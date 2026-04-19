@@ -278,126 +278,159 @@ struct RichText {
     //     slide=cyan, plain=panel-hi). The current preset's contour is lit
     //     with the same heat-gradient palette as the filter graph so the
     //     "selected" row visually glows.
-    // The full list takes the panel's vertical length, matching the sequencer
-    // below for a DAW-style browser feel.
-    auto preset_list = [&]() -> Element {
-        int n  = static_cast<int>(t.presets.size());
-        int cv = t.pattern_index;
-
-        // pad names to the longest for alignment of the contour column
-        size_t name_w = 4;
-        for (const auto& p : t.presets)
-            name_w = std::max(name_w, p.name.size());
-
-        std::vector<Element> rows;
-        rows.reserve(static_cast<size_t>(n + 2));
-
-        // ── header row ───────────────────────────────────────────────────────
-        RichText hdr;
-        hdr.push("PRESETS   ", Style{}.with_fg(clr_muted()).with_bold());
-        hdr.push("\xe2\x86\x91\xe2\x86\x93 browse",                    // ↑↓ browse
-            Style{}.with_fg(t.focused ? clr_accent() : clr_dim()));
-        char cnt[16];
-        std::snprintf(cnt, sizeof(cnt), "   %d/%d", cv + 1, n);
-        hdr.push(cnt, Style{}.with_fg(clr_muted()));
-        rows.push_back(hdr.build());
-
-        // a subtle dotted rule below the header
-        rows.push_back(Element{TextElement{
-            .content = std::string(name_w + 24, '\xe2'),  // placeholder below
-            .style   = Style{}.with_fg(clr_grid()),
-            .wrap    = TextWrap::NoWrap,
-        }});
-        // rebuild the rule with a valid glyph (· every 2 cols)
+    //
+    // Scrolls: when the allocated height can't fit every preset, we clamp a
+    // scroll window around `pattern_index` so the current preset is always
+    // visible, and reserve one header row for ▲/▼ "more above/below" arrows.
+    // Captured by value because ComponentElement::render runs after we've
+    // already returned from build_transport.
+    int preset_count = static_cast<int>(t.presets.size());
+    Element preset_list = Element{ComponentElement{
+        .render = [presets    = t.presets,
+                   pattern_ix = t.pattern_index,
+                   focused    = t.focused]
+            (int /*w*/, int h) -> Element
         {
-            std::string rule;
-            for (size_t k = 0; k < name_w + 24; ++k) {
-                rule += (k % 2 == 0) ? "\xc2\xb7" : " ";   // ·
+            int n = static_cast<int>(presets.size());
+            int cv = pattern_ix;
+
+            // pad names to the longest for alignment of the contour column
+            size_t name_w = 4;
+            for (const auto& p : presets)
+                name_w = std::max(name_w, p.name.size());
+
+            // Header (1 row) + dotted rule (1 row) consume 2 lines before any
+            // preset row. If the caller gave us less than 3 we still render
+            // at least one preset so the list isn't silent.
+            int visible = std::max(1, h - 2);
+            int first = 0;
+            if (n > visible) {
+                // Keep the current row centred; clamp at the ends so we don't
+                // scroll past the first/last preset.
+                first = std::clamp(cv - visible / 2, 0, n - visible);
             }
-            rows.back() = Element{TextElement{
-                .content = std::move(rule),
-                .style   = Style{}.with_fg(clr_grid()),
-                .wrap    = TextWrap::NoWrap,
-            }};
-        }
+            int last = std::min(first + visible, n);
+            bool more_above = first > 0;
+            bool more_below = last < n;
 
-        // ── one row per preset ───────────────────────────────────────────────
-        for (int i = 0; i < n; ++i) {
-            bool is_cur = (i == cv);
-            const auto& p = t.presets[static_cast<size_t>(i)];
+            std::vector<Element> rows;
+            rows.reserve(static_cast<size_t>(visible + 2));
 
-            RichText r;
+            // ── header row ───────────────────────────────────────────────────
+            RichText hdr;
+            hdr.push("PRESETS  ", Style{}.with_fg(clr_muted()).with_bold());
+            // ▲/▼ arrows flag hidden rows above/below — same cells always, just
+            // swap to a dim dot when nothing is clipped so the header width
+            // stays constant.
+            hdr.push(more_above ? "\xe2\x96\xb2" : "\xc2\xb7",             // ▲ / ·
+                Style{}.with_fg(more_above ? clr_accent() : clr_dim()).with_bold());
+            hdr.push(more_below ? "\xe2\x96\xbc" : "\xc2\xb7",             // ▼ / ·
+                Style{}.with_fg(more_below ? clr_accent() : clr_dim()).with_bold());
+            hdr.push("  ", Style{});
+            hdr.push("\xe2\x86\x91\xe2\x86\x93 browse",                    // ↑↓ browse
+                Style{}.with_fg(focused ? clr_accent() : clr_dim()));
+            char cnt[16];
+            std::snprintf(cnt, sizeof(cnt), "   %d/%d", cv + 1, n);
+            hdr.push(cnt, Style{}.with_fg(clr_muted()));
+            rows.push_back(hdr.build());
 
-            // marker + index
-            r.push(is_cur ? " \xe2\x96\xb8 " : "   ",                   // ▸
-                Style{}.with_fg(is_cur ? clr_accent() : clr_dim()).with_bold());
-            char idx[8];
-            std::snprintf(idx, sizeof(idx), "%02d  ", i + 1);
-            r.push(idx,
-                is_cur ? Style{}.with_fg(clr_muted()).with_bold()
-                       : Style{}.with_fg(clr_dim()));
-
-            // name, padded to the longest name so contours line up
-            std::string name = p.name;
-            if (name.size() < name_w) name.append(name_w - name.size(), ' ');
-            name += "  ";
-            r.push(name,
-                is_cur ? Style{}.with_fg(clr_accent()).with_bold()
-                       : Style{}.with_fg(clr_muted()));
-
-            // mini pitch-contour — walk the steps ourselves so we can colour
-            // each cell based on that step's flags (accent / slide / rest).
-            int lo = 1000, hi = -1000;
-            for (const auto& s : p.steps) {
-                if (s.rest) continue;
-                lo = std::min(lo, s.note);
-                hi = std::max(hi, s.note);
+            // subtle dotted rule under the header
+            {
+                std::string rule;
+                for (size_t k = 0; k < name_w + 24; ++k) {
+                    rule += (k % 2 == 0) ? "\xc2\xb7" : " ";               // ·
+                }
+                rows.push_back(Element{TextElement{
+                    .content = std::move(rule),
+                    .style   = Style{}.with_fg(clr_grid()),
+                    .wrap    = TextWrap::NoWrap,
+                }});
             }
-            if (lo > hi)     { lo = 36; hi = 48; }
-            if (hi - lo < 6) { hi = lo + 6; }
 
-            static constexpr const char* blocks[] = {
-                "_",
-                "\xe2\x96\x81", "\xe2\x96\x82", "\xe2\x96\x83",
-                "\xe2\x96\x84", "\xe2\x96\x85", "\xe2\x96\x86",
-                "\xe2\x96\x87", "\xe2\x96\x88",
-            };
-            for (const auto& s : p.steps) {
-                const char* glyph;
-                int b;
-                if (s.rest) { glyph = "_"; b = 0; }
-                else {
-                    float nrm = static_cast<float>(s.note - lo)
-                              / static_cast<float>(hi - lo);
-                    b = std::clamp(
-                        static_cast<int>(std::round(nrm * 7.0f)) + 1, 1, 8);
-                    glyph = blocks[b];
+            // ── visible slice of preset rows ─────────────────────────────────
+            for (int i = first; i < last; ++i) {
+                bool is_cur = (i == cv);
+                const auto& p = presets[static_cast<size_t>(i)];
+
+                RichText r;
+
+                // marker + index
+                r.push(is_cur ? " \xe2\x96\xb8 " : "   ",                  // ▸
+                    Style{}.with_fg(is_cur ? clr_accent() : clr_dim()).with_bold());
+                char idx[8];
+                std::snprintf(idx, sizeof(idx), "%02d  ", i + 1);
+                r.push(idx,
+                    is_cur ? Style{}.with_fg(clr_muted()).with_bold()
+                           : Style{}.with_fg(clr_dim()));
+
+                // name, padded to the longest name so contours line up
+                std::string name = p.name;
+                if (name.size() < name_w) name.append(name_w - name.size(), ' ');
+                name += "  ";
+                r.push(name,
+                    is_cur ? Style{}.with_fg(clr_accent()).with_bold()
+                           : Style{}.with_fg(clr_muted()));
+
+                // mini pitch-contour — colour each cell based on its flags
+                int lo = 1000, hi = -1000;
+                for (const auto& s : p.steps) {
+                    if (s.rest) continue;
+                    lo = std::min(lo, s.note);
+                    hi = std::max(hi, s.note);
+                }
+                if (lo > hi)     { lo = 36; hi = 48; }
+                if (hi - lo < 6) { hi = lo + 6; }
+
+                static constexpr const char* blocks[] = {
+                    "_",
+                    "\xe2\x96\x81", "\xe2\x96\x82", "\xe2\x96\x83",
+                    "\xe2\x96\x84", "\xe2\x96\x85", "\xe2\x96\x86",
+                    "\xe2\x96\x87", "\xe2\x96\x88",
+                };
+                for (const auto& s : p.steps) {
+                    const char* glyph;
+                    int b;
+                    if (s.rest) { glyph = "_"; b = 0; }
+                    else {
+                        float nrm = static_cast<float>(s.note - lo)
+                                  / static_cast<float>(hi - lo);
+                        b = std::clamp(
+                            static_cast<int>(std::round(nrm * 7.0f)) + 1, 1, 8);
+                        glyph = blocks[b];
+                    }
+
+                    Color fg;
+                    if (is_cur) {
+                        if (s.rest)         fg = clr_dim();
+                        else if (s.slide)   fg = clr_slide();
+                        else if (s.accent)  fg = clr_hot();
+                        else                fg = clr_accent();
+                    } else {
+                        if (s.rest)         fg = clr_grid();
+                        else if (s.slide)   fg = Color::rgb(70, 120, 160);
+                        else if (s.accent)  fg = Color::rgb(150, 80, 60);
+                        else                fg = clr_panel_hi();
+                    }
+                    Style st = is_cur
+                        ? Style{}.with_fg(fg).with_bold()
+                        : Style{}.with_fg(fg);
+                    r.push(glyph, st);
                 }
 
-                // colour choices — brighter / accented on the current row
-                Color fg;
-                if (is_cur) {
-                    if (s.rest)         fg = clr_dim();
-                    else if (s.slide)   fg = clr_slide();
-                    else if (s.accent)  fg = clr_hot();
-                    else                fg = clr_accent();
-                } else {
-                    if (s.rest)         fg = clr_grid();
-                    else if (s.slide)   fg = Color::rgb(70, 120, 160); // dim cyan
-                    else if (s.accent)  fg = Color::rgb(150, 80, 60);  // dim red
-                    else                fg = clr_panel_hi();
-                }
-                Style st = is_cur
-                    ? Style{}.with_fg(fg).with_bold()
-                    : Style{}.with_fg(fg);
-                r.push(glyph, st);
+                rows.push_back(r.build());
             }
 
-            rows.push_back(r.build());
-        }
-
-        return (dsl::v(std::move(rows)) | dsl::gap(0) | dsl::grow(1)).build();
-    }();
+            return (dsl::v(std::move(rows)) | dsl::gap(0)).build();
+        },
+        // Report our *ideal* height (all presets + header + rule) so the
+        // layout engine allocates enough vertical space when there's room.
+        // When the parent can't afford the full height, flex-shrink reduces
+        // our allocation and the render callback scrolls within it.
+        .measure = [preset_count](int max_width) -> Size {
+            return {Columns{max_width}, Rows{preset_count + 2}};
+        },
+        .layout = FlexStyle{.grow = 1.0f, .shrink = 1.0f},
+    }};
 
     auto body = dsl::vstack().gap(0)(
         status.build(),
