@@ -45,15 +45,49 @@ inline constexpr uint8_t kBrailleColBits[2][4] = {
 
         // Pull 2*chart_w samples (Braille doubles horizontal resolution).
         int want = chart_w * 2;
+
+        // ── Zero-crossing trigger ───────────────────────────────────────────
+        // A free-running trailing-window scope "swims" because each frame
+        // picks up a different phase of the waveform. To lock the display we
+        // grab a larger buffer and hunt for the most-recent rising zero
+        // crossing that still has `want` samples after it — that's the left
+        // edge of our displayed window. This is how real oscilloscopes stay
+        // stable: trigger on edge, display N samples starting from it.
+        //
+        // We search backwards (newest-first) so the display shows the freshest
+        // locked frame rather than an older one. If no trigger is found
+        // (silence, or a waveform that stays on one side of zero), we fall
+        // back to the trailing window — at which point the scope will simply
+        // show whatever's there with no alignment, which is fine.
+        int pull_n = std::min(want * 3, 4096);
+        std::vector<float> pulled(static_cast<size_t>(pull_n), 0.0f);
+        int got = acid_scope_tail(pulled.data(), pull_n);
+
+        int trigger = -1;
+        const float hysteresis = 0.01f;   // ignore sub-noise-floor crossings
+        int search_hi = got - want;       // need `want` samples after trigger
+        for (int i = search_hi; i > 0; --i) {
+            if (pulled[static_cast<size_t>(i)] >= hysteresis &&
+                pulled[static_cast<size_t>(i - 1)] < -hysteresis) {
+                trigger = i;
+                break;
+            }
+        }
+
         std::vector<float> samples(static_cast<size_t>(want), 0.0f);
-        int got = acid_scope_tail(samples.data(), want);
-        if (got < want) {
-            // Left-pad with silence so the waveform hugs the right side when
-            // the ring hasn't filled yet.
-            std::vector<float> tmp(static_cast<size_t>(want), 0.0f);
-            for (int i = 0; i < got; ++i)
-                tmp[static_cast<size_t>(want - got + i)] = samples[static_cast<size_t>(i)];
-            samples = std::move(tmp);
+        if (trigger >= 0) {
+            for (int i = 0; i < want; ++i)
+                samples[static_cast<size_t>(i)] =
+                    pulled[static_cast<size_t>(trigger + i)];
+        } else {
+            // Fallback: trailing window, right-aligned so partial rings still
+            // read naturally (scope "fills in from the right" during startup).
+            int take = std::min(want, got);
+            int src_off = got - take;
+            int dst_off = want - take;
+            for (int i = 0; i < take; ++i)
+                samples[static_cast<size_t>(dst_off + i)] =
+                    pulled[static_cast<size_t>(src_off + i)];
         }
 
         // Map each sample to a dot row in the Braille grid. Each terminal row
@@ -65,6 +99,9 @@ inline constexpr uint8_t kBrailleColBits[2][4] = {
             int   r    = static_cast<int>(std::round(t * (dot_rows - 1)));
             return std::clamp(r, 0, dot_rows - 1);
         };
+        // Dot row of the zero line (centre). A dim dotted line at this row
+        // draws the 0-V reference.
+        const int zero_dot = dot_rows / 2;
 
         // Build chart_h rows of Braille text with colour gradient by row.
         // Grid colour ramps red/orange for rows closer to peak amplitude.
@@ -111,6 +148,17 @@ inline constexpr uint8_t kBrailleColBits[2][4] = {
                 light(0, prev_b, s_a);
                 light(1, s_a,    s_b);
 
+                // If this cell is still empty AND the zero line passes through
+                // its dot-row window, sprinkle a dim zero-reference mark —
+                // dot at col 0 on even cells, col 1 on odd cells. Reads as a
+                // dashed horizontal without adding any new colour.
+                bool was_empty = (cp == 0x2800);
+                int  zero_local = zero_dot - row_dot_top;
+                if (was_empty && zero_local >= 0 && zero_local < 4) {
+                    int zero_col = (col % 2);
+                    cp |= kBrailleColBits[zero_col][zero_local];
+                }
+
                 // encode cp (U+2800..U+28FF) as UTF-8 (3 bytes)
                 char buf[4] = {
                     static_cast<char>(0xE0 | (cp >> 12)),
@@ -120,10 +168,9 @@ inline constexpr uint8_t kBrailleColBits[2][4] = {
                 };
                 size_t off = txt.size();
                 txt += buf;
-                // Dim the cell when its Braille code is empty (0x2800) so the
-                // background doesn't look speckled.
-                bool empty = (cp == 0x2800);
-                Color fg = empty ? clr_grid() : base;
+                // Dim the cell when there was no signal in it (just the zero
+                // tick, or truly nothing). Live waveform gets the hot colour.
+                Color fg = was_empty ? clr_grid() : base;
                 runs.push_back(StyledRun{off, 3,
                     Style{}.with_fg(fg).with_bold()});
             }

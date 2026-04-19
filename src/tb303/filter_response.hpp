@@ -16,6 +16,7 @@
 
 #include <maya/maya.hpp>
 
+#include "../audio.hpp"
 #include "theme.hpp"
 
 namespace tb303 {
@@ -23,20 +24,29 @@ namespace tb303 {
 using namespace maya;
 
 [[nodiscard]] inline Element build_filter_response(float cutoff01, float res01) {
-    float fc = 80.0f + cutoff01 * 6000.0f;
+    float fc       = 80.0f + cutoff01 * 6000.0f;
+    float live_fc  = acid_live_fc();         // post-envelope / post-accent
 
     char fc_buf[16];
     if (fc >= 1000.0f) std::snprintf(fc_buf, sizeof(fc_buf), "%.2f kHz", fc / 1000.0f);
     else               std::snprintf(fc_buf, sizeof(fc_buf), "%.0f Hz", fc);
+    char live_buf[16];
+    if (live_fc >= 1000.0f) std::snprintf(live_buf, sizeof(live_buf), "%.2f kHz", live_fc / 1000.0f);
+    else                    std::snprintf(live_buf, sizeof(live_buf), "%.0f Hz", live_fc);
 
+    // Caption shows both the static CUTOFF knob position (fc) and the
+    // instantaneous modulated frequency (live). When idle they coincide;
+    // during a note the live value sweeps up and the gap visualises envmod.
     auto caption = Element{TextElement{
-        .content = "fc " + std::string(fc_buf) + "   Q " +
+        .content = "fc " + std::string(fc_buf) +
+                   "  \xe2\x86\x92 " + std::string(live_buf) +     // "→"
+                   "   Q " +
                    std::to_string(static_cast<int>(std::round(res01 * 100))) + "%",
         .style   = Style{}.with_fg(clr_muted()),
         .wrap    = TextWrap::NoWrap,
     }};
 
-    auto chart = dsl::component([cutoff01, res01](int w, int h) -> Element {
+    auto chart = dsl::component([cutoff01, res01, live_fc](int w, int h) -> Element {
         // 8-level vertical block chars (empty..full). blocks[0] is a space so
         // the background in empty cells renders as pure background colour.
         static constexpr const char* blocks[] = {
@@ -84,6 +94,23 @@ using namespace maya;
         int   fc_col = std::clamp(
             static_cast<int>(std::round(fc_t * (chart_w - 1))), 0, chart_w - 1);
 
+        // Live effective cutoff — where the filter is RIGHT NOW after env and
+        // accent modulation. Usually above fc during a note (envelope opens
+        // it up), equal to fc at rest. We clamp the engine's reported value
+        // into the display range so off-scale transients still pin to the
+        // edge instead of vanishing.
+        float live_clamped = std::clamp(live_fc, f_lo, f_hi);
+        float live_t       = std::log(live_clamped / f_lo) / std::log(f_hi / f_lo);
+        int   live_col     = std::clamp(
+            static_cast<int>(std::round(live_t * (chart_w - 1))), 0, chart_w - 1);
+        bool  show_live    = std::fabs(live_col - fc_col) > 0;
+
+        // Horizontal dB grid lines. The Y axis maps -40..+3 dB onto norm
+        // 0..1, so -24 dB is norm=(−24+40)/43 ≈ 0.372 and -12 dB is ≈ 0.651.
+        // We draw a dim dashed horizontal through empty cells at those rows.
+        const int grid_row_24 = static_cast<int>(std::round(0.372f * (chart_h - 1)));
+        const int grid_row_12 = static_cast<int>(std::round(0.651f * (chart_h - 1)));
+
         // Pre-compute a heat-gradient palette: deep red-orange at the base
         // through orange, amber, to bright yellow at the top. Each bar is
         // coloured by the row it's drawn in, not by the column — so the whole
@@ -119,19 +146,49 @@ using namespace maya;
                 if (b > 0) {
                     // filled cell: heat-gradient colour + highlight the cutoff bar
                     glyph = blocks[b];
-                    if (c == fc_col) {
+                    if (show_live && c == live_col) {
+                        // Brightest marker in the scene — the actual current
+                        // filter corner. This is the thing that moves.
+                        fg = Color::rgb(255, 240, 120);
+                        st = Style{}.with_fg(fg).with_bold();
+                    } else if (c == fc_col) {
                         fg = clr_hot();
                         st = Style{}.with_fg(fg).with_bold();
                     } else {
                         fg = row_col[static_cast<size_t>(row)];
                         st = Style{}.with_fg(fg).with_bold();
                     }
+                } else if (show_live && c == live_col) {
+                    // solid vertical marker above the chart for the live fc —
+                    // brighter and thicker than the static fc ghost line so it
+                    // reads as "this is where the envelope pushed it".
+                    glyph = "\xe2\x94\x83";               // ┃ heavy vertical
+                    fg    = Color::rgb(255, 240, 120);
+                    st    = Style{}.with_fg(fg).with_bold();
                 } else if (c == fc_col) {
                     // empty cell above the cutoff bar — draw a red dashed ghost
                     // line so the eye traces fc right to the top of the chart.
                     glyph = "\xe2\x94\x8a";               // ┊ light dashed
                     fg    = clr_hot();
                     st    = Style{}.with_fg(fg);
+                } else if (row == grid_row_12 || row == grid_row_24) {
+                    // dB reference line — tiny inline label at the far left
+                    // ("-12" / "-24") followed by a sparse dashed horizontal.
+                    // Gives readers a scale cue for the resonance bump.
+                    const char* label = (row == grid_row_12) ? "-12" : "-24";
+                    if (c < 3) {
+                        runs.push_back(StyledRun{txt.size(), 1,
+                            Style{}.with_fg(clr_muted())});
+                        txt += label[c];
+                        continue;
+                    } else if (c % 2 == 0) {
+                        glyph = "\xe2\x94\x80";           // ─ light horizontal
+                        fg    = clr_grid();
+                    } else {
+                        glyph = " ";
+                        fg    = clr_grid();
+                    }
+                    st = Style{}.with_fg(fg);
                 } else {
                     // truly empty — blank, grid-dim dot every 8 cols for rhythm
                     if (c % 12 == 0 && row % 2 == 0) {

@@ -39,6 +39,12 @@ int acid_scope_tail(float* dst, int n);
 // clipping peaks).
 float acid_output_peak(void);
 
+// Current effective filter cutoff in Hz, i.e. the smoothed CUTOFF knob after
+// envelope and accent modulation have been applied. Used by the UI to draw a
+// live bar on the filter-response chart — so the graph "screams" with the
+// accent envelope rather than sitting still.
+float acid_live_fc(void);
+
 // Offline WAV bounce: render `pattern_length * step_sec * loops` seconds of
 // audio into `path` at 44.1kHz, 16-bit PCM mono, with the sequencer driving
 // notes as per the passed pattern. Uses the same DSP as live playback but

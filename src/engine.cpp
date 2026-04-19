@@ -152,6 +152,11 @@ std::atomic<uint32_t> g_scope_w{0};
 std::atomic<float> g_peak{0.0f};
 float              g_peak_env = 0.0f;
 
+// Current effective filter cutoff (smoothed base × envelope × accent), in Hz.
+// Snapshotted once per render block — plenty fast for the 30 Hz UI, and
+// keeps audio-side overhead to a single relaxed store per block.
+std::atomic<float> g_live_fc{200.0f};
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 // PolyBLEP residual for a waveform discontinuity at phase wrap.
@@ -483,6 +488,10 @@ void render(float* out, int frames) {
         float abs_y = std::fabs(y_hpf);
         if (abs_y > g_peak_env) g_peak_env = abs_y;
         else                    g_peak_env *= 0.9995f;   // ~100 ms decay @ 44.1kHz
+
+        // Publish the most-recent effective cutoff once per sample — cheap
+        // (relaxed atomic store) and lets the UI show the envelope "scream".
+        g_live_fc.store(fc_hz, std::memory_order_relaxed);
     }
     g_peak.store(g_peak_env, std::memory_order_relaxed);
 }
@@ -535,6 +544,10 @@ int acid_scope_tail(float* dst, int n) {
 
 float acid_output_peak(void) {
     return acid::g_peak.load(std::memory_order_relaxed);
+}
+
+float acid_live_fc(void) {
+    return acid::g_live_fc.load(std::memory_order_relaxed);
 }
 
 // ── Offline WAV render ──────────────────────────────────────────────────────
