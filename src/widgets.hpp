@@ -17,6 +17,7 @@
 #include "tb303/waveform_toggle.hpp"
 #include "tb303/sequencer.hpp"
 #include "tb303/filter_response.hpp"
+#include "tb303/scope.hpp"
 #include "tb303/transport.hpp"
 #include "tb303/help_bar.hpp"
 #include "tb303/help_overlay.hpp"

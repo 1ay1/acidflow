@@ -21,6 +21,10 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -73,6 +77,21 @@ static Section g_focus      = Section::Sequencer;
 static int     g_knob_sel   = 2;   // K_CUTOFF — the signature 303 knob
 static int     g_step_sel   = 0;
 static bool    g_help_open  = false;
+
+// Beat-sync animation state. g_step_phase ramps 0..1 within the current step
+// (wraps each trigger) so the UI can fade flashes smoothly. g_toast is a
+// transient banner — whenever an action fires (randomize / save / load /
+// export) we set g_toast + g_toast_t and the title bar shows it, fading out
+// over ~1.5s.
+static float       g_step_phase = 0.0f;
+static std::string g_toast;
+static float       g_toast_t    = 0.0f;    // seconds remaining
+static constexpr float kToastDur = 1.5f;
+
+static void set_toast(std::string s) {
+    g_toast   = std::move(s);
+    g_toast_t = kToastDur;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Knob descriptor table — makes per-knob behaviour data-driven
@@ -339,6 +358,339 @@ static void load_preset(int idx) {
     g_step_sel     = 0;
 }
 
+// Forward-declares — the save/export helpers need to reach into the audio
+// transport below, but we want to declare the pattern I/O up here where the
+// rest of the pattern management lives.
+static void start_playback();
+static void stop_playback();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Knob randomizer — a dice roll over the *correlated* acid parameter space.
+// We pick one of four character archetypes (classic / squelchy / driving /
+// dubby), each pre-baked with sensible inter-knob relationships, then jitter
+// within that archetype. This consistently produces playable patches:
+//   * high Q pairs with low-mid cutoff (so the envelope has room to scream)
+//   * long decay pairs with lower env mod (slow evolving sweeps)
+//   * short decay pairs with heavy env mod + high accent (snappy squelch)
+// A naive rand(0..1) across every knob usually lands on muddy / inaudible
+// patches — the archetype pass keeps each roll musical.
+// ─────────────────────────────────────────────────────────────────────────────
+static void randomize_knobs() {
+    static std::mt19937 rng{std::random_device{}()};
+    auto u = [&](float lo, float hi) {
+        return lo + (hi - lo) * std::uniform_real_distribution<float>(0.0f, 1.0f)(rng);
+    };
+    auto chance = [&](float p) {
+        return std::uniform_real_distribution<float>(0.0f, 1.0f)(rng) < p;
+    };
+
+    enum Arch { CLASSIC, SQUELCH, DRIVING, DUBBY };
+    Arch a = static_cast<Arch>(std::uniform_int_distribution<int>(0, 3)(rng));
+
+    // Tuning: always near centre — detuning kills "in-key" playback. ±1 st.
+    g_tune = u(0.48f, 0.52f);
+
+    switch (a) {
+        case CLASSIC:
+            // Mid cutoff, strong Q, moderate sweep, medium decay — the
+            // universal acid starting point.
+            g_cutoff    = u(0.30f, 0.50f);
+            g_resonance = u(0.65f, 0.85f);
+            g_env_mod   = u(0.50f, 0.75f);
+            g_decay     = u(0.25f, 0.50f);
+            g_accent    = u(0.50f, 0.75f);
+            break;
+        case SQUELCH:
+            // Self-osc territory: very high Q, low cutoff (max headroom for
+            // the MEG to sweep), tight decay and heavy accent.
+            g_cutoff    = u(0.15f, 0.35f);
+            g_resonance = u(0.80f, 0.95f);
+            g_env_mod   = u(0.70f, 0.95f);
+            g_decay     = u(0.10f, 0.30f);
+            g_accent    = u(0.70f, 0.90f);
+            break;
+        case DRIVING:
+            // Open filter, less envelope motion, medium resonance — the
+            // Beltram "Energy Flash" engine sound.
+            g_cutoff    = u(0.50f, 0.75f);
+            g_resonance = u(0.55f, 0.75f);
+            g_env_mod   = u(0.30f, 0.55f);
+            g_decay     = u(0.20f, 0.45f);
+            g_accent    = u(0.55f, 0.80f);
+            break;
+        case DUBBY:
+            // Low cutoff, long decay, moderate Q — Plastikman / dub techno
+            // territory. Sustained filter motion over bars.
+            g_cutoff    = u(0.10f, 0.30f);
+            g_resonance = u(0.55f, 0.80f);
+            g_env_mod   = u(0.40f, 0.70f);
+            g_decay     = u(0.55f, 0.90f);
+            g_accent    = u(0.35f, 0.60f);
+            break;
+    }
+
+    g_volume = u(0.55f, 0.70f);           // keep output in a safe range
+    // Square is classic but ~30% of rolls — saw is canonical 303.
+    g_wave   = chance(0.30f) ? 1 : 0;
+
+    static const char* kNames[] = {"classic", "squelch", "driving", "dubby"};
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "\xe2\x86\xbb knobs: %s", kNames[a]);
+    set_toast(buf);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pattern randomizer (musical, not purely random)
+// ─────────────────────────────────────────────────────────────────────────────
+// Picks one of four groove archetypes (pedal / driving / melodic / dub),
+// each of which parameterises note density, octave-jump frequency, slide
+// probability, and accent weighting differently. All pitches are drawn from
+// a minor-pentatonic/Dorian superset — the canonical 303 vocabulary
+// (Voodoo Ray, Energy Flash, Acperience etc.). A few hand-picked musical
+// constraints keep every roll playable:
+//
+//   * downbeats (steps 0, 4, 8, 12) favour the tonic so the groove lands
+//   * at least one accent per bar — flat patterns sound dead
+//   * slides are only kept when the previous step played (you can't glide
+//     into a note from a rest)
+//   * slides resolve DOWN to the tonic on the next downbeat, which is the
+//     signature 303 "squelch back home" motion
+//
+// This is strictly better than a flat per-step dice roll, which produces
+// listless noise roughly 80% of the time.
+static void randomize_pattern() {
+    static std::mt19937 rng{std::random_device{}()};
+    auto U = [&]() {
+        return std::uniform_real_distribution<float>(0.0f, 1.0f)(rng);
+    };
+    auto chance = [&](float p) { return U() < p; };
+
+    static constexpr int kTonic = 36;                      // C2
+    // Minor pentatonic + b7 + octave + octave+5. Each entry is the semitone
+    // offset from the tonic. Selection is weight-biased: root/5 heavy,
+    // upper notes sparse. Indices: 0=root, 1=♭3, 2=4, 3=5, 4=♭7, 5=oct,
+    // 6=oct+5.
+    static constexpr int kScale[]   = {0, 3, 5, 7, 10, 12, 15};
+    static constexpr int kWeight[]  = {7, 2, 3, 4,  2,  4,  1};  // totals 23
+    static constexpr int kWeightSum = 7+2+3+4+2+4+1;
+
+    auto pick_scale_tone = [&]() -> int {
+        int r = std::uniform_int_distribution<int>(0, kWeightSum - 1)(rng);
+        int acc = 0;
+        for (size_t i = 0; i < std::size(kScale); ++i) {
+            acc += kWeight[i];
+            if (r < acc) return kScale[i];
+        }
+        return kScale[0];
+    };
+
+    enum Groove { PEDAL, DRIVING, MELODIC, DUB };
+    Groove gr = static_cast<Groove>(std::uniform_int_distribution<int>(0, 3)(rng));
+
+    // Per-groove shape parameters.
+    //   rest_rate  : probability an off-beat becomes a rest (sparseness)
+    //   jump_rate  : probability a non-root note lands (colour-tone density)
+    //   slide_rate : base slide probability per non-rest note
+    //   accent_off : off-beat accent probability
+    float rest_rate = 0.25f, jump_rate = 0.35f, slide_rate = 0.25f, accent_off = 0.15f;
+    switch (gr) {
+        case PEDAL:   rest_rate = 0.20f; jump_rate = 0.20f; slide_rate = 0.25f; accent_off = 0.10f; break;
+        case DRIVING: rest_rate = 0.05f; jump_rate = 0.30f; slide_rate = 0.20f; accent_off = 0.25f; break;
+        case MELODIC: rest_rate = 0.15f; jump_rate = 0.60f; slide_rate = 0.35f; accent_off = 0.20f; break;
+        case DUB:     rest_rate = 0.55f; jump_rate = 0.30f; slide_rate = 0.40f; accent_off = 0.15f; break;
+    }
+
+    // ── Pass 1: lay down notes + rests ──────────────────────────────────────
+    bool has_accent = false;
+    for (int i = 0; i < g_pattern_length; ++i) {
+        auto& s = g_steps[static_cast<size_t>(i)];
+        s = StepData{};
+        bool downbeat = (i % 4 == 0);
+
+        if (!downbeat && chance(rest_rate)) {
+            s.rest = true;
+            continue;
+        }
+
+        int pitch;
+        if (downbeat && chance(0.80f)) {
+            pitch = kTonic;
+        } else if (chance(jump_rate)) {
+            pitch = kTonic + pick_scale_tone();
+        } else {
+            pitch = kTonic;
+        }
+        s.note   = pitch;
+        s.rest   = false;
+        s.accent = downbeat ? chance(0.70f) : chance(accent_off);
+        if (s.accent) has_accent = true;
+    }
+
+    // ── Pass 2: slides (second pass so we know neighbours are real notes) ──
+    for (int i = 1; i < g_pattern_length; ++i) {
+        auto& s = g_steps[static_cast<size_t>(i)];
+        if (s.rest) continue;
+        const auto& prev = g_steps[static_cast<size_t>(i - 1)];
+        if (prev.rest) continue;
+        // More likely to slide INTO upper notes than back down to root —
+        // that's the "pull up" direction the 303 envelope emphasises.
+        float p = slide_rate;
+        if (s.note > prev.note) p *= 1.5f;
+        if (chance(std::min(p, 0.9f))) s.slide = true;
+    }
+
+    // ── Pass 3: musical guarantees ─────────────────────────────────────────
+    // If somehow the whole bar ended up flat, force an accent on beat 1.
+    if (!has_accent) {
+        g_steps[0].accent = true;
+        g_steps[0].rest   = false;
+        if (g_steps[0].note < kTonic) g_steps[0].note = kTonic;
+    }
+    // Ensure beat 1 always plays — a pattern that starts on a rest reads as
+    // confusing when looped.
+    if (g_steps[0].rest) {
+        g_steps[0].rest = false;
+        g_steps[0].note = kTonic;
+    }
+
+    // Clear trailing steps when pattern_length < 16.
+    for (int i = g_pattern_length; i < 16; ++i) {
+        g_steps[static_cast<size_t>(i)] = StepData{};
+        g_steps[static_cast<size_t>(i)].rest = true;
+    }
+
+    g_preset_index = -1;                   // mark as "custom, not a preset"
+    g_step_sel     = 0;
+
+    static const char* kNames[] = {"pedal", "driving", "melodic", "dub"};
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "\xe2\x86\xbb pattern: %s", kNames[gr]);
+    set_toast(buf);
+}
+
+// Randomize everything — fresh knobs AND a fresh pattern. The individual
+// toasts from each helper would stomp each other, so we suppress them and
+// emit a single combined toast. Used by capital-R.
+static void randomize_everything() {
+    randomize_knobs();
+    randomize_pattern();
+    set_toast("\xe2\x86\xbb all randomized");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pattern persistence — save/load current 16-step pattern as JSON-ish text
+// under ~/.config/acidflow/. One slot per keyboard digit 1..9; slot 0 is
+// "last", used for the quick-load round-trip.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static std::filesystem::path config_dir() {
+    const char* xdg = std::getenv("XDG_CONFIG_HOME");
+    const char* home = std::getenv("HOME");
+    std::filesystem::path base = xdg ? xdg : (home ? std::string(home) + "/.config" : std::string("."));
+    return base / "acidflow";
+}
+
+static std::filesystem::path pattern_path(int slot) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "pattern_%d.txt", slot);
+    return config_dir() / buf;
+}
+
+// Minimal human-readable format — one step per line, fields space-separated:
+//   note rest accent slide
+// Header line carries pattern_length + bpm so we restore full state.
+static bool save_pattern_slot(int slot) {
+    std::error_code ec;
+    std::filesystem::create_directories(config_dir(), ec);
+    if (ec) return false;
+
+    std::ofstream f(pattern_path(slot));
+    if (!f) return false;
+
+    f << "# acidflow pattern v1\n";
+    f << g_pattern_length << " " << g_bpm << "\n";
+    for (int i = 0; i < 16; ++i) {
+        const auto& s = g_steps[static_cast<size_t>(i)];
+        f << s.note << " " << (s.rest ? 1 : 0) << " "
+          << (s.accent ? 1 : 0) << " " << (s.slide ? 1 : 0) << "\n";
+    }
+    bool ok = static_cast<bool>(f);
+    if (ok) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "\xe2\x9c\x93 saved slot %d", slot);
+        set_toast(buf);
+    }
+    return ok;
+}
+
+static bool load_pattern_slot(int slot) {
+    std::ifstream f(pattern_path(slot));
+    if (!f) return false;
+
+    std::string line;
+    std::getline(f, line);              // header comment (discarded)
+
+    int plen; float bpm;
+    if (!(f >> plen >> bpm)) return false;
+    g_pattern_length = std::clamp(plen, 4, 16);
+    g_bpm = std::clamp(bpm, 40.0f, 220.0f);
+
+    for (int i = 0; i < 16; ++i) {
+        int note, rest, acc, sld;
+        if (!(f >> note >> rest >> acc >> sld)) break;
+        auto& s = g_steps[static_cast<size_t>(i)];
+        s.note   = std::clamp(note, 12, 96);
+        s.rest   = rest != 0;
+        s.accent = acc != 0;
+        s.slide  = sld != 0;
+    }
+    g_preset_index = -1;
+    g_step_sel = 0;
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "\xe2\x86\xba loaded slot %d", slot);
+    set_toast(buf);
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WAV export — offline bounce the current pattern (4 loops) to
+// ~/.config/acidflow/bounce.wav via the engine's synchronous render path.
+// ─────────────────────────────────────────────────────────────────────────────
+static bool export_wav() {
+    std::error_code ec;
+    std::filesystem::create_directories(config_dir(), ec);
+    if (ec) return false;
+
+    auto path = config_dir() / "bounce.wav";
+    // Pack the current pattern into the (midi | flags<<16) format the engine
+    // expects. Flags: bit0 rest, bit1 accent, bit2 slide.
+    int notes[16];
+    for (int i = 0; i < 16; ++i) {
+        const auto& s = g_steps[static_cast<size_t>(i)];
+        int flags = 0;
+        if (s.rest)   flags |= 1;
+        if (s.accent) flags |= 2;
+        if (s.slide)  flags |= 4;
+        notes[i] = (flags << 16) | (s.note & 0xFFFF);
+    }
+    float step_sec = 60.0f / std::max(g_bpm, 20.0f) / 4.0f;
+
+    // Stop live audio so we don't race the engine's global state.
+    bool was_playing = g_playing;
+    stop_playback();
+    acid_stop();
+
+    int rc = acid_render_wav(path.string().c_str(), notes,
+                             g_pattern_length, step_sec, /*loops=*/4);
+
+    acid_start();                        // restart the live audio thread
+    if (was_playing) start_playback();
+
+    set_toast(rc == 0 ? "\xe2\x9c\x93 wav \xe2\x86\x92 bounce.wav"
+                      : "\xe2\x9c\x97 wav failed");
+    return rc == 0;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Audio plumbing
 // ─────────────────────────────────────────────────────────────────────────────
@@ -363,15 +715,24 @@ static void push_params() {
 static void tick(float dt) {
     push_params();
 
-    if (!g_playing) return;
+    // Toast fade runs whether or not playback is active.
+    if (g_toast_t > 0.0f) g_toast_t = std::max(0.0f, g_toast_t - dt);
+
+    if (!g_playing) { g_step_phase = 0.0f; return; }
 
     // 16th-note step duration from BPM
     float step_sec = 60.0f / std::max(g_bpm, 20.0f) / 4.0f;
     g_step_clock += dt;
 
+    // Track normalised position within the current step for smooth UI fades.
+    g_step_phase = std::clamp(
+        static_cast<float>(g_step_clock / std::max(step_sec, 1e-3f)),
+        0.0f, 1.0f);
+
     if (g_step_clock >= step_sec) {
         g_step_clock -= step_sec;
         g_current_step = (g_current_step + 1) % g_pattern_length;
+        g_step_phase   = 0.0f;
 
         const auto& s = g_steps[static_cast<size_t>(g_current_step)];
         if (!s.rest) {
@@ -455,6 +816,43 @@ static void handle_event(const Event& ev) {
     if (key(ev, SpecialKey::Tab))     { cycle_focus(+1); return; }
     if (key(ev, SpecialKey::BackTab)) { cycle_focus(-1); return; }
 
+    // ── Global pattern / I/O actions ────────────────────────────────────────
+    // Randomization: lowercase `r` dice-rolls the currently-focused section
+    // only ("randomize what I'm looking at"); uppercase `R` dice-rolls
+    // everything (knobs + pattern) for a full fresh patch + groove combo.
+    // The sequencer's previous per-step rest toggle moved to `m` (mute).
+    if (key(ev, 'r')) {
+        if (g_focus == Section::Knobs) randomize_knobs();
+        else                           randomize_pattern();
+        return;
+    }
+    if (key(ev, 'R')) { randomize_everything(); return; }
+    if (key(ev, 'e')) { export_wav(); return; }
+    // Save slots: Shift+digit saves, digit alone loads. Slot 0 is a bottom-of-
+    // the-stack auto-slot (no binding); users address slots 1..9.
+    {
+        const KeyEvent* k = as_key(ev);
+        if (k) {
+            auto* ck = std::get_if<CharKey>(&k->key);
+            if (ck) {
+                char c = static_cast<char>(ck->codepoint);
+                // Shift+1..9 = save; characters '!'…'(' arrive as the US
+                // keyboard's shifted digit pair, so accept either form.
+                static constexpr const char* kShiftedDigits = ")!@#$%^&*(";
+                for (int i = 1; i <= 9; ++i) {
+                    if (c == kShiftedDigits[i]) { save_pattern_slot(i); return; }
+                }
+                // Only handle plain digits when the sequencer isn't focused
+                // (those keys don't mean anything to sequencer editing anyway,
+                // but keeping the guard makes the intent explicit).
+                if (c >= '1' && c <= '9' && k->mods.none()) {
+                    load_pattern_slot(c - '0');
+                    return;
+                }
+            }
+        }
+    }
+
     // ── Section-specific keys ────────────────────────────────────────────────
     switch (g_focus) {
         case Section::Knobs: {
@@ -478,7 +876,9 @@ static void handle_event(const Event& ev) {
             if (key(ev, '>') || key(ev, '.')) { s.note = std::min(s.note + 12, 96); return; }
             if (key(ev, 'a')) { s.accent = !s.accent; s.rest = false; return; }
             if (key(ev, 's')) { s.slide  = !s.slide;  s.rest = false; return; }
-            if (key(ev, 'r')) { s.rest   = !s.rest; return; }
+            // `m` for mute (rest toggle) — `r` is the global randomize key
+            // now, so per-step rest moves here. Mnemonic: muted step = rest.
+            if (key(ev, 'm')) { s.rest   = !s.rest; return; }
             // letter notes — keep octave of current step
             {
                 const KeyEvent* k = as_key(ev);
@@ -721,11 +1121,20 @@ static Element render_frame() {
 
     auto knob_row   = build_knob_row();
     auto filter_box = tb303::build_filter_response(g_cutoff, g_resonance);
+    auto scope_box  = tb303::build_scope();
     auto transport  = tb303::build_transport(ts);
 
+    // Left column stacks FILTER RESPONSE on top of SCOPE so the two visual
+    // analyses share the same width (both read horizontally as log-freq /
+    // time), while TRANSPORT owns the right side.
+    auto left_col = (dsl::v(
+        std::move(filter_box) | dsl::grow(3),
+        std::move(scope_box)  | dsl::grow(2)
+    ) | dsl::gap(0) | dsl::grow(1)).build();
+
     auto middle_row = (dsl::h(
-        std::move(filter_box) | dsl::grow(2),
-        std::move(transport)  | dsl::grow(3)
+        std::move(left_col)  | dsl::grow(2),
+        std::move(transport) | dsl::grow(3)
     ) | dsl::gap(1) | dsl::grow(1)).build();
 
     auto seq = tb303::build_sequencer(g_steps, g_pattern_length, g_step_sel,
@@ -740,10 +1149,21 @@ static Element render_frame() {
 
     // Title bar: a compact brand strip with a pulse-colored dot that flips
     // from muted → red while playing, so the play state is legible from a
-    // glance even when the transport panel is off-screen.
+    // glance even when the transport panel is off-screen. The ◆ icon brightens
+    // on the downbeat (step%4==0) and fades back over the step — an ambient
+    // cue that's easy to sync a shoulder nod to without looking at the cells.
+    bool on_downbeat = g_playing && g_current_step >= 0 && (g_current_step % 4 == 0);
+    float pulse_amt = on_downbeat ? (1.0f - g_step_phase) : 0.0f;
+    maya::Color brand_col = on_downbeat
+        ? maya::Color::rgb(
+            static_cast<uint8_t>(255),
+            static_cast<uint8_t>(138 + (255 - 138) * pulse_amt),
+            static_cast<uint8_t>(40  + (140 - 40)  * pulse_amt))
+        : tb303::clr_accent();
+
     auto brand = Element{TextElement{
         .content = "\xe2\x97\x86 TB-303",                    // ◆
-        .style   = Style{}.with_fg(tb303::clr_accent()).with_bold(),
+        .style   = Style{}.with_fg(brand_col).with_bold(),
         .wrap    = TextWrap::NoWrap,
     }};
     auto brand_sub = Element{TextElement{
@@ -751,15 +1171,50 @@ static Element render_frame() {
         .style   = Style{}.with_fg(tb303::clr_muted()),
         .wrap    = TextWrap::NoWrap,
     }};
-    auto pulse = Element{TextElement{
-        .content = g_playing ? "\xe2\x97\x8f  live" : "\xe2\x97\x8b  idle",  // ● / ○
-        .style   = Style{}.with_fg(g_playing ? tb303::clr_hot() : tb303::clr_muted())
-                         .with_bold(),
-        .wrap    = TextWrap::NoWrap,
-    }};
-    auto title_bar = (dsl::h(
-        std::move(brand), std::move(brand_sub), dsl::space, std::move(pulse)
-    ) | dsl::padding(0, 1, 0, 1)).build();
+
+    // Right-side status. When a toast is active it REPLACES the play indicator
+    // (single element at the right edge) so there's never both a toast AND a
+    // "live" glyph on the header at the same time. When the toast timer hits
+    // zero we also clear the string so nothing stale can leak into a later
+    // render path.
+    Element status_el;
+    if (g_toast_t > 0.0f) {
+        float t = g_toast_t / kToastDur;
+        uint8_t r = static_cast<uint8_t>(120 + (255 - 120) * t);
+        uint8_t g = static_cast<uint8_t>(120 + ( 70 - 120) * t);
+        uint8_t b = static_cast<uint8_t>(120 + ( 70 - 120) * t);
+        status_el = Element{TextElement{
+            .content = g_toast,
+            .style   = Style{}.with_fg(maya::Color::rgb(r, g, b)).with_bold(),
+            .wrap    = TextWrap::NoWrap,
+        }};
+    } else {
+        if (!g_toast.empty()) g_toast.clear();
+        status_el = Element{TextElement{
+            .content = g_playing ? "\xe2\x97\x8f  live" : "\xe2\x97\x8b  idle",
+            .style   = Style{}.with_fg(g_playing ? tb303::clr_hot() : tb303::clr_muted())
+                             .with_bold(),
+            .wrap    = TextWrap::NoWrap,
+        }};
+    }
+
+    // Group brand on the left, status on the right, with `justify(SpaceBetween)`
+    // doing the separation. Previously this used a manual `dsl::space` spacer
+    // between brand_sub and status_el. That worked but left a subtle artefact:
+    // as the status text shrank (long toast → short "● live"), the spacer had
+    // to grow to compensate, and on some terminals the last columns of the old
+    // toast text lingered visually until the next full repaint. Using
+    // SpaceBetween puts each group at a fixed edge, so the status swap happens
+    // in-place at the right margin and old glyphs are always overwritten.
+    auto brand_group = dsl::hstack().gap(0)(
+        std::move(brand),
+        std::move(brand_sub)
+    );
+    auto title_bar = dsl::hstack()
+        .padding(0, 1, 0, 1)
+        .justify(Justify::SpaceBetween)
+        .align_items(Align::Center)
+        (std::move(brand_group), std::move(status_el));
 
     // Help replaces the main workspace (keeps title + status bar visible) so
     // the user always has context and knows how to close it.

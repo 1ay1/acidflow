@@ -42,6 +42,9 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <vector>
 
 namespace acid {
 namespace {
@@ -93,6 +96,21 @@ bool  g_note_accented = false;
 // Output-stage DC blocker
 float g_hpf_xprev = 0.0f;
 float g_hpf_yprev = 0.0f;
+
+// ── Scope + meter taps ──────────────────────────────────────────────────────
+// Lock-free single-producer / single-consumer ring. Audio thread writes into
+// g_scope_buf at g_scope_w (relaxed → release bump); UI thread reads the
+// most-recent N samples during render. Only the write index needs atomicity;
+// the buffer itself is racy under pathological timing but we only draw, not
+// process, so a tearing sample is visually invisible.
+constexpr int kScopeRingSize = 4096;
+float                 g_scope_buf[kScopeRingSize] = {};
+std::atomic<uint32_t> g_scope_w{0};
+
+// Peak envelope: max |sample| over a ~100 ms window, one-pole decay for nice
+// meter ballistics. UI reads the atomic once per frame.
+std::atomic<float> g_peak{0.0f};
+float              g_peak_env = 0.0f;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -308,7 +326,17 @@ void render(float* out, int frames) {
         g_hpf_yprev = y_hpf;
 
         out[i] = y_hpf;
+
+        // Scope tap: store in ring; peak envelope decays ~100 ms.
+        uint32_t w = g_scope_w.load(std::memory_order_relaxed);
+        g_scope_buf[w & (kScopeRingSize - 1)] = y_hpf;
+        g_scope_w.store(w + 1, std::memory_order_release);
+
+        float abs_y = std::fabs(y_hpf);
+        if (abs_y > g_peak_env) g_peak_env = abs_y;
+        else                    g_peak_env *= 0.9995f;   // ~100 ms decay @ 44.1kHz
     }
+    g_peak.store(g_peak_env, std::memory_order_relaxed);
 }
 
 }  // namespace acid
@@ -341,6 +369,114 @@ void acid_note_on(float freq, int accent, int slide, float step_sec) {
 void acid_note_off() {
     acid::g_cmd_flags.store(0, std::memory_order_relaxed);
     acid::g_cmd_seq.fetch_add(1, std::memory_order_release);
+}
+
+int acid_scope_tail(float* dst, int n) {
+    if (!dst || n <= 0) return 0;
+    int avail = std::min(n, acid::kScopeRingSize);
+    uint32_t w = acid::g_scope_w.load(std::memory_order_acquire);
+    // Copy the most-recent `avail` samples ending at w-1. Done with two
+    // memcpys straddling the ring's wrap point — avoids per-sample work.
+    uint32_t start = w - static_cast<uint32_t>(avail);
+    for (int i = 0; i < avail; ++i) {
+        dst[i] = acid::g_scope_buf[(start + i) & (acid::kScopeRingSize - 1)];
+    }
+    return avail;
+}
+
+float acid_output_peak(void) {
+    return acid::g_peak.load(std::memory_order_relaxed);
+}
+
+// ── Offline WAV render ──────────────────────────────────────────────────────
+// Runs the same DSP pipeline as live playback but synchronously — we drive
+// the command ring from this thread and pump render() ourselves. Engine
+// globals are shared with the live audio thread, so the caller must have
+// stopped live playback for the duration (main.cpp does acid_stop()→render→
+// acid_start()).
+int acid_render_wav(const char* path,
+                    const int*  notes,
+                    int         pattern_length,
+                    float       step_sec,
+                    int         loops) {
+    if (!path || !notes || pattern_length <= 0 || loops <= 0 || step_sec <= 0.0f)
+        return -1;
+
+    FILE* f = std::fopen(path, "wb");
+    if (!f) return -1;
+
+    const int   sr          = acid::sample_rate();
+    const float step_freq_mul = std::pow(2.0f, acid::g_params.tuning.load() / 12.0f);
+    const int   total_steps = pattern_length * loops;
+    const int   total_frames = static_cast<int>(
+        static_cast<double>(total_steps) * step_sec * sr);
+
+    // ── WAV header (44-byte RIFF/PCM, 16-bit mono) ─────────────────────────
+    auto write_u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
+    auto write_u16 = [&](uint16_t v) { std::fwrite(&v, 2, 1, f); };
+    uint32_t data_bytes = static_cast<uint32_t>(total_frames) * 2u;
+    std::fwrite("RIFF", 1, 4, f);
+    write_u32(36u + data_bytes);
+    std::fwrite("WAVEfmt ", 1, 8, f);
+    write_u32(16);                              // PCM fmt chunk size
+    write_u16(1);                               // PCM
+    write_u16(1);                               // mono
+    write_u32(static_cast<uint32_t>(sr));
+    write_u32(static_cast<uint32_t>(sr * 2));   // byte rate
+    write_u16(2);                               // block align
+    write_u16(16);                              // bits per sample
+    std::fwrite("data", 1, 4, f);
+    write_u32(data_bytes);
+
+    // Reset engine state so every bounce starts from silence.
+    acid::g_phase = 0.0f;
+    acid::g_fs[0] = acid::g_fs[1] = acid::g_fs[2] = acid::g_fs[3] = 0.0f;
+    acid::g_fb = 0.0f;
+    acid::g_meg = acid::g_veg = acid::g_acc_env = 0.0f;
+    acid::g_gate = false; acid::g_note_accented = false;
+    acid::g_hpf_xprev = acid::g_hpf_yprev = 0.0f;
+    acid::g_current_freq = acid::g_target_freq = 100.0f;
+
+    // Drive the sequencer step by step.
+    constexpr int kBlock = 256;
+    std::vector<float> buf(kBlock);
+    std::vector<int16_t> out16(kBlock);
+    auto midi_to_hz = [](int m) {
+        return 440.0f * std::pow(2.0f, (m - 69) / 12.0f);
+    };
+
+    int written = 0;
+    for (int si = 0; si < total_steps && written < total_frames; ++si) {
+        int  idx   = si % pattern_length;
+        int  enc   = notes[idx];
+        int  midi  = enc & 0xFFFF;
+        int  flags = (enc >> 16) & 0xFF;
+        bool rest  = (flags & 1);
+        bool acc   = (flags & 2);
+        bool sld   = (flags & 4);
+
+        if (!rest) {
+            acid_note_on(midi_to_hz(midi) * step_freq_mul,
+                         acc ? 1 : 0, sld ? 1 : 0, step_sec);
+        }
+
+        int step_frames = static_cast<int>(step_sec * sr);
+        while (step_frames > 0 && written < total_frames) {
+            int n = std::min({kBlock, step_frames, total_frames - written});
+            acid::render(buf.data(), n);
+            for (int i = 0; i < n; ++i) {
+                float s = std::clamp(buf[i], -1.0f, 1.0f);
+                out16[static_cast<size_t>(i)] =
+                    static_cast<int16_t>(s * 32767.0f);
+            }
+            std::fwrite(out16.data(), 2, static_cast<size_t>(n), f);
+            written     += n;
+            step_frames -= n;
+        }
+    }
+
+    std::fclose(f);
+    return 0;
 }
 
 }  // extern "C"

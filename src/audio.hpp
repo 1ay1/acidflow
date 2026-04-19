@@ -27,6 +27,32 @@ void acid_set_waveform(int v);
 void acid_note_on(float freq, int accent, int slide, float step_sec);
 void acid_note_off(void);
 
+// Pull the most-recent `n` samples out of the scope ring (capped at the ring
+// size, 4096). The UI polls this each render frame to draw the oscilloscope.
+// Returns the number of samples actually written. If the engine hasn't run
+// yet (or `n` is 0), writes nothing and returns 0.
+int acid_scope_tail(float* dst, int n);
+
+// Peak output level over the last ~100ms of audio — a decaying envelope the UI
+// can use to drive level meters. 0..1+ (can briefly exceed 1 during tanh
+// clipping peaks).
+float acid_output_peak(void);
+
+// Offline WAV bounce: render `pattern_length * step_sec * loops` seconds of
+// audio into `path` at 44.1kHz, 16-bit PCM mono, with the sequencer driving
+// notes as per the passed pattern. Uses the same DSP as live playback but
+// runs synchronously so it can't drop frames. The UI should NOT be running
+// `acid_start()` for the duration of the call (engine globals are shared).
+// Returns 0 on success, -1 on file-open failure.
+//
+// The `notes` array carries 16 entries; each slot is (midi, flags) packed as
+// one int per step where flags are bits {rest=1, accent=2, slide=4}.
+int acid_render_wav(const char* path,
+                    const int*  notes,       // pattern_length entries
+                    int         pattern_length,
+                    float       step_sec,
+                    int         loops);
+
 #ifdef __cplusplus
 }
 #endif

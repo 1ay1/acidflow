@@ -32,6 +32,11 @@ using namespace maya;
     children.push_back(heading("Global"));
     children.push_back(row("Tab / S-Tab",  "cycle focus between sections"));
     children.push_back(row("Space",        "play / pause"));
+    children.push_back(row("r",            "randomize current section (knobs OR pattern)"));
+    children.push_back(row("R",            "randomize everything (knobs AND pattern)"));
+    children.push_back(row("e",            "export pattern as WAV (4 loops)"));
+    children.push_back(row("!..(  (S-1..9)","save pattern to slot 1..9"));
+    children.push_back(row("1..9",         "load pattern from slot 1..9"));
     children.push_back(row("?",            "toggle this help"));
     children.push_back(row("q / Esc",      "quit"));
     children.push_back(Element{TextElement{.content = ""}});
@@ -50,8 +55,8 @@ using namespace maya;
     children.push_back(row("< / >",        "octave down / up"));
     children.push_back(row("a",            "toggle accent on step"));
     children.push_back(row("s",            "toggle slide into next step"));
-    children.push_back(row("r",            "toggle rest (note on / off)"));
-    children.push_back(row(".",            "clear step (set to rest)"));
+    children.push_back(row("m",            "toggle mute/rest (note on / off)"));
+    children.push_back(row("x",            "clear step (note + flags)"));
     children.push_back(row("c d e f g a b","set root pitch at current octave"));
     children.push_back(Element{TextElement{.content = ""}});
 
@@ -65,6 +70,8 @@ using namespace maya;
         .border(BorderStyle::Double)
         .border_color(clr_accent())
         .border_text(" HELP — press ? or Esc to close ", BorderTextPos::Top)
+        .align_self(Align::Stretch)      // fill cross-axis (width) of parent
+        .grow(1.0f)                      // fill remaining vertical space
         .padding(1, 3, 1, 3)(std::move(children));
 }
 

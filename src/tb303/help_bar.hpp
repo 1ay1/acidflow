@@ -32,7 +32,7 @@ using namespace maya;
             items.push_back({"<  >",  "octave"});
             items.push_back({"a",    "accent"});
             items.push_back({"s",    "slide"});
-            items.push_back({"r",    "rest"});
+            items.push_back({"m",    "mute"});
             items.push_back({"x",    "clear"});
             break;
         case Section::Transport:
@@ -42,6 +42,8 @@ using namespace maya;
             break;
     }
     items.push_back({"space", "play"});
+    items.push_back({"r/R",   "rand/all"});
+    items.push_back({"e",     "wav"});
     items.push_back({"?",     help_open ? "close" : "help"});
     items.push_back({"q",     "quit"});
 
