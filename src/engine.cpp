@@ -70,6 +70,7 @@ struct Params {
     std::atomic<float> env_mod    {0.70f};  // 0..1 → 0..5 octaves of sweep
     std::atomic<float> decay      {0.40f};  // 0..1 → 0.2..2 s (MEG)
     std::atomic<float> accent_amt {0.55f};  // 0..1
+    std::atomic<float> drive      {0.20f};  // 0..1 → tanh pre-gain (post-VCA)
     std::atomic<float> tuning     {0.0f};   // ±12 semitones
     std::atomic<float> master_vol {0.60f};
     std::atomic<int>   waveform   {0};      // 0 = saw, 1 = square
@@ -309,8 +310,17 @@ void render(float* out, int frames) {
     const float envmod_k = g_params.env_mod.load();
     const float decay_k  = g_params.decay.load();
     const float acc_amt  = g_params.accent_amt.load();
+    const float drive_k  = g_params.drive.load();
     const int   wf       = g_params.waveform.load();
     const float master   = g_params.master_vol.load();
+
+    // Output-stage drive. 0 = barely-there tanh (1.3× pre-gain, historical
+    // 303-into-mixer level), 1 = "303 into a fuzzpedal" (≈ 6× pre-gain with
+    // post-normalise). The pre-gain gets compensated on the way out so the
+    // overall loudness stays roughly matched as the user sweeps drive — this
+    // turns the knob into a TEXTURE knob, not a volume knob.
+    const float drive_pre  = 1.3f + drive_k * 4.7f;      // 1.3..6.0
+    const float drive_norm = 1.0f / std::tanh(drive_pre);
 
     // MEG time constant: accent bypasses the Decay pot and forces ~200 ms.
     const float meg_tau  = g_note_accented ? 0.2f : decay_knob_to_seconds(decay_k);
@@ -453,7 +463,9 @@ void render(float* out, int frames) {
 
         // Post-VCA soft clip — the real BA662 VCA starts compressing before
         // the rail; tanh with modest drive captures the "bite" on accents.
-        y = std::tanh(y * 1.3f);
+        // The DRIVE knob scales the pre-gain and we divide by tanh(pre) so
+        // perceived loudness is roughly constant as drive sweeps.
+        y = std::tanh(y * drive_pre) * drive_norm;
 
         // 16 Hz single-pole HPF (matches the output-coupling cap, also
         // removes any DC drift from the filter at low cutoffs).
@@ -487,6 +499,7 @@ void acid_set_resonance(float v)   { acid::g_params.resonance.store(v); }
 void acid_set_env_mod(float v)     { acid::g_params.env_mod.store(v); }
 void acid_set_decay(float v)       { acid::g_params.decay.store(v); }
 void acid_set_accent_amt(float v)  { acid::g_params.accent_amt.store(v); }
+void acid_set_drive(float v)       { acid::g_params.drive.store(v); }
 void acid_set_volume(float v)      { acid::g_params.master_vol.store(v); }
 void acid_set_tuning_semi(float v) { acid::g_params.tuning.store(v); }
 void acid_set_waveform(int v)      { acid::g_params.waveform.store(v); }

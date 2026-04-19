@@ -39,6 +39,7 @@ using namespace maya;
             items.push_back({"\xe2\x86\x91\xe2\x86\x93", "preset"}); // ↑↓
             items.push_back({"[  ]",  "bpm"});
             items.push_back({"{  }",  "length"});
+            items.push_back({"-  =",  "swing"});
             break;
     }
     items.push_back({"space", "play"});

@@ -56,6 +56,7 @@ static float g_resonance = 0.75f;
 static float g_env_mod   = 0.65f;
 static float g_decay     = 0.30f;
 static float g_accent    = 0.65f;
+static float g_drive     = 0.20f;   // output tanh pre-gain
 static float g_volume    = 0.65f;
 static int   g_wave      = 0;       // 0 = saw, 1 = square
 
@@ -71,6 +72,11 @@ static double g_step_clock    = 0.0;    // accumulated seconds within current st
 // Back" at 122. 128+ pushes into acid techno territory (Beltram, Hawtin).
 static bool  g_playing = false;
 static float g_bpm     = 122.0f;
+// Swing: 0.50 = straight 16ths, 0.62 ≈ classic MPC swing, 0.66 = hard
+// shuffle. Even-indexed steps (0,2,4…) play on the grid; odd-indexed steps
+// are delayed by (swing − 0.5) × one-pair duration so the pair still sums
+// to two 16ths. Applies uniformly to all steps so every pattern grooves.
+static float g_swing   = 0.50f;
 
 // UI focus
 static Section g_focus      = Section::Sequencer;
@@ -101,7 +107,7 @@ static void set_toast(std::string s) {
 // right ordering: OSC (TUNE+WAVE) → VCF (CUTOFF+RES+ENVMOD) → EG (DECAY) →
 // VCA (ACCENT+VOL). Reading the strip is reading the block diagram.
 enum KnobIdx {
-    K_TUNE = 0, K_WAVE, K_CUTOFF, K_RES, K_ENV, K_DECAY, K_ACCENT, K_VOL,
+    K_TUNE = 0, K_WAVE, K_CUTOFF, K_RES, K_ENV, K_DECAY, K_ACCENT, K_DRIVE, K_VOL,
     K_COUNT
 };
 
@@ -132,6 +138,8 @@ static KnobDesc g_knob_table[K_COUNT] = {
         "filter envelope length  [0.2 \xe2\x80\x93 2 s, bypassed on accent]"},
     {"ACCENT", &g_accent,     0.65f, "C\xe2\x82\x81\xe2\x82\x83",  // C₁₃
         "accent emphasis  [cap stacks across consecutive accents]"},
+    {"DRIVE",  &g_drive,      0.20f, "\xe2\x88\xab",   // ∫ (integrator / saturator glyph)
+        "output stage saturation  [clean \xe2\x86\x92 pedal-grit]"},
     {"VOL",    &g_volume,     0.65f, "VCA",
         "master output level"},
 };
@@ -173,6 +181,7 @@ static std::string format_knob(int idx) {
         }
         case K_RES:
         case K_ACCENT:
+        case K_DRIVE:
         case K_VOL:
             std::snprintf(buf, sizeof(buf), "%d%%",
                 static_cast<int>(std::round(*g_knob_table[idx].value * 100.0f)));
@@ -707,6 +716,7 @@ static void push_params() {
     acid_set_env_mod(g_env_mod);
     acid_set_decay(g_decay);
     acid_set_accent_amt(g_accent);
+    acid_set_drive(g_drive);
     acid_set_volume(g_volume);
     acid_set_tuning_semi((g_tune - 0.5f) * 24.0f);
     acid_set_waveform(g_wave);
@@ -720,17 +730,28 @@ static void tick(float dt) {
 
     if (!g_playing) { g_step_phase = 0.0f; return; }
 
-    // 16th-note step duration from BPM
-    float step_sec = 60.0f / std::max(g_bpm, 20.0f) / 4.0f;
+    // 16th-note step duration from BPM, shuffled by the swing ratio. Swing
+    // lengthens even-indexed steps (on the grid) and shortens odd-indexed
+    // ones by the same amount, so each pair still sums to two straight 16ths
+    // — the rhythm stays locked to the bar while the feel shifts between
+    // straight (0.50), classic MPC (~0.58–0.62), and hard shuffle (0.66+).
+    const float base_sec = 60.0f / std::max(g_bpm, 20.0f) / 4.0f;
+    const float sw       = std::clamp(g_swing, 0.50f, 0.75f);
+    auto step_dur = [&](int step_idx) {
+        bool even = (step_idx % 2) == 0;
+        return base_sec * 2.0f * (even ? sw : (1.0f - sw));
+    };
+    const float cur_dur = (g_current_step < 0) ? base_sec : step_dur(g_current_step);
+
     g_step_clock += dt;
 
     // Track normalised position within the current step for smooth UI fades.
     g_step_phase = std::clamp(
-        static_cast<float>(g_step_clock / std::max(step_sec, 1e-3f)),
+        static_cast<float>(g_step_clock / std::max(cur_dur, 1e-3f)),
         0.0f, 1.0f);
 
-    if (g_step_clock >= step_sec) {
-        g_step_clock -= step_sec;
+    if (g_step_clock >= cur_dur) {
+        g_step_clock -= cur_dur;
         g_current_step = (g_current_step + 1) % g_pattern_length;
         g_step_phase   = 0.0f;
 
@@ -742,7 +763,7 @@ static void tick(float dt) {
             int  prev = (g_current_step - 1 + g_pattern_length) % g_pattern_length;
             bool do_slide = s.slide && !g_steps[static_cast<size_t>(prev)].rest;
             acid_note_on(midi_to_hz(s.note), s.accent ? 1 : 0,
-                         do_slide ? 1 : 0, step_sec);
+                         do_slide ? 1 : 0, step_dur(g_current_step));
         }
     }
 }
@@ -907,6 +928,10 @@ static void handle_event(const Event& ev) {
             if (key(ev, ']')) { g_bpm = std::min(220.0f, g_bpm + 2.0f); return; }
             if (key(ev, '{')) { g_pattern_length = std::max(4, g_pattern_length - 1); return; }
             if (key(ev, '}')) { g_pattern_length = std::min(16, g_pattern_length + 1); return; }
+            // Swing: 0.50 straight → 0.75 hard shuffle. Step is 2% so three
+            // taps from centre lands on the canonical MPC-56/58/60/62 feels.
+            if (key(ev, '-')) { g_swing = std::max(0.50f, g_swing - 0.02f); return; }
+            if (key(ev, '=')) { g_swing = std::min(0.75f, g_swing + 0.02f); return; }
             if (key(ev, ',')) { load_preset(g_preset_index - 1); return; }
             if (key(ev, '.')) { load_preset(g_preset_index + 1); return; }
             break;
@@ -936,6 +961,7 @@ static Element build_knob_row() {
             case K_ENV:    return Color::rgb( 90, 200, 220);
             case K_DECAY:  return Color::rgb(230, 180,  90); // ENV    amber
             case K_ACCENT: return Color::rgb(120, 210, 140); // AMP    green
+            case K_DRIVE:  return Color::rgb(120, 210, 140);
             case K_VOL:    return Color::rgb(120, 210, 140);
         }
         return tb303::clr_accent();
@@ -975,7 +1001,7 @@ static Element build_knob_row() {
     std::vector<Element> cols;
     cols.reserve(K_COUNT);
     for (int i : {K_TUNE, K_WAVE, K_CUTOFF, K_RES,
-                  K_ENV,  K_DECAY, K_ACCENT, K_VOL}) {
+                  K_ENV,  K_DECAY, K_ACCENT, K_DRIVE, K_VOL}) {
         cols.push_back(build_one(i));
     }
     auto strip = (dsl::h(std::move(cols)) | dsl::gap(1)
@@ -987,10 +1013,10 @@ static Element build_knob_row() {
     // columns beneath it, and rails are composed into an hstack with gap(1)
     // — mirroring the knob strip's structure cell-for-cell, so both rows
     // centre to identical positions under justify(Center).
-    //   OSC = TUNE(8)   + gap + WAVE(8)                 = 17
-    //   VCF = CUTOFF(8) + gap + RES(8) + gap + ENV(8)   = 26
-    //   EG  = DECAY(8)                                  =  8
-    //   VCA = ACCENT(8) + gap + VOL(8)                  = 17
+    //   OSC = TUNE(8)   + gap + WAVE(8)                       = 17
+    //   VCF = CUTOFF(8) + gap + RES(8)    + gap + ENV(8)      = 26
+    //   EG  = DECAY(8)                                        =  8
+    //   VCA = ACCENT(8) + gap + DRIVE(8)  + gap + VOL(8)      = 26
     auto build_rail = [](const char* label, int width, maya::Color c) -> Element {
         int label_cols   = static_cast<int>(std::string_view(label).size());
         int dashes_total = std::max(0, width - 2 /*spaces*/ - label_cols);
@@ -1029,7 +1055,7 @@ static Element build_knob_row() {
         build_rail("OSC", 17, group_color_for(K_TUNE)),
         build_rail("VCF", 26, group_color_for(K_CUTOFF)),
         build_rail("EG",   8, group_color_for(K_DECAY)),
-        build_rail("VCA", 17, group_color_for(K_VOL))
+        build_rail("VCA", 26, group_color_for(K_VOL))
     ) | dsl::gap(1) | dsl::justify(Justify::Center)).build();
 
     // Caption row: shows the focused knob's description inline with the
@@ -1111,6 +1137,7 @@ static Element render_frame() {
     tb303::TransportState ts{
         .playing        = g_playing,
         .bpm            = g_bpm,
+        .swing          = g_swing,
         .pattern_length = g_pattern_length,
         .current_step   = g_current_step,
         .pattern_index  = g_preset_index,

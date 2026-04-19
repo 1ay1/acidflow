@@ -65,6 +65,7 @@ using namespace maya;
     children.push_back(row(", / .",        "previous / next preset (alt)"));
     children.push_back(row("[ / ]",        "bpm -/+ 2"));
     children.push_back(row("{ / }",        "pattern length"));
+    children.push_back(row("- / =",        "swing (50% straight \xe2\x86\x92 75% hard shuffle)"));
 
     return dsl::vstack()
         .border(BorderStyle::Double)

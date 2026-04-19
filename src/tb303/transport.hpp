@@ -30,6 +30,7 @@ struct PresetSummary {
 struct TransportState {
     bool                        playing;
     float                       bpm;
+    float                       swing;            // 0.50 = straight, 0.62 ≈ MPC
     int                         pattern_length;
     int                         current_step;     // -1 when stopped
     int                         pattern_index;
@@ -123,7 +124,21 @@ struct RichText {
         std::snprintf(len_buf, sizeof(len_buf), "%d", t.pattern_length);
         status.push("\xe2\x96\xae ", Style{}.with_fg(clr_accent()));      // ▮
         status.push(len_buf,         Style{}.with_fg(clr_text()).with_bold());
-        status.push(" STEPS",        Style{}.with_fg(clr_muted()));
+        status.push(" STEPS   ",     Style{}.with_fg(clr_muted()));
+
+        // Swing — "∿ 50%" straight, brightens to hot red as shuffle increases.
+        // The glyph pulses from muted → accent → hot as the knob passes the
+        // subtle (~55%) and classic-MPC (~62%) thresholds.
+        int swing_pct = static_cast<int>(std::round(t.swing * 100.0f));
+        Color sw_col;
+        if (swing_pct <= 50)       sw_col = clr_muted();
+        else if (swing_pct < 58)   sw_col = clr_accent();
+        else                       sw_col = clr_hot();
+        status.push("\xe2\x88\xbf ", Style{}.with_fg(sw_col).with_bold());     // ∿
+        char sw_buf[8];
+        std::snprintf(sw_buf, sizeof(sw_buf), "%d%%", swing_pct);
+        status.push(sw_buf,  Style{}.with_fg(clr_text()).with_bold());
+        status.push(" SWING", Style{}.with_fg(clr_muted()));
     }
 
     // ── Row 2: playhead progress bar ─────────────────────────────────────────

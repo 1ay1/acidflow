@@ -18,6 +18,7 @@ void acid_set_resonance(float v);
 void acid_set_env_mod(float v);
 void acid_set_decay(float v);
 void acid_set_accent_amt(float v);
+void acid_set_drive(float v);
 void acid_set_volume(float v);
 void acid_set_tuning_semi(float v);
 void acid_set_waveform(int v);
