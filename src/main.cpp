@@ -94,6 +94,16 @@ static std::string g_toast;
 static float       g_toast_t    = 0.0f;    // seconds remaining
 static constexpr float kToastDur = 1.5f;
 
+// Mouse support — captured terminal size (updated each frame via the root
+// component wrapper and by ResizeEvent) plus click-drag state for knobs. We
+// don't know widget screen positions from the framework, so hit-testing is
+// done from the known static row heights + centred widget widths below.
+static int   g_term_w = 0;
+static int   g_term_h = 0;
+static int   g_knob_drag_idx = -1;   // -1 when not dragging
+static int   g_knob_drag_y0  = 0;
+static float g_knob_drag_v0  = 0.0f;
+
 static void set_toast(std::string s) {
     g_toast   = std::move(s);
     g_toast_t = kToastDur;
@@ -822,9 +832,204 @@ static int letter_to_semitone(char c) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Mouse hit-testing & event handling
+// ─────────────────────────────────────────────────────────────────────────────
+// Layout is fixed-row at top and bottom, flex in the middle. Known heights:
+//
+//   row 0              title bar
+//   rows 1..12         SYNTH VOICE panel (border + header + 8 knob rows +
+//                      caption + border) — 12 rows total
+//   rows 13..H-9       middle row (filter + scope on the left, transport on
+//                      the right)
+//   rows H-9..H-2      SEQUENCER panel (border + STEP/PITCH/FLAG/NOTE + border)
+//   row H-1            help bar
+//
+// Centred widget widths:
+//   knob strip     : 9 knobs × 8 cols + 8 gap = 80, centred in the terminal
+//   sequencer grid : 7-col label + 16 × (3-col cell + 1 wall) + 1 final wall = 72
+//
+// For the transport preset area we don't hit-test individual preset rows (its
+// height is flex-shrunk and the body layout changes with terminal size). We
+// just carve out "right half of the middle row" as a scroll-to-browse zone,
+// which captures the most common interaction cheaply and without fragility.
+
+struct HitZone {
+    enum Kind { None, Title, Knob, Step, TransportArea };
+    Kind kind = None;
+    int  idx  = 0;
+};
+
+static HitZone hit_test(int col, int row) {
+    // SGR mouse coordinates are 1-indexed per protocol; our geometry here is
+    // 0-indexed (matches maya's internal render positions). Shift once at the
+    // boundary so the math below lines up with what the user actually sees.
+    col -= 1;
+    row -= 1;
+    if (g_term_w <= 0 || g_term_h <= 0) return {};
+    if (row < 0 || row >= g_term_h || col < 0 || col >= g_term_w) return {};
+
+    if (row == 0) return {HitZone::Title, 0};
+    if (row == g_term_h - 1) return {};
+
+    // Knob row: 12 rows tall. Clickable body is rows 2..11 (inside the border).
+    if (row >= 1 && row <= 12) {
+        constexpr int kStripW = 9 * 8 + 8;   // 80
+        int strip_start = std::max(0, (g_term_w - kStripW) / 2);
+        int rel = col - strip_start;
+        if (rel < 0 || rel >= kStripW)      return {};
+        int idx    = rel / 9;
+        int within = rel % 9;
+        if (within == 8)                     return {};   // inter-knob gap
+        if (idx < 0 || idx >= K_COUNT)       return {};
+        if (row < 2 || row > 11)             return {};   // border
+        return {HitZone::Knob, idx};
+    }
+
+    // Sequencer panel: 8 rows at the bottom (above the help bar).
+    int seq_top = g_term_h - 9;
+    int seq_bot = g_term_h - 2;
+    if (row >= seq_top && row <= seq_bot) {
+        constexpr int kSeqW = 7 + 16 * 4 + 1;   // 72
+        int seq_start = std::max(0, (g_term_w - kSeqW) / 2);
+        int rel = col - seq_start;
+        if (rel < 8 || rel >= kSeqW)        return {};   // label/left wall/overflow
+        int cell_rel = rel - 8;
+        int step    = cell_rel / 4;
+        int within  = cell_rel % 4;
+        if (within == 3)                    return {};   // between-cell wall
+        if (step < 0 || step >= 16)         return {};
+        // Only respond in the 5 data rows (skip the border rules).
+        if (row < seq_top + 1 || row > seq_top + 5) return {};
+        return {HitZone::Step, step};
+    }
+
+    // Middle row: treat the right ~3/5 as the transport zone for scroll-to-browse.
+    if (row > 12 && row < seq_top) {
+        int split = (g_term_w * 2) / 5;
+        if (col >= split)                   return {HitZone::TransportArea, 0};
+    }
+
+    return {};
+}
+
+static void handle_mouse(const MouseEvent& m) {
+    // Help overlay replaces the workspace — the row/col math for knobs and
+    // steps no longer matches the screen, so ignore mouse until it closes.
+    if (g_help_open) return;
+
+    int col = m.x.raw();
+    int row = m.y.raw();
+
+    // ── Drag continuation ──────────────────────────────────────────────────
+    // Once a knob drag starts, we keep tracking motion until the button is
+    // released — even if the cursor leaves the original knob column. This is
+    // the standard "capture" behaviour users expect from sliders.
+    if (g_knob_drag_idx >= 0 && m.kind == MouseEventKind::Move) {
+        int   dy    = g_knob_drag_y0 - row;              // up = positive
+        float new_v = std::clamp(g_knob_drag_v0 + dy * 0.02f, 0.0f, 1.0f);
+        *g_knob_table[g_knob_drag_idx].value = new_v;
+        return;
+    }
+    if (m.kind == MouseEventKind::Release) {
+        g_knob_drag_idx = -1;
+        return;
+    }
+    if (m.kind == MouseEventKind::Move) return;
+
+    HitZone z = hit_test(col, row);
+
+    // ── Scroll wheel ───────────────────────────────────────────────────────
+    if (m.button == MouseButton::ScrollUp || m.button == MouseButton::ScrollDown) {
+        int dir = (m.button == MouseButton::ScrollUp) ? +1 : -1;
+        switch (z.kind) {
+            case HitZone::Knob:
+                g_focus = Section::Knobs;
+                g_knob_sel = z.idx;
+                if (z.idx == K_WAVE) g_wave = 1 - g_wave;
+                else                 adjust_knob(z.idx, dir * 0.05f);
+                return;
+            case HitZone::Step: {
+                g_focus = Section::Sequencer;
+                g_step_sel = z.idx;
+                auto& s = g_steps[static_cast<size_t>(z.idx)];
+                s.note = std::clamp(s.note + dir, 12, 96);
+                s.rest = false;
+                return;
+            }
+            case HitZone::TransportArea:
+                g_focus = Section::Transport;
+                // Scroll-down feels like "next preset" — invert dir so wheel-down
+                // advances the list even though our logical "dir" is +1 for up.
+                load_preset(g_preset_index - dir);
+                return;
+            case HitZone::Title:
+                // Scroll on the title bar nudges BPM by 1 — discoverable cherry
+                // on top, not essential.
+                g_bpm = std::clamp(g_bpm + dir * 1.0f, 40.0f, 220.0f);
+                return;
+            default: return;
+        }
+    }
+
+    // ── Left click ─────────────────────────────────────────────────────────
+    if (m.kind == MouseEventKind::Press && m.button == MouseButton::Left) {
+        switch (z.kind) {
+            case HitZone::Title:
+                g_playing ? stop_playback() : start_playback();
+                return;
+            case HitZone::Knob:
+                g_focus = Section::Knobs;
+                g_knob_sel = z.idx;
+                if (z.idx == K_WAVE) {
+                    g_wave = 1 - g_wave;
+                } else {
+                    // Begin vertical drag. While the button is held, every
+                    // Move event updates the value relative to this anchor.
+                    g_knob_drag_idx = z.idx;
+                    g_knob_drag_y0  = row;
+                    g_knob_drag_v0  = *g_knob_table[z.idx].value;
+                }
+                return;
+            case HitZone::Step:
+                g_focus = Section::Sequencer;
+                g_step_sel = z.idx;
+                return;
+            case HitZone::TransportArea:
+                g_focus = Section::Transport;
+                return;
+            default: return;
+        }
+    }
+
+    // ── Right click ────────────────────────────────────────────────────────
+    if (m.kind == MouseEventKind::Press && m.button == MouseButton::Right) {
+        switch (z.kind) {
+            case HitZone::Knob:
+                g_focus = Section::Knobs;
+                g_knob_sel = z.idx;
+                reset_knob(z.idx);
+                return;
+            case HitZone::Step: {
+                g_focus = Section::Sequencer;
+                g_step_sel = z.idx;
+                auto& s = g_steps[static_cast<size_t>(z.idx)];
+                s.rest = !s.rest;
+                return;
+            }
+            default: return;
+        }
+    }
+}
+
 static void handle_event(const Event& ev) {
+    // Resize — keep terminal size in sync for mouse hit-tests.
+    int rw = 0, rh = 0;
+    if (resized(ev, &rw, &rh)) { g_term_w = rw; g_term_h = rh; return; }
+    if (const MouseEvent* m = as_mouse(ev)) { handle_mouse(*m); return; }
+
     // ── Global keys ──────────────────────────────────────────────────────────
-    if (key(ev, 'q') || key(ev, SpecialKey::Escape)) {
+    if (key(ev, 'q') || key(ev, 'Q') || key(ev, SpecialKey::Escape)) {
         if (g_help_open) { g_help_open = false; return; }
         maya::quit();
         return;
@@ -1277,7 +1482,7 @@ int main() {
         RunConfig{
             .title = "tb-303",
             .fps   = 30,
-            .mouse = false,
+            .mouse = true,
             .mode  = Mode::Fullscreen,
         },
         [](const Event& ev) { handle_event(ev); },
@@ -1288,7 +1493,15 @@ int main() {
             // clamp — protects against debugger pauses or initial frame
             dt = std::clamp(dt, 0.0f, 0.1f);
             tick(dt);
-            return render_frame();
+            // Wrap the whole tree in a root ComponentElement so every render
+            // pass captures the current terminal (w, h) into globals. We need
+            // these for mouse hit-testing — maya doesn't otherwise expose
+            // widget positions to user code.
+            return Element{dsl::component([](int w, int h) -> Element {
+                g_term_w = w;
+                g_term_h = h;
+                return render_frame();
+            }).grow(1)};
         }
     );
 

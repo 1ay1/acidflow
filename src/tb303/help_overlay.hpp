@@ -66,6 +66,19 @@ using namespace maya;
     children.push_back(row("[ / ]",        "bpm -/+ 2"));
     children.push_back(row("{ / }",        "pattern length"));
     children.push_back(row("- / =",        "swing (50% straight \xe2\x86\x92 75% hard shuffle)"));
+    children.push_back(Element{TextElement{.content = ""}});
+
+    children.push_back(heading("Mouse"));
+    children.push_back(row("click knob",   "focus + select"));
+    children.push_back(row("drag knob",    "adjust (vertical motion)"));
+    children.push_back(row("scroll knob",  "adjust by 5%"));
+    children.push_back(row("right-click",  "reset knob to default"));
+    children.push_back(row("click step",   "select step to edit"));
+    children.push_back(row("scroll step",  "transpose by semitone"));
+    children.push_back(row("right-click",  "toggle rest on step"));
+    children.push_back(row("click title",  "play / pause"));
+    children.push_back(row("scroll title", "nudge bpm"));
+    children.push_back(row("scroll right", "browse presets"));
 
     return dsl::vstack()
         .border(BorderStyle::Double)
