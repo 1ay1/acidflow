@@ -39,7 +39,8 @@ Type `space` to play. Press `r` to randomize. Drag a knob. Export a WAV. Quit be
 - **Song mode** — chain saved pattern slots on every wrap — and **jam mode** — turn the computer keyboard into a two-octave tracker piano.
 - **Full mouse support.** Click + drag knobs vertically. Scroll to fine-tune. Right-click to reset. Click a step to edit it. Hover onto a panel to focus it. Scroll on the title to nudge BPM.
 - **Smart randomizer.** Four character archetypes for knobs, four groove archetypes for patterns, plus `M` for one-at-a-time evolving mutations that "walk" a pattern without obliterating it.
-- **9 user save slots** (`Shift-1`…`Shift-9` to save, `1`…`9` to load). Export to **WAV** (4 loops), **MIDI** (.mid, one loop), or **shareable text** (`pattern.txt`).
+- **9 save slots** (`Shift-1`…`Shift-9` to save, `1`…`9` to load) — each slot stores the full session state (sequence, drums, all knobs, FX) in a plain-text file (`slot_1.txt`…`slot_9.txt`). Drop an AI-generated file here to load it instantly.
+- **Shareable pattern export** (`p` to export, `P` to import) — writes the current session to a single compact base64 file (`pattern.txt`) you can paste into a message or forum post. Same full state as a slot, just a different format for sharing.
 - **5 UI themes** — classic / cyber / moss / ice / mono — cycled with `T`.
 - **Cross-platform.** Linux (ALSA), macOS (CoreAudio), Windows (WASAPI). One DSP engine, three backends.
 - **Lock-free audio.** UI ↔ audio thread communication is atomic-only. Per-sample 15 ms parameter smoothing kills knob zipper. ~5–6 ms output latency.
@@ -91,7 +92,7 @@ T        cycle colour theme
 n / k    song mode / jam mode
 O / I    toggle MIDI out / MIDI sync
 e / E    export pattern as WAV / MIDI (.mid)
-p / P    export / import shareable pattern.txt
+p / P    export / import pattern.txt  (compact base64 for sharing)
 q        quit
 ```
 
@@ -184,7 +185,7 @@ Field rules:
   master_gain  0.0–1.5 for the drum bus
 ```
 
-Save the output as `slot1.txt` (or `slot2.txt` … `slot9.txt`) in:
+Save the output as `slot_1.txt` (or `slot_2.txt` … `slot_9.txt`) in:
 
 - **Linux / macOS:** `~/.config/acidflow/`
 - **Windows:** `%APPDATA%\acidflow\`

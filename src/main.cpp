@@ -132,6 +132,14 @@ static std::array<std::array<bool, 16>, kDrumVoices> g_drums{};
 static int   g_drum_voice_sel = 0;     // which row (voice) is being edited
 static int   g_drum_step_sel  = 0;     // which step in that row
 static float g_drum_master    = 1.0f;  // drum-bus master send (0 = silent)
+static std::array<bool, kDrumVoices> g_drum_voice_mute{};  // per-voice mute (s key)
+// Default per-voice gains — match the engine's initial g_seq_drum_gain values.
+static constexpr float kDrumDefaultGain[kDrumVoices] = {
+    0.95f, 0.70f, 0.35f, 0.40f, 0.60f,
+    0.80f, 0.75f, 0.55f, 0.45f,
+    0.30f, 0.35f, 0.65f,
+    0.78f, 0.50f, 0.32f, 0.55f
+};
 
 // Per-section mute toggles — `m` in any non-sequencer section flips the
 // relevant flag. Sequencer keeps `m` for its per-step rest toggle (each step
@@ -532,7 +540,7 @@ static void stop_playback();
 // File-scope archetype enums so the Vibe table can index them by int. Each
 // matches the same ordering used inside the individual randomize_X helpers.
 enum KnobsArch  { KA_CLASSIC, KA_SQUELCH, KA_DRIVING, KA_DUBBY, KA_COUNT };
-enum PatArch    { PA_PEDAL,   PA_DRIVING, PA_MELODIC, PA_DUB,   PA_COUNT };
+enum PatArch    { PA_PEDAL, PA_DRIVING, PA_MELODIC, PA_DUB, PA_STUTTER, PA_CHROM, PA_COUNT };
 enum FxArch     { FA_DRY,     FA_SLAP,    FA_DUB,     FA_CAVERN, FA_DIRTY, FA_COUNT };
 // Drum genres — must mirror the `Groove` enum inside randomize_drums().
 enum DrumArch   {
@@ -684,111 +692,201 @@ static void randomize_knobs(int arch_hint = -1, bool square_bias = false,
 // listless noise roughly 80% of the time.
 static void randomize_pattern(int arch_hint = -1, bool silent = false) {
     static std::mt19937 rng{std::random_device{}()};
-    auto U = [&]() {
-        return std::uniform_real_distribution<float>(0.0f, 1.0f)(rng);
-    };
+    auto U  = [&]() { return std::uniform_real_distribution<float>(0.0f,1.0f)(rng); };
+    auto Ui = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo,hi)(rng); };
     auto chance = [&](float p) { return U() < p; };
 
-    static constexpr int kTonic = 36;                      // C2
-    // Minor pentatonic + b7 + octave + octave+5. Each entry is the semitone
-    // offset from the tonic. Selection is weight-biased: root/5 heavy,
-    // upper notes sparse. Indices: 0=root, 1=♭3, 2=4, 3=5, 4=♭7, 5=oct,
-    // 6=oct+5.
-    static constexpr int kScale[]   = {0, 3, 5, 7, 10, 12, 15};
-    static constexpr int kWeight[]  = {7, 2, 3, 4,  2,  4,  1};  // totals 23
-    static constexpr int kWeightSum = 7+2+3+4+2+4+1;
+    // ── Scale library ───────────────────────────────────────────────────────
+    // Each scale is a set of semitone offsets from the root, with per-note
+    // weights. Higher weight = picked more often.
+    struct ScaleNote { int semi; int w; };
+    using ScaleVec = std::array<ScaleNote, 8>;
+    // minor pentatonic — classic acid
+    static constexpr ScaleVec kMinorPenta = {{{0,4},{3,3},{5,3},{7,4},{10,2},{12,3},{15,2},{19,1}}};
+    // blues — minor penta + b5 passing tone
+    static constexpr ScaleVec kBlues      = {{{0,4},{3,3},{5,2},{6,2},{7,3},{10,2},{12,3},{15,2}}};
+    // dorian — darker, more melodic
+    static constexpr ScaleVec kDorian     = {{{0,3},{2,2},{3,3},{5,2},{7,3},{9,2},{10,3},{12,3}}};
+    // phrygian — flat-2 tension
+    static constexpr ScaleVec kPhrygian   = {{{0,3},{1,3},{3,2},{5,2},{7,2},{8,2},{10,3},{12,3}}};
+    // chromatic walk — semitone motion, very acid
+    static constexpr ScaleVec kChromatic  = {{{0,3},{1,2},{2,1},{3,3},{5,2},{6,1},{7,3},{10,2}}};
+    // mixolydian — brighter
+    static constexpr ScaleVec kMixo       = {{{0,4},{2,2},{4,2},{5,3},{7,4},{9,2},{10,3},{12,3}}};
 
-    auto pick_scale_tone = [&]() -> int {
-        int r = std::uniform_int_distribution<int>(0, kWeightSum - 1)(rng);
-        int acc = 0;
-        for (size_t i = 0; i < std::size(kScale); ++i) {
-            acc += kWeight[i];
-            if (r < acc) return kScale[i];
+    const ScaleVec* scales[] = {
+        &kMinorPenta, &kBlues, &kDorian, &kPhrygian, &kChromatic, &kMixo
+    };
+    const ScaleVec& scale = *scales[Ui(0, 5)];
+
+    // Root octave — C1=24, C2=36, C3=48. Weighted toward C2.
+    static constexpr int kRoots[] = {24, 36, 36, 48};
+    int tonic = kRoots[Ui(0, 3)];
+
+    auto pick_tone = [&]() -> int {
+        int total = 0;
+        for (auto& n : scale) total += n.w;
+        int r = Ui(0, total - 1), acc = 0;
+        for (auto& n : scale) {
+            acc += n.w;
+            if (r < acc) return n.semi;
         }
-        return kScale[0];
+        return 0;
+    };
+
+    // Octave displacement — lets notes jump up/down an extra octave for range.
+    // Probability of shifting up 12 or down 12 varies by archetype.
+    auto displace = [&](int note, float up_p, float dn_p) -> int {
+        if (chance(up_p)) note += 12;
+        else if (chance(dn_p)) note -= 12;
+        return std::clamp(note, 12, 72);
     };
 
     int gr = (arch_hint >= 0)
         ? std::clamp(arch_hint, 0, PA_COUNT - 1)
-        : std::uniform_int_distribution<int>(0, PA_COUNT - 1)(rng);
+        : Ui(0, PA_COUNT - 1);
 
-    // Per-groove shape parameters.
-    //   rest_rate  : probability an off-beat becomes a rest (sparseness)
-    //   jump_rate  : probability a non-root note lands (colour-tone density)
-    //   slide_rate : base slide probability per non-rest note
-    //   accent_off : off-beat accent probability
-    float rest_rate = 0.25f, jump_rate = 0.35f, slide_rate = 0.25f, accent_off = 0.15f;
+    // Per-archetype shape parameters:
+    //   rest_rate   : off-beat rest probability (sparseness)
+    //   root_bias   : chance a non-downbeat note picks root vs scale tone
+    //   db_root     : chance a downbeat anchors to root
+    //   slide_rate  : base slide probability
+    //   accent_off  : off-beat accent probability
+    //   oct_up/dn   : octave displacement chances
+    //   prob_rate   : fraction of steps that get <100% probability
+    //   ratchet_r   : fraction of steps that get ratchet>1
+    //   plock_r     : fraction of steps that get a p-lock
+    float rest_rate=0.25f, root_bias=0.40f, db_root=0.55f;
+    float slide_rate=0.25f, accent_off=0.15f;
+    float oct_up=0.15f, oct_dn=0.10f;
+    float prob_rate=0.12f, ratchet_r=0.08f, plock_r=0.12f;
+
     switch (gr) {
-        case PA_PEDAL:   rest_rate = 0.20f; jump_rate = 0.20f; slide_rate = 0.25f; accent_off = 0.10f; break;
-        case PA_DRIVING: rest_rate = 0.05f; jump_rate = 0.30f; slide_rate = 0.20f; accent_off = 0.25f; break;
-        case PA_MELODIC: rest_rate = 0.15f; jump_rate = 0.60f; slide_rate = 0.35f; accent_off = 0.20f; break;
-        case PA_DUB:     rest_rate = 0.55f; jump_rate = 0.30f; slide_rate = 0.40f; accent_off = 0.15f; break;
+        case PA_PEDAL:
+            rest_rate=0.20f; root_bias=0.55f; db_root=0.70f;
+            slide_rate=0.20f; accent_off=0.10f;
+            oct_up=0.05f; oct_dn=0.05f;
+            prob_rate=0.08f; ratchet_r=0.04f; plock_r=0.10f;
+            break;
+        case PA_DRIVING:
+            rest_rate=0.05f; root_bias=0.30f; db_root=0.45f;
+            slide_rate=0.20f; accent_off=0.30f;
+            oct_up=0.20f; oct_dn=0.15f;
+            prob_rate=0.15f; ratchet_r=0.12f; plock_r=0.15f;
+            break;
+        case PA_MELODIC:
+            rest_rate=0.15f; root_bias=0.20f; db_root=0.40f;
+            slide_rate=0.40f; accent_off=0.20f;
+            oct_up=0.25f; oct_dn=0.20f;
+            prob_rate=0.20f; ratchet_r=0.06f; plock_r=0.20f;
+            break;
+        case PA_DUB:
+            rest_rate=0.50f; root_bias=0.35f; db_root=0.50f;
+            slide_rate=0.50f; accent_off=0.12f;
+            oct_up=0.10f; oct_dn=0.20f;
+            prob_rate=0.25f; ratchet_r=0.04f; plock_r=0.12f;
+            break;
+        case PA_STUTTER:
+            rest_rate=0.10f; root_bias=0.25f; db_root=0.40f;
+            slide_rate=0.10f; accent_off=0.35f;
+            oct_up=0.20f; oct_dn=0.10f;
+            prob_rate=0.20f; ratchet_r=0.30f; plock_r=0.15f;
+            break;
+        case PA_CHROM:
+            rest_rate=0.20f; root_bias=0.15f; db_root=0.35f;
+            slide_rate=0.45f; accent_off=0.18f;
+            oct_up=0.15f; oct_dn=0.15f;
+            prob_rate=0.15f; ratchet_r=0.08f; plock_r=0.25f;
+            break;
     }
 
-    // ── Pass 1: lay down notes + rests ──────────────────────────────────────
+    // Pattern length — driving/stutter favour 16, dub/pedal sometimes use 8
+    if (gr == PA_DUB || gr == PA_PEDAL) {
+        if (chance(0.35f)) g_pattern_length = 8;
+        else               g_pattern_length = 16;
+    }
+
+    // ── Pass 1: notes + rests ───────────────────────────────────────────────
     bool has_accent = false;
     for (int i = 0; i < g_pattern_length; ++i) {
         auto& s = g_steps[static_cast<size_t>(i)];
         s = StepData{};
         bool downbeat = (i % 4 == 0);
 
-        if (!downbeat && chance(rest_rate)) {
-            s.rest = true;
-            continue;
-        }
+        if (!downbeat && chance(rest_rate)) { s.rest = true; continue; }
 
         int pitch;
-        if (downbeat && chance(0.80f)) {
-            pitch = kTonic;
-        } else if (chance(jump_rate)) {
-            pitch = kTonic + pick_scale_tone();
+        if (downbeat && chance(db_root)) {
+            pitch = tonic;
+        } else if (chance(root_bias)) {
+            pitch = tonic;
         } else {
-            pitch = kTonic;
+            pitch = tonic + pick_tone();
         }
+        pitch = displace(pitch, oct_up, oct_dn);
+
         s.note   = pitch;
-        s.rest   = false;
-        s.accent = downbeat ? chance(0.70f) : chance(accent_off);
+        s.accent = downbeat ? chance(0.65f) : chance(accent_off);
         if (s.accent) has_accent = true;
     }
 
-    // ── Pass 2: slides (second pass so we know neighbours are real notes) ──
+    // ── Pass 2: slides ──────────────────────────────────────────────────────
     for (int i = 1; i < g_pattern_length; ++i) {
         auto& s = g_steps[static_cast<size_t>(i)];
         if (s.rest) continue;
         const auto& prev = g_steps[static_cast<size_t>(i - 1)];
         if (prev.rest) continue;
-        // More likely to slide INTO upper notes than back down to root —
-        // that's the "pull up" direction the 303 envelope emphasises.
         float p = slide_rate;
-        if (s.note > prev.note) p *= 1.5f;
-        if (chance(std::min(p, 0.9f))) s.slide = true;
+        if (s.note > prev.note) p *= 1.6f;   // upward pull sounds more natural
+        if (chance(std::min(p, 0.90f))) s.slide = true;
     }
 
-    // ── Pass 3: musical guarantees ─────────────────────────────────────────
-    // If somehow the whole bar ended up flat, force an accent on beat 1.
-    if (!has_accent) {
-        g_steps[0].accent = true;
-        g_steps[0].rest   = false;
-        if (g_steps[0].note < kTonic) g_steps[0].note = kTonic;
-    }
-    // Ensure beat 1 always plays — a pattern that starts on a rest reads as
-    // confusing when looped.
-    if (g_steps[0].rest) {
-        g_steps[0].rest = false;
-        g_steps[0].note = kTonic;
+    // ── Pass 3: probability + ratchet + p-locks ─────────────────────────────
+    static constexpr int kProbChoices[] = {75, 50, 25};
+    for (int i = 0; i < g_pattern_length; ++i) {
+        auto& s = g_steps[static_cast<size_t>(i)];
+        if (s.rest) continue;
+
+        // Probability — skip beat 1 so the pattern always anchors the loop.
+        if (i > 0 && chance(prob_rate))
+            s.prob = kProbChoices[Ui(0, 2)];
+
+        // Ratchet — favour steps with accents or off-beats for the burst feel.
+        if (chance(ratchet_r)) {
+            s.ratchet = chance(0.6f) ? 2 : (chance(0.5f) ? 3 : 4);
+            s.ratchet = std::clamp(s.ratchet, 1, 4);
+        }
+
+        // P-locks — cutoff snap or env-mod surge on interesting steps.
+        if (chance(plock_r)) {
+            // cutoff p-lock: snap to a specific frequency for this step
+            s.lock_mask   |= 0x1;
+            s.lock_cutoff  = 0.15f + U() * 0.65f;   // 0.15..0.80
+        }
+        if (chance(plock_r * 0.6f)) {
+            // env-mod p-lock: spike or suppress the sweep on this step
+            s.lock_mask |= 0x4;
+            s.lock_env   = chance(0.5f) ? (0.70f + U() * 0.30f)   // big sweep
+                                        : (U() * 0.25f);            // flat
+        }
     }
 
-    // Clear trailing steps when pattern_length < 16.
+    // ── Pass 4: musical guarantees ──────────────────────────────────────────
+    if (!has_accent) { g_steps[0].accent = true; }
+    if (g_steps[0].rest) { g_steps[0].rest = false; g_steps[0].note = tonic; }
+
     for (int i = g_pattern_length; i < 16; ++i) {
         g_steps[static_cast<size_t>(i)] = StepData{};
         g_steps[static_cast<size_t>(i)].rest = true;
     }
 
-    g_preset_index = -1;                   // mark as "custom, not a preset"
+    g_preset_index = -1;
     g_step_sel     = 0;
 
     if (!silent) {
-        static const char* kNames[PA_COUNT] = {"pedal", "driving", "melodic", "dub"};
+        static const char* kNames[PA_COUNT] = {
+            "pedal", "driving", "melodic", "dub", "stutter", "chrom"
+        };
         char buf[32];
         std::snprintf(buf, sizeof(buf), "\xe2\x86\xbb pattern: %s", kNames[gr]);
         set_toast(buf);
@@ -1334,15 +1432,20 @@ static void mutate_pattern() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 static std::filesystem::path config_dir() {
+#if defined(_WIN32)
+    const char* appdata = std::getenv("APPDATA");
+    std::filesystem::path base = appdata ? appdata : ".";
+#else
     const char* xdg = std::getenv("XDG_CONFIG_HOME");
     const char* home = std::getenv("HOME");
     std::filesystem::path base = xdg ? xdg : (home ? std::string(home) + "/.config" : std::string("."));
+#endif
     return base / "acidflow";
 }
 
 static std::filesystem::path pattern_path(int slot) {
     char buf[32];
-    std::snprintf(buf, sizeof(buf), "pattern_%d.txt", slot);
+    std::snprintf(buf, sizeof(buf), "slot_%d.txt", slot);
     return config_dir() / buf;
 }
 
@@ -2090,6 +2193,8 @@ static void push_params() {
             }
         }
         acid_seq_set_drum_lane(v, mask);
+        acid_seq_set_drum_gain(v, g_drum_voice_mute[static_cast<size_t>(v)]
+                                  ? 0.0f : kDrumDefaultGain[v]);
     }
     acid_seq_set_drum_master(g_drums_mute ? 0.0f : g_drum_master);
 }
@@ -3001,6 +3106,15 @@ static void handle_event(const Event& ev) {
                 set_toast(g_drums_mute ? "drums muted" : "drums live");
                 return;
             }
+            if (key(ev, 's')) {
+                bool& mute = g_drum_voice_mute[static_cast<size_t>(g_drum_voice_sel)];
+                mute = !mute;
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "%s %s",
+                    kDrumLabels[g_drum_voice_sel], mute ? "muted" : "live");
+                set_toast(buf);
+                return;
+            }
             // `c` clears the focused row; `C` clears the entire kit. Mirrors
             // the sequencer's `x = clear step` ergonomics at the row level.
             if (key(ev, 'c')) {
@@ -3470,7 +3584,7 @@ static Element render_frame() {
             std::move(scope_box)  | dsl::grow(2)
         );
 
-    auto drums = tb303::build_drums(g_drums,
+    auto drums = tb303::build_drums(g_drums, g_drum_voice_mute,
                                     g_drum_voice_sel, g_drum_step_sel,
                                     g_playing ? g_current_step : -1,
                                     g_drum_master,

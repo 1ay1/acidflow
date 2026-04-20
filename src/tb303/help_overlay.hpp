@@ -84,8 +84,10 @@ using namespace maya;
 
     children.push_back(heading("Drums"));
     children.push_back(row("\xe2\x86\x90 / \xe2\x86\x92",  "select step"));
-    children.push_back(row("\xe2\x86\x91 / \xe2\x86\x93",  "select voice (BD / SD / CH / OH / CL)"));
+    children.push_back(row("\xe2\x86\x91 / \xe2\x86\x93",  "select voice (BD / SD / CH / OH / CL …)"));
     children.push_back(row("space / x",    "toggle hit on selected cell"));
+    children.push_back(row("s",            "mute / unmute selected voice (shown as BDM)"));
+    children.push_back(row("m",            "mute / unmute entire drum bus"));
     children.push_back(row("1..9, 0",      "quick-toggle step 1..10 on current voice"));
     children.push_back(row("[ / ]",        "drum bus master send"));
     children.push_back(row("c",            "clear current voice row"));

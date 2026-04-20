@@ -19,6 +19,7 @@ inline constexpr int kDrumGridVoices = 16;
 
 [[nodiscard]] inline Element build_drums(
     const std::array<std::array<bool, 16>, kDrumGridVoices>& grid,
+    const std::array<bool, kDrumGridVoices>& voice_mute,
     int voice_sel,
     int step_sel,
     int playing_step,
@@ -89,17 +90,19 @@ inline constexpr int kDrumGridVoices = 16;
         std::string txt;
 
         bool row_focused = focused && (v == voice_sel);
+        bool muted = voice_mute[static_cast<size_t>(v)];
         std::string lab;
         lab += kLabels[v];
-        lab += ":";
+        lab += muted ? "M" : ":";
         while (lab.size() < 4) lab += " ";
+        Color lab_col = muted       ? clr_dim()
+                      : row_focused ? clr_accent()
+                                    : clr_muted();
         runs.push_back(StyledRun{0, lab.size(),
-            row_focused
-                ? Style{}.with_fg(clr_accent()).with_bold()
-                : Style{}.with_fg(clr_muted()).with_bold()});
+            Style{}.with_fg(lab_col).with_bold()});
         txt = std::move(lab);
 
-        Color base = row_colour(v);
+        Color base = muted ? clr_dim() : row_colour(v);
         for (int i = 0; i < 16; ++i) {
             bool cell = grid[static_cast<size_t>(v)][static_cast<size_t>(i)];
             bool is_play = (i == playing_step);
@@ -107,9 +110,10 @@ inline constexpr int kDrumGridVoices = 16;
 
             const char* glyph;
             Color fg;
-            if (cell && is_play)      { glyph = " \xe2\x96\x88 "; fg = clr_hot(); }
+            if (muted && cell)        { glyph = " \xe2\x96\x88 "; fg = clr_dim(); }
+            else if (cell && is_play) { glyph = " \xe2\x96\x88 "; fg = clr_hot(); }
             else if (cell)            { glyph = " \xe2\x96\x88 "; fg = base; }
-            else if (is_play)         { glyph = " \xe2\x94\x82 "; fg = clr_hot(); }
+            else if (is_play)         { glyph = " \xe2\x94\x82 "; fg = muted ? clr_dim() : clr_hot(); }
             else if (i % 4 == 0)      { glyph = " \xc2\xb7 ";     fg = clr_grid(); }
             else                      { glyph = " \xc2\xb7 ";     fg = clr_dim(); }
 
