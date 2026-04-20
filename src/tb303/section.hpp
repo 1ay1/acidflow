@@ -5,6 +5,6 @@
 
 namespace tb303 {
 
-enum class Section { Knobs, Sequencer, Transport };
+enum class Section { Knobs, FX, Sequencer, Drums, Transport };
 
 } // namespace tb303

@@ -37,6 +37,15 @@ struct TransportState {
     std::vector<PresetSummary>  presets;          // all presets, full data
     std::span<const StepData>   steps;            // currently-loaded 16 steps
     bool                        focused;
+    bool                        song_mode = false; // Phase 4.1: chain saved slots
+    int                         song_slot = 0;     // active slot (1..9, 0 = none)
+    bool                        jam_mode  = false; // Phase 4.2: live keyboard
+    int                         jam_octave = 3;
+    int                         jam_last_midi = -1; // -1 if nothing held
+    bool                        jam_accent = false;
+    bool                        jam_slide  = false;
+    bool                        midi_out  = false; // Phase 5: forward notes + clock
+    bool                        midi_sync = false; // Phase 5: slaved to ext clock
 };
 
 // Render a step pattern as a 16-character-wide block-character contour. Each
@@ -139,6 +148,64 @@ struct RichText {
         std::snprintf(sw_buf, sizeof(sw_buf), "%d%%", swing_pct);
         status.push(sw_buf,  Style{}.with_fg(clr_text()).with_bold());
         status.push(" SWING", Style{}.with_fg(clr_muted()));
+
+        // Song-mode badge — only drawn when active so the status line stays
+        // minimal in the common case. "♪ SONG 3" with the slot number in the
+        // hot colour so you can tell at a glance where the chain has advanced.
+        if (t.song_mode) {
+            status.push("   \xe2\x99\xaa ",                                // ♪
+                Style{}.with_fg(clr_hot()).with_bold());
+            status.push("SONG ",
+                Style{}.with_fg(clr_accent()).with_bold());
+            char ss[8];
+            std::snprintf(ss, sizeof(ss), "%d", t.song_slot);
+            status.push(ss, Style{}.with_fg(clr_hot()).with_bold());
+        }
+
+        // MIDI badges. Two compact flags — "◇ MIDI OUT" when we're forwarding
+        // events and "◇ MIDI SYNC" when we're slaved to an external clock. Use
+        // the slide colour so they read as "external signal" visually, distinct
+        // from the hot/accent palette of SONG and JAM.
+        if (t.midi_out) {
+            status.push("   \xe2\x97\x86 ",                                // ◆
+                Style{}.with_fg(clr_slide()).with_bold());
+            status.push("MIDI OUT",
+                Style{}.with_fg(clr_slide()).with_bold());
+        }
+        if (t.midi_sync) {
+            status.push("   \xe2\x97\x86 ",                                // ◆
+                Style{}.with_fg(clr_slide()).with_bold());
+            status.push("MIDI SYNC",
+                Style{}.with_fg(clr_slide()).with_bold());
+        }
+
+        // Jam-mode badge — "♬ JAM Oct3 ♩A C4" with the current octave and the
+        // last played note, plus tiny accent/slide flags so the user knows
+        // which voicing-modifiers will apply to the next keypress.
+        if (t.jam_mode) {
+            status.push("   \xe2\x99\xac ",                                // ♬
+                Style{}.with_fg(clr_hot()).with_bold());
+            status.push("JAM ",
+                Style{}.with_fg(clr_accent()).with_bold());
+            char ob[12];
+            std::snprintf(ob, sizeof(ob), "Oct%d ", t.jam_octave);
+            status.push(ob, Style{}.with_fg(clr_text()).with_bold());
+            if (t.jam_accent) {
+                status.push("A ", Style{}.with_fg(clr_hot()).with_bold());
+            }
+            if (t.jam_slide) {
+                status.push("S ", Style{}.with_fg(clr_slide()).with_bold());
+            }
+            if (t.jam_last_midi >= 0) {
+                static constexpr const char* n[12] = {
+                    "C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+                int pc = ((t.jam_last_midi % 12) + 12) % 12;
+                int oct = (t.jam_last_midi / 12) - 1;
+                char nb[12];
+                std::snprintf(nb, sizeof(nb), "\xe2\x99\xa9%s%d", n[pc], oct);
+                status.push(nb, Style{}.with_fg(clr_hot()).with_bold());
+            }
+        }
     }
 
     // ── Row 2: playhead progress bar ─────────────────────────────────────────

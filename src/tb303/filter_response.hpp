@@ -64,6 +64,51 @@ using namespace maya;
         float peak_gain = 1.0f + res01 * 3.5f;
         float damp      = 0.9f - res01 * 0.7f;
 
+        // ── Live FFT overlay ────────────────────────────────────────────────
+        // Pull a magnitude spectrum from the engine and project each bin onto
+        // the chart's log-frequency axis. We store the dB-normalised peak per
+        // column so the overlay reads as "the sound the filter is making right
+        // now" sitting on top of "the shape the filter allows". When playing,
+        // they should roughly coincide under the cutoff and duck above it —
+        // which is exactly the resonance bump made visible.
+        constexpr int kFftBins = 1024;
+        static std::vector<float> fft_mags(kFftBins, 0.0f);
+        int got_bins = acid_fft_bins(fft_mags.data(), kFftBins);
+        int sr       = acid_sample_rate();
+        std::vector<float> fft_col(static_cast<size_t>(chart_w), 0.0f);
+        if (got_bins > 0 && sr > 0) {
+            const float bin_hz = static_cast<float>(sr) / 2048.0f;
+            const float log_hi_lo = std::log(f_hi / f_lo);
+            for (int i = 1; i < got_bins; ++i) {          // skip DC
+                float fbin = static_cast<float>(i) * bin_hz;
+                if (fbin < f_lo || fbin > f_hi) continue;
+                float t = std::log(fbin / f_lo) / log_hi_lo;
+                int   c = static_cast<int>(std::round(t * (chart_w - 1)));
+                if (c < 0 || c >= chart_w) continue;
+                float m = fft_mags[static_cast<size_t>(i)];
+                if (m > fft_col[static_cast<size_t>(c)])
+                    fft_col[static_cast<size_t>(c)] = m;
+            }
+        }
+        // Normalise to dB on the same −40..+3 scale the filter curve uses,
+        // so the FFT line lives in the same vertical space as the fill and
+        // can't float off the chart.
+        std::vector<float> fft_norm(static_cast<size_t>(chart_w), 0.0f);
+        for (int c = 0; c < chart_w; ++c) {
+            float m = fft_col[static_cast<size_t>(c)];
+            if (m < 1e-5f) { fft_norm[static_cast<size_t>(c)] = 0.0f; continue; }
+            float db = 20.0f * std::log10(m);
+            fft_norm[static_cast<size_t>(c)] = std::clamp((db + 40.0f) / 43.0f, 0.0f, 1.0f);
+        }
+        // Map each column to the row its FFT peak sits in. −1 = below chart.
+        std::vector<int> fft_row(static_cast<size_t>(chart_w), -1);
+        for (int c = 0; c < chart_w; ++c) {
+            float v = fft_norm[static_cast<size_t>(c)];
+            if (v < 0.02f) continue;                      // below noise floor
+            int row = static_cast<int>(std::round(v * (chart_h - 1)));
+            fft_row[static_cast<size_t>(c)] = std::clamp(row, 0, chart_h - 1);
+        }
+
         // magnitude per column on a log frequency sweep
         std::vector<float> raw(static_cast<size_t>(chart_w));
         float mx = 0.0f;
@@ -143,6 +188,13 @@ using namespace maya;
                 Color       fg;
                 Style       st;
 
+                // FFT marker sits on top of this row iff the spectrum peak for
+                // the column lands here. We consult it after computing `b` so
+                // we can decide whether the FFT should replace an otherwise
+                // empty cell or a low-fill cell.
+                const int fft_here = fft_row[static_cast<size_t>(c)];
+                const bool fft_hit = (fft_here == row);
+
                 if (b > 0) {
                     // filled cell: heat-gradient colour + highlight the cutoff bar
                     glyph = blocks[b];
@@ -158,6 +210,13 @@ using namespace maya;
                         fg = row_col[static_cast<size_t>(row)];
                         st = Style{}.with_fg(fg).with_bold();
                     }
+                } else if (fft_hit) {
+                    // Spectrum peak in an otherwise empty cell. Draw it as a
+                    // pale cyan dotted marker — distinct hue from the filter's
+                    // warm palette so the two layers are legible at once.
+                    glyph = "\xe2\x97\xa6";               // ◦ small circle
+                    fg    = Color::rgb(130, 210, 230);    // pale cyan
+                    st    = Style{}.with_fg(fg);
                 } else if (show_live && c == live_col) {
                     // solid vertical marker above the chart for the live fc —
                     // brighter and thicker than the static fc ghost line so it

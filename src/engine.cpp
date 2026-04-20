@@ -55,6 +55,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <complex>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -74,6 +75,24 @@ struct Params {
     std::atomic<float> tuning     {0.0f};   // ±12 semitones
     std::atomic<float> master_vol {0.60f};
     std::atomic<int>   waveform   {0};      // 0 = saw, 1 = square
+
+    // Delay: tempo-synced tape-style. Division picks the beat subdivision
+    // (1/16 / 1/16d / 1/8 / 1/8d). Time is derived from g_seq_bpm so the
+    // repeats lock to the sequencer even as BPM changes.
+    std::atomic<float> delay_mix     {0.0f};   // 0..1 wet send (0 = bypass)
+    std::atomic<float> delay_feedback{0.35f};  // 0..1 — clamped < 1 to stay stable
+    std::atomic<int>   delay_division{2};      // 0=1/16, 1=1/16d, 2=1/8, 3=1/8d
+
+    // Overdrive: pre-filter soft-clip, sits between the oscillator and the
+    // ladder input. Sweeps from transparent to "303 into a Big Muff".
+    std::atomic<float> od_amt        {0.0f};
+
+    // Plate reverb: Schroeder-style (4 combs + 2 allpasses). Size scales the
+    // comb feedback (= decay time); damp rolls off the HF inside the comb
+    // feedback path so longer tails darken like a real plate.
+    std::atomic<float> rev_mix       {0.0f};
+    std::atomic<float> rev_size      {0.55f};
+    std::atomic<float> rev_damp      {0.35f};
 };
 
 Params g_params;
@@ -137,6 +156,39 @@ bool  g_note_accented = false;
 float g_hpf_xprev = 0.0f;
 float g_hpf_yprev = 0.0f;
 
+// ── Delay line ──────────────────────────────────────────────────────────────
+// Mono tape-style delay in the master bus. Ring buffer sized for the slowest
+// tempo we allow (20 BPM @ 1/8 dotted = 0.9 s, well under 2 s). Fractional
+// read via linear interpolation so BPM changes don't click. A one-pole LPF
+// inside the feedback path gives each repeat its characteristic tape darken
+// and keeps runaway feedback from screeching into self-oscillation.
+constexpr int kDelayBufSize = 96000;       // ~2 s at 48 kHz
+float g_delay_buf[kDelayBufSize] = {};
+int   g_delay_w = 0;
+float g_delay_fb_lp = 0.0f;                // one-pole LPF state inside FB path
+float g_delay_time_sm = 0.0f;              // smoothed delay time (samples)
+
+// ── Plate reverb (Schroeder / Freeverb-lite) ────────────────────────────────
+// 4 parallel comb filters feed 2 serial allpass filters. Comb delays are the
+// original Freeverb prime-ish values scaled to the runtime sample rate so the
+// density stays constant across 44.1/48 kHz. A one-pole LPF inside each comb
+// feedback path gives the "darkens as it decays" plate/room behaviour.
+// Totals ~7 KB of buffer state — nothing.
+constexpr int kRevCombs    = 4;
+constexpr int kRevApass    = 2;
+constexpr int kRevCombMax  = 2048;         // worst-case samples at 48 kHz
+constexpr int kRevApassMax = 768;
+// Freeverb-style comb delays (samples @ 44.1 kHz). Scaled at set_sample_rate.
+constexpr int kRevCombBase[kRevCombs] = {1116, 1277, 1422, 1557};
+constexpr int kRevApassBase[kRevApass] = {556, 441};
+float g_rev_comb_buf[kRevCombs][kRevCombMax]   = {};
+float g_rev_apass_buf[kRevApass][kRevApassMax] = {};
+int   g_rev_comb_w[kRevCombs]    = {};
+int   g_rev_apass_w[kRevApass]   = {};
+int   g_rev_comb_len[kRevCombs]  = {1116, 1277, 1422, 1557};
+int   g_rev_apass_len[kRevApass] = {556, 441};
+float g_rev_comb_lp[kRevCombs]   = {};      // one-pole LPF state per comb
+
 // ── Scope + meter taps ──────────────────────────────────────────────────────
 // Lock-free single-producer / single-consumer ring. Audio thread writes into
 // g_scope_buf at g_scope_w (relaxed → release bump); UI thread reads the
@@ -164,13 +216,19 @@ std::atomic<float> g_live_fc{200.0f};
 // than the offline WAV bounce. Now both paths share this scheduler, so live
 // matches export to the sample.
 //
-// UI-shared atomics: pattern (packed midi|flags per slot), length, bpm,
-// swing, playing flag, plus published current step + within-step phase for
-// beat-sync animation.
+// UI-shared atomics: pattern (packed per slot), length, bpm, swing, playing
+// flag, plus published current step + within-step phase for beat-sync
+// animation.
+//
+// Step encoding (single u32 per slot — single atomic store, no tearing):
+//   bits  0-7   midi (0..127)
+//   bits  8-10  flags  (rest=1, accent=2, slide=4)
+//   bits 11-17  prob   (0..100, 7 bits)
+//   bits 18-19  ratchet-1 (0..3 → 1..4 sub-triggers)
 //
 // Audio-thread locals (g_seq_clock etc.) are only touched inside render().
 constexpr int kSeqMaxSteps = 16;
-std::atomic<uint32_t> g_seq_steps[kSeqMaxSteps]  {};            // bits: flags<<16 | midi
+std::atomic<uint32_t> g_seq_steps[kSeqMaxSteps]  {};
 std::atomic<int>      g_seq_pattern_length       {16};
 std::atomic<float>    g_seq_bpm                  {122.0f};
 std::atomic<float>    g_seq_swing                {0.50f};       // 0.50..0.75
@@ -182,6 +240,173 @@ double g_seq_clock       = 0.0;         // samples into the current step
 int    g_seq_step        = -1;          // playing step (-1 = idle)
 bool   g_seq_prev_rest   = true;        // for slide-after-rest suppression
 bool   g_seq_was_playing = false;
+
+// Ratchet sub-triggers: when a step has ratchet > 1 we re-fire the same
+// (midi, accent) at regular sub-intervals across the step's duration. First
+// hit fires on the step boundary; the remainder are counted here and
+// commit when the step clock crosses `g_seq_rat_next`. Ratchets always
+// retrigger envelopes (no slide) — otherwise the repeats are inaudible
+// during the glide.
+int     g_seq_rat_left = 0;             // remaining sub-triggers for current step
+double  g_seq_rat_next = 0.0;           // next sub-trigger's clock sample
+double  g_seq_rat_inc  = 0.0;           // samples between sub-triggers
+int     g_seq_rat_midi = 0;
+bool    g_seq_rat_acc  = false;
+
+// Probability RNG — xorshift32, deterministic enough for "rolls the dice
+// once per step" without pulling libc. Seeded from a non-zero constant so
+// fresh engines agree on the first few rolls (useful for offline bounces
+// where reproducibility matters).
+uint32_t g_seq_rng = 0x9E3779B9u;
+
+// Per-step parameter locks (Elektron-style p-locks). `mask` bits:
+//   1=cutoff, 2=res, 4=env, 8=accent. When a bit is set, the matching
+// `g_seq_lock_*` value replaces the global knob for the duration of that
+// step. Values are normalised 0..1 (knob-native). Single atomic per
+// parameter per step; UI writes each setter as one store, audio reads
+// relaxed per sub-block.
+std::atomic<uint32_t> g_seq_lock_mask[kSeqMaxSteps] {};
+std::atomic<float>    g_seq_lock_cut[kSeqMaxSteps]  {};
+std::atomic<float>    g_seq_lock_res[kSeqMaxSteps]  {};
+std::atomic<float>    g_seq_lock_env[kSeqMaxSteps]  {};
+std::atomic<float>    g_seq_lock_acc[kSeqMaxSteps]  {};
+inline uint32_t seq_rand_u32() {
+    uint32_t s = g_seq_rng;
+    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+    g_seq_rng = s;
+    return s;
+}
+
+// ── Drum machine (Phase 4.3) ────────────────────────────────────────────────
+// Five synthesized percussion voices — BD / SD / CH / OH / CL — each with its
+// own 16-step bitmask lane. Triggers fire on step boundaries alongside the
+// bass voice. Voices render in parallel per sample and sum into the master
+// bus BEFORE the delay so they hit the same FX the bass does.
+constexpr int kDrumVoices = 5;
+constexpr int kDrumBD = 0, kDrumSD = 1, kDrumCH = 2, kDrumOH = 3, kDrumCL = 4;
+
+std::atomic<uint32_t> g_seq_drum_mask[kDrumVoices] {};
+// Per-voice baseline gain — picked so a four-on-the-floor BD + off-beat CH
+// sits roughly at the bass voice's level with DRUM knob at 1.0.
+std::atomic<float> g_seq_drum_gain[kDrumVoices] {
+    {0.95f}, {0.70f}, {0.35f}, {0.40f}, {0.60f}
+};
+// Master drum-bus send. UI knob; 0 = drums silent, 1 = nominal.
+std::atomic<float> g_seq_drum_master {1.0f};
+
+// Per-voice audio-thread synth state. Plain floats (no atomics — only the
+// render thread touches these). Each voice is ~4 floats of state so the
+// whole drum machine is ~20 floats, negligible cache-wise.
+struct DrumBD {
+    float env   = 0.0f;    // amp envelope (decays ~0.12 s)
+    float penv  = 0.0f;    // pitch envelope (sweeps ~0.035 s)
+    float phase = 0.0f;    // sine phase
+};
+struct DrumSD {
+    float env        = 0.0f;
+    float body_env   = 0.0f;
+    float body_phase = 0.0f;
+    float hp_x       = 0.0f;
+    float hp_y       = 0.0f;
+    uint32_t rng     = 0xc3a5c85cu;
+};
+struct DrumHH {
+    float env  = 0.0f;
+    float hp_x = 0.0f;
+    float hp_y = 0.0f;
+    uint32_t rng;
+};
+struct DrumCL {
+    float env         = 0.0f;       // per-burst fast env (~7 ms)
+    float tail_env    = 0.0f;       // long tail (~250 ms)
+    int   bursts_left = 0;
+    float burst_clock = 0.0f;       // seconds until next retrigger
+    float hp_x        = 0.0f;
+    float hp_y        = 0.0f;
+    uint32_t rng      = 0x52a43d26u;
+};
+
+DrumBD g_bd;
+DrumSD g_sd;
+DrumHH g_ch{ .rng = 0x1b873593u };
+DrumHH g_oh{ .rng = 0xcc9e2d51u };
+DrumCL g_cl;
+
+inline void drum_trig_bd() { g_bd.env = 1.0f; g_bd.penv = 1.0f; g_bd.phase = 0.0f; }
+inline void drum_trig_sd() { g_sd.env = 1.0f; g_sd.body_env = 1.0f; g_sd.body_phase = 0.0f; }
+inline void drum_trig_ch() { g_ch.env = 1.0f; }
+inline void drum_trig_oh() { g_oh.env = 1.0f; }
+inline void drum_trig_cl() {
+    // Classic 808 clap: 3 fast noise bursts spaced ~12 ms apart, plus a
+    // longer dense-noise tail. First burst fires now; the other 2 fire as
+    // the burst_clock counts down in the render loop.
+    g_cl.env         = 1.0f;
+    g_cl.tail_env    = 1.0f;
+    g_cl.bursts_left = 2;
+    g_cl.burst_clock = 0.012f;
+}
+inline void drum_fire(int voice) {
+    switch (voice) {
+        case kDrumBD: drum_trig_bd(); break;
+        case kDrumSD: drum_trig_sd(); break;
+        case kDrumCH: drum_trig_ch(); break;
+        case kDrumOH: drum_trig_oh(); break;
+        case kDrumCL: drum_trig_cl(); break;
+    }
+}
+
+// ── MIDI event ring (Phase 5) ───────────────────────────────────────────────
+// Audio thread pushes note-on/off messages here whenever the sequencer fires
+// a bass note or a drum hit. The MIDI backend thread drains the ring and
+// forwards the messages out of its ALSA sequencer port. SPSC, power-of-two
+// size so the mask is a cheap AND; drops on overrun rather than blocking the
+// audio thread (overruns require >64 pending events which only happens if the
+// MIDI thread has stalled).
+constexpr int kMidiRingSize = 256;
+struct MidiEvt {
+    uint8_t type;     // 0=none, 1=note_on, 2=note_off
+    uint8_t channel;  // 0..15
+    uint8_t data1;    // note number
+    uint8_t data2;    // velocity
+};
+MidiEvt              g_midi_ring[kMidiRingSize] {};
+std::atomic<uint32_t> g_midi_w {0};
+std::atomic<uint32_t> g_midi_r {0};
+// When false, midi_push is a no-op — keeps the ring cold for users who never
+// enable MIDI so the audio thread does zero extra work.
+std::atomic<bool>    g_midi_out_enabled {false};
+// MIDI channels for bass / drums. Bass on 1 (index 0), drums on 10 (index 9
+// — GM convention). Most DAWs and hardware expect this layout.
+constexpr uint8_t    kMidiBassChan = 0;
+constexpr uint8_t    kMidiDrumChan = 9;
+// GM drum mapping for our 5 voices: BD=35, SD=38, CH=42, OH=46, CL=39. Stock
+// enough that a plugged-in drum module or a GM softsynth will just play the
+// right sound without remapping.
+constexpr uint8_t    kDrumMidiNote[5] = { 35, 38, 42, 46, 39 };
+// Track the currently-gated bass note so the audio thread can emit a matching
+// note-off before the next note-on (otherwise external synths stack voices).
+uint8_t              g_midi_last_bass_note = 0;
+
+inline void midi_push(uint8_t type, uint8_t ch, uint8_t d1, uint8_t d2) {
+    if (!g_midi_out_enabled.load(std::memory_order_relaxed)) return;
+    uint32_t w = g_midi_w.load(std::memory_order_relaxed);
+    uint32_t r = g_midi_r.load(std::memory_order_acquire);
+    if ((w - r) >= static_cast<uint32_t>(kMidiRingSize)) return;
+    g_midi_ring[w & (kMidiRingSize - 1)] = { type, ch, d1, d2 };
+    g_midi_w.store(w + 1, std::memory_order_release);
+}
+
+// Clock-in state (external-tempo sync). When slaved, the backend thread calls
+// acid_midi_feed_clock() once per incoming 0xF8 pulse; we average the
+// inter-pulse interval across 24 pulses (= one beat) and set g_seq_bpm.
+std::atomic<bool>  g_midi_sync_in  {false};
+// BPM-averaging ring: 24 recent inter-pulse deltas in seconds. Running sum
+// kept for cheap running mean.
+constexpr int      kMidiClockWindow = 24;
+float              g_midi_clock_delta[kMidiClockWindow] {};
+int                g_midi_clock_i      = 0;
+int                g_midi_clock_filled = 0;
+double             g_midi_clock_sum    = 0.0;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -325,7 +550,20 @@ inline void note_commit_off() {
 
 }  // namespace
 
-void set_sample_rate(int sr) { g_sample_rate = sr > 0 ? sr : kDefaultSampleRate; }
+void set_sample_rate(int sr) {
+    g_sample_rate = sr > 0 ? sr : kDefaultSampleRate;
+    // Scale Freeverb delays from the reference 44.1 kHz to the runtime SR so
+    // the reverb's resonant density sounds the same at 48 kHz.
+    const double scale = static_cast<double>(g_sample_rate) / 44100.0;
+    for (int i = 0; i < kRevCombs; ++i) {
+        int len = static_cast<int>(std::round(kRevCombBase[i] * scale));
+        g_rev_comb_len[i] = std::clamp(len, 16, kRevCombMax);
+    }
+    for (int i = 0; i < kRevApass; ++i) {
+        int len = static_cast<int>(std::round(kRevApassBase[i] * scale));
+        g_rev_apass_len[i] = std::clamp(len, 16, kRevApassMax);
+    }
+}
 int  sample_rate()           { return g_sample_rate; }
 
 void render(float* out, int frames) {
@@ -369,10 +607,16 @@ void render(float* out, int frames) {
         g_seq_step      = -1;
         g_seq_clock     = 0.0;
         g_seq_prev_rest = true;
+        g_seq_rat_left  = 0;
     } else if (!sp_on && g_seq_was_playing) {
         // Falling edge: release the gate and park.
         note_commit_off();
+        if (g_midi_last_bass_note) {
+            midi_push(2, kMidiBassChan, g_midi_last_bass_note, 64);
+            g_midi_last_bass_note = 0;
+        }
         g_seq_step = -1;
+        g_seq_rat_left = 0;
         g_seq_current_step.store(-1, std::memory_order_relaxed);
         g_seq_step_phase.store(0.0f,  std::memory_order_relaxed);
     }
@@ -386,38 +630,123 @@ void render(float* out, int frames) {
     int   frames_left = frames;
     float* out_ptr    = out;
     while (frames_left > 0) {
-        // Advance sequencer across any boundaries that are already due.
+        // Advance sequencer across any step boundary OR ratchet sub-trigger
+        // that is already due. Each iteration fires at most one event, so two
+        // events on the same sample simply resolve in separate passes.
         if (sp_on) {
             while (true) {
-                // Pre-start (step==-1) has zero "duration" so the first
-                // iteration immediately advances to step 0 and fires its note.
+                // Step boundary first — a brand-new step can supersede a
+                // pending ratchet from the previous step (its sub-triggers
+                // never bleed past the step they were scheduled in).
                 double cur_dur = (g_seq_step < 0) ? 0.0 : step_samples(g_seq_step);
-                if (g_seq_clock < cur_dur) break;
-                g_seq_clock -= cur_dur;
-                g_seq_step   = (g_seq_step + 1) % plen;
-                uint32_t enc = g_seq_steps[g_seq_step].load(std::memory_order_relaxed);
-                int  midi  = static_cast<int>(enc & 0xFFFF);
-                int  flg   = static_cast<int>((enc >> 16) & 0xFF);
-                bool rest  = (flg & 1) != 0;
-                bool acc   = (flg & 2) != 0;
-                bool sld   = (flg & 4) != 0;
-                if (!rest) {
-                    // Mirror live tick()'s rule: a slide only counts when the
-                    // previous step actually played — you can't glide from a
-                    // rest.
-                    float freq = 440.0f * std::pow(2.0f,
-                                 static_cast<float>(midi - 69) / 12.0f);
-                    note_commit_on(freq, acc, sld && !g_seq_prev_rest);
+                if (g_seq_clock >= cur_dur) {
+                    g_seq_clock -= cur_dur;
+                    g_seq_step   = (g_seq_step + 1) % plen;
+                    uint32_t enc = g_seq_steps[g_seq_step].load(std::memory_order_relaxed);
+                    int  midi  = static_cast<int>(enc & 0xFF);
+                    int  flg   = static_cast<int>((enc >> 8) & 0x7);
+                    int  prob  = static_cast<int>((enc >> 11) & 0x7F);
+                    int  rat   = static_cast<int>((enc >> 18) & 0x3) + 1;
+                    bool rest  = (flg & 1) != 0;
+                    bool acc   = (flg & 2) != 0;
+                    bool sld   = (flg & 4) != 0;
+
+                    // Probability roll. 100 always plays; 0 never plays; in
+                    // between, xorshift RNG mod 100 beats `prob`.
+                    bool rolled_out = false;
+                    if (prob < 100) {
+                        uint32_t r = seq_rand_u32() % 100u;
+                        rolled_out = (static_cast<int>(r) >= prob);
+                    }
+
+                    g_seq_rat_left = 0;
+                    if (!rest && !rolled_out) {
+                        float freq = 440.0f * std::pow(2.0f,
+                                     static_cast<float>(midi - 69) / 12.0f);
+                        // Slide only when previous step played — can't glide
+                        // from a rest.
+                        bool slide_now = sld && !g_seq_prev_rest;
+                        note_commit_on(freq, acc, slide_now);
+                        // MIDI out: end previous note (unless slide — let the
+                        // receiver do its own legato handling) and start this
+                        // one. Accent → higher velocity (127 vs 96).
+                        if (g_midi_last_bass_note && !slide_now) {
+                            midi_push(2, kMidiBassChan, g_midi_last_bass_note, 64);
+                        }
+                        uint8_t mv = static_cast<uint8_t>(
+                            std::clamp(midi, 0, 127));
+                        midi_push(1, kMidiBassChan, mv, acc ? 127 : 96);
+                        g_midi_last_bass_note = mv;
+                        if (rat > 1) {
+                            g_seq_rat_left = rat - 1;
+                            g_seq_rat_inc  = step_samples(g_seq_step)
+                                           / static_cast<double>(rat);
+                            g_seq_rat_next = g_seq_rat_inc;
+                            g_seq_rat_midi = midi;
+                            g_seq_rat_acc  = acc;
+                        }
+                        g_seq_prev_rest = false;
+                    } else {
+                        // Rest (or rolled-out). Mark so the next step can't
+                        // slide into silence.
+                        if (g_midi_last_bass_note) {
+                            midi_push(2, kMidiBassChan, g_midi_last_bass_note, 64);
+                            g_midi_last_bass_note = 0;
+                        }
+                        g_seq_prev_rest = true;
+                    }
+                    g_seq_current_step.store(g_seq_step, std::memory_order_relaxed);
+                    // Drum lanes: each voice's 16-bit mask picks which of the
+                    // 16 steps fire. Drums don't use probability or ratchet —
+                    // they're a fixed grid; that's the whole draw of a TR-
+                    // style sequencer. (Can layer per-lane prob later if we
+                    // miss hardware-style generative drums.)
+                    {
+                        const uint32_t bit = 1u << g_seq_step;
+                        for (int v = 0; v < kDrumVoices; ++v) {
+                            uint32_t m = g_seq_drum_mask[v].load(std::memory_order_relaxed);
+                            if (m & bit) {
+                                drum_fire(v);
+                                // MIDI out: short note-on/off pair on ch 10.
+                                // Drum hits are one-shots so we emit the off
+                                // immediately; receivers treat it as a trigger.
+                                midi_push(1, kMidiDrumChan, kDrumMidiNote[v], 112);
+                                midi_push(2, kMidiDrumChan, kDrumMidiNote[v], 64);
+                            }
+                        }
+                    }
+                    continue;
                 }
-                g_seq_prev_rest = rest;
-                g_seq_current_step.store(g_seq_step, std::memory_order_relaxed);
+                // Ratchet sub-trigger boundary — re-fire same pitch. Always
+                // retrigger (no slide) so the repeat is audible.
+                if (g_seq_rat_left > 0 && g_seq_clock >= g_seq_rat_next) {
+                    float freq = 440.0f * std::pow(2.0f,
+                                 static_cast<float>(g_seq_rat_midi - 69) / 12.0f);
+                    note_commit_on(freq, g_seq_rat_acc, /*slide=*/false);
+                    // Ratchet MIDI: retrigger the same note. Emit off/on pair.
+                    if (g_midi_last_bass_note) {
+                        midi_push(2, kMidiBassChan, g_midi_last_bass_note, 64);
+                    }
+                    uint8_t mv = static_cast<uint8_t>(
+                        std::clamp(g_seq_rat_midi, 0, 127));
+                    midi_push(1, kMidiBassChan, mv, g_seq_rat_acc ? 127 : 96);
+                    g_midi_last_bass_note = mv;
+                    g_seq_rat_left -= 1;
+                    g_seq_rat_next += g_seq_rat_inc;
+                    continue;
+                }
+                break;
             }
         }
 
-        // How many frames until the next step boundary?
+        // How many frames until the next step boundary or ratchet sub-trigger?
         int n;
         if (sp_on && g_seq_step >= 0) {
             double remaining = step_samples(g_seq_step) - g_seq_clock;
+            if (g_seq_rat_left > 0) {
+                double rr = g_seq_rat_next - g_seq_clock;
+                if (rr > 0.0 && rr < remaining) remaining = rr;
+            }
             int fu = (remaining <= 1.0) ? 1 : static_cast<int>(remaining);
             n = std::min(frames_left, fu);
         } else {
@@ -425,11 +754,27 @@ void render(float* out, int frames) {
         }
 
         // ── Block-rate parameter snapshot (per sub-block) ───────────────────
-    const float fc_knob  = g_params.cutoff.load();
-    const float res_knob = g_params.resonance.load();
-    const float envmod_k = g_params.env_mod.load();
+    // Per-step parameter locks: if the currently-playing step has a lock
+    // bit set, use the step's override instead of the global knob. Since a
+    // sub-block never straddles a step boundary, the override stays valid
+    // for the whole window.
+    uint32_t lk_m = 0;
+    if (sp_on && g_seq_step >= 0) {
+        lk_m = g_seq_lock_mask[g_seq_step].load(std::memory_order_relaxed);
+    }
+    const float fc_knob  = (lk_m & 1)
+        ? g_seq_lock_cut[g_seq_step].load(std::memory_order_relaxed)
+        : g_params.cutoff.load();
+    const float res_knob = (lk_m & 2)
+        ? g_seq_lock_res[g_seq_step].load(std::memory_order_relaxed)
+        : g_params.resonance.load();
+    const float envmod_k = (lk_m & 4)
+        ? g_seq_lock_env[g_seq_step].load(std::memory_order_relaxed)
+        : g_params.env_mod.load();
+    const float acc_amt  = (lk_m & 8)
+        ? g_seq_lock_acc[g_seq_step].load(std::memory_order_relaxed)
+        : g_params.accent_amt.load();
     const float decay_k  = g_params.decay.load();
-    const float acc_amt  = g_params.accent_amt.load();
     const float drive_k  = g_params.drive.load();
     const int   wf       = g_params.waveform.load();
     const float master   = g_params.master_vol.load();
@@ -505,6 +850,75 @@ void render(float* out, int frames) {
     // the aliasing you'd otherwise hear as "grit" on high-Q squelches.
     const float sr2 = sr * 2.0f;
 
+    // ── Overdrive precompute ────────────────────────────────────────────────
+    // Pre-filter soft-clip (classic "303 into distortion pedal"). Gain sweeps
+    // 1× → 6× with gain-compensated tanh so perceived loudness is roughly
+    // constant as OD is dialled up — the knob is TEXTURE, not level.
+    const float od_amt  = std::clamp(g_params.od_amt.load(), 0.0f, 1.0f);
+    const float od_pre  = 1.0f + od_amt * 5.0f;
+    const float od_norm = 1.0f / std::tanh(od_pre);
+
+    // ── Delay precomputes ────────────────────────────────────────────────────
+    // Target delay time in samples, synced to the sequencer's BPM. One 16th =
+    // 60/BPM/4 s; division multipliers give 1/16, 1/16d, 1/8, 1/8d.
+    const float dly_mix = std::clamp(g_params.delay_mix.load(),      0.0f, 1.0f);
+    const float dly_fb  = std::clamp(g_params.delay_feedback.load(), 0.0f, 0.92f);
+    const int   dly_div = std::clamp(g_params.delay_division.load(), 0, 3);
+    static constexpr float kDivMul[4] = {1.0f, 1.5f, 2.0f, 3.0f};  // in 16ths
+    const float sixteenth_s   = 60.0f / bpm / 4.0f;
+    const float dly_time_tgt  = sixteenth_s * kDivMul[dly_div] * sr;
+    // Clamp to buffer size minus 4 for safe linear-interp read across wrap.
+    const float dly_time_max  = static_cast<float>(kDelayBufSize - 4);
+    const float dly_time_clip = std::min(dly_time_tgt, dly_time_max);
+    // Per-sample one-pole smoothing for time changes (BPM or division changes
+    // shouldn't click). 60 ms settles faster than most finger turns register.
+    const float dly_time_coef = 1.0f - std::exp(-dt_s / 0.060f);
+    // Tape-darken LPF inside the feedback path, ~3.5 kHz. Keeps the repeats
+    // getting steadily duller, which is what makes feedback feel "tape" not
+    // "digital ping-pong".
+    const float fb_lp_coef    = 1.0f - std::exp(-2.0f * static_cast<float>(M_PI)
+                                               * 3500.0f / sr);
+
+    // ── Reverb precomputes ──────────────────────────────────────────────────
+    // Comb feedback g = 0.70 + size * 0.28 → small room (RT60≈0.6s) through
+    // big plate (RT60≈4s). Damp LPF coef in [0, 0.5] rolls off high end in the
+    // feedback path so long tails go dark instead of ringing.
+    const float rev_mix_k  = std::clamp(g_params.rev_mix.load(),  0.0f, 1.0f);
+    const float rev_size_k = std::clamp(g_params.rev_size.load(), 0.0f, 1.0f);
+    const float rev_damp_k = std::clamp(g_params.rev_damp.load(), 0.0f, 1.0f);
+    const float comb_g     = 0.70f + 0.28f * rev_size_k;
+    const float damp       = 0.05f + 0.45f * rev_damp_k;
+    const float undamp     = 1.0f - damp;
+    // 0.5 fixed allpass coefficient is the Freeverb standard.
+    constexpr float apass_g = 0.5f;
+    // Input attenuation — without this, the dense comb net runs way too hot
+    // even before Mix. 0.015 matches Freeverb's fixed input scale.
+    constexpr float rev_in_gain = 0.015f;
+
+    // ── Drum precomputes ────────────────────────────────────────────────────
+    // Per-voice envelope decay coefficients (exp(-dt/tau)) and the per-voice
+    // bus gains loaded once per sub-block. Time constants are tuned by ear:
+    //   BD: 120 ms amp / 35 ms pitch sweep → TR-808 kick shape
+    //   SD: 80 ms amp / 40 ms body → snappy snare
+    //   CH: 25 ms → classic tight closed hat
+    //   OH: 200 ms → brassy open hat
+    //   CL: 7 ms per burst / 250 ms tail → 808 clap
+    const float drum_master = std::clamp(
+        g_seq_drum_master.load(std::memory_order_relaxed), 0.0f, 1.5f);
+    float drum_gain[kDrumVoices];
+    for (int v = 0; v < kDrumVoices; ++v) {
+        drum_gain[v] = g_seq_drum_gain[v].load(std::memory_order_relaxed)
+                     * drum_master;
+    }
+    const float bd_env_dec  = std::exp(-dt_s / 0.12f);
+    const float bd_penv_dec = std::exp(-dt_s / 0.035f);
+    const float sd_env_dec  = std::exp(-dt_s / 0.08f);
+    const float sd_body_dec = std::exp(-dt_s / 0.04f);
+    const float ch_env_dec  = std::exp(-dt_s / 0.025f);
+    const float oh_env_dec  = std::exp(-dt_s / 0.20f);
+    const float cl_env_dec  = std::exp(-dt_s / 0.007f);
+    const float cl_tail_dec = std::exp(-dt_s / 0.25f);
+
     // ── Sample loop (inner — runs for `n` frames of this sub-block) ─────
     for (int i = 0; i < n; i++) {
         // Slide: exponential approach to target pitch (single-pole LPF)
@@ -565,13 +979,17 @@ void render(float* out, int frames) {
         // clamp above already keeps us in the safe zone.
         const float g_tpt = std::tan(static_cast<float>(M_PI) * fc_hz / sr2);
 
+        // Pre-filter overdrive. Tanh with gain-compensation so output level
+        // stays close to input level as OD sweeps. OD=0 is near-transparent.
+        const float osc_od = std::tanh(osc * od_pre) * od_norm;
+
         // 2× oversample the filter + saturator. Produce two input sub-samples
         // by linear interpolation between the previous and current osc value,
         // run each through the ZDF ladder, and average for decimation.
-        const float osc_mid = 0.5f * (g_osc_prev + osc);
+        const float osc_mid = 0.5f * (g_osc_prev + osc_od);
         const float y_a     = ladder_tpt_step(osc_mid, g_tpt, g_res_sm);
-        const float y_b     = ladder_tpt_step(osc,     g_tpt, g_res_sm);
-        g_osc_prev          = osc;
+        const float y_b     = ladder_tpt_step(osc_od,  g_tpt, g_res_sm);
+        g_osc_prev          = osc_od;
         const float y_filt  = 0.5f * (y_a + y_b);
 
         // VCA: VEG × (accent boost on accented notes) × smoothed master.
@@ -593,14 +1011,130 @@ void render(float* out, int frames) {
         g_hpf_xprev = y;
         g_hpf_yprev = y_hpf;
 
-        out_ptr[i] = y_hpf;
+        // ── Drum voice mix (pre-FX) ─────────────────────────────────────────
+        // Every voice checks its env > ~0 gate so silent voices cost nothing
+        // beyond a compare+branch. Output sums into drum_bus, then folded
+        // into y_hpf BEFORE delay/reverb so drums carry the same FX send.
+        float drum_bus = 0.0f;
+        if (g_bd.env > 1e-4f) {
+            g_bd.env  *= bd_env_dec;
+            g_bd.penv *= bd_penv_dec;
+            // 50 Hz base + 80 Hz pitch sweep = 130→50 Hz, the 808/909 kick shape.
+            float bd_hz = 50.0f + 80.0f * g_bd.penv;
+            g_bd.phase += bd_hz / sr;
+            if (g_bd.phase >= 1.0f) g_bd.phase -= 1.0f;
+            float tone  = std::sin(2.0f * static_cast<float>(M_PI) * g_bd.phase);
+            // Click transient on attack — disappears as pitch_env decays.
+            float click = g_bd.penv * g_bd.penv;
+            drum_bus += (tone * g_bd.env + click * 0.25f) * drum_gain[kDrumBD];
+        }
+        if (g_sd.env > 1e-4f) {
+            g_sd.env      *= sd_env_dec;
+            g_sd.body_env *= sd_body_dec;
+            g_sd.body_phase += 220.0f / sr;
+            if (g_sd.body_phase >= 1.0f) g_sd.body_phase -= 1.0f;
+            float body  = std::sin(2.0f * static_cast<float>(M_PI)
+                                   * g_sd.body_phase) * g_sd.body_env;
+            float noise = rand_bipolar(g_sd.rng);
+            // Gentle HPF gives the noise component "crack" instead of hiss.
+            float nhp = noise - g_sd.hp_x + 0.93f * g_sd.hp_y;
+            g_sd.hp_x = noise; g_sd.hp_y = nhp;
+            drum_bus += (body * 0.55f + nhp * 0.8f) * g_sd.env
+                        * drum_gain[kDrumSD];
+        }
+        if (g_ch.env > 1e-4f) {
+            g_ch.env *= ch_env_dec;
+            float n  = rand_bipolar(g_ch.rng);
+            float h  = n - g_ch.hp_x + 0.97f * g_ch.hp_y;
+            g_ch.hp_x = n; g_ch.hp_y = h;
+            drum_bus += h * g_ch.env * drum_gain[kDrumCH];
+        }
+        if (g_oh.env > 1e-4f) {
+            g_oh.env *= oh_env_dec;
+            float n  = rand_bipolar(g_oh.rng);
+            float h  = n - g_oh.hp_x + 0.95f * g_oh.hp_y;
+            g_oh.hp_x = n; g_oh.hp_y = h;
+            drum_bus += h * g_oh.env * drum_gain[kDrumOH];
+        }
+        if (g_cl.env > 1e-4f || g_cl.tail_env > 1e-4f) {
+            g_cl.env      *= cl_env_dec;
+            g_cl.tail_env *= cl_tail_dec;
+            if (g_cl.bursts_left > 0) {
+                g_cl.burst_clock -= dt_s;
+                if (g_cl.burst_clock <= 0.0f) {
+                    g_cl.env = 1.0f;
+                    g_cl.bursts_left -= 1;
+                    g_cl.burst_clock += 0.012f;
+                }
+            }
+            float n = rand_bipolar(g_cl.rng);
+            // Gentler HPF (0.85) keeps more body — a clap is "thicker" than a hat.
+            float h = n - g_cl.hp_x + 0.85f * g_cl.hp_y;
+            g_cl.hp_x = n; g_cl.hp_y = h;
+            float amp = std::max(g_cl.env, g_cl.tail_env * 0.3f);
+            drum_bus += h * amp * drum_gain[kDrumCL];
+        }
+        y_hpf += drum_bus;
+
+        // ── Tempo-synced delay (master bus) ─────────────────────────────────
+        // Read at fractional index with linear interp so BPM sweeps glide.
+        // Feedback path runs through a one-pole LPF to darken each repeat —
+        // the "tape" flavour that makes stacked echoes feel musical rather
+        // than digital-harsh. Dry + wet are summed additively (wet scaled by
+        // the MIX knob) so MIX=0 is clean bypass.
+        g_delay_time_sm += dly_time_coef * (dly_time_clip - g_delay_time_sm);
+        float rd_f  = static_cast<float>(g_delay_w) - g_delay_time_sm;
+        while (rd_f < 0.0f) rd_f += static_cast<float>(kDelayBufSize);
+        int   rd_i  = static_cast<int>(rd_f);
+        float frac  = rd_f - static_cast<float>(rd_i);
+        int   rd_i2 = (rd_i + 1) % kDelayBufSize;
+        float wet   = g_delay_buf[rd_i] * (1.0f - frac)
+                    + g_delay_buf[rd_i2] * frac;
+        g_delay_fb_lp += fb_lp_coef * (wet - g_delay_fb_lp);
+        g_delay_buf[g_delay_w] = y_hpf + dly_fb * g_delay_fb_lp;
+        g_delay_w = (g_delay_w + 1) % kDelayBufSize;
+        float y_post_dly = y_hpf + dly_mix * wet;
+
+        // ── Plate reverb (master bus, parallel combs → serial allpass) ──────
+        // Only pay the cost when the wet path is actually audible. Below
+        // 0.3% mix the reverb is below the noise floor of most listeners, so
+        // skipping there keeps idle CPU low.
+        float y_out = y_post_dly;
+        if (rev_mix_k > 0.003f) {
+            float rv_in = y_post_dly * rev_in_gain;
+            float comb_sum = 0.0f;
+            for (int c = 0; c < kRevCombs; ++c) {
+                int   len = g_rev_comb_len[c];
+                int   w   = g_rev_comb_w[c];
+                float s   = g_rev_comb_buf[c][w];
+                g_rev_comb_lp[c] = s * undamp + g_rev_comb_lp[c] * damp;
+                float fb  = g_rev_comb_lp[c] * comb_g;
+                g_rev_comb_buf[c][w] = rv_in + fb;
+                g_rev_comb_w[c] = (w + 1) % len;
+                comb_sum += s;
+            }
+            float rv = comb_sum;
+            for (int a = 0; a < kRevApass; ++a) {
+                int   len = g_rev_apass_len[a];
+                int   w   = g_rev_apass_w[a];
+                float s   = g_rev_apass_buf[a][w];
+                float in  = rv;
+                float out_ap = -in + s;
+                g_rev_apass_buf[a][w] = in + apass_g * out_ap;
+                g_rev_apass_w[a] = (w + 1) % len;
+                rv = out_ap;
+            }
+            y_out = y_post_dly + rev_mix_k * rv;
+        }
+
+        out_ptr[i] = y_out;
 
         // Scope tap: store in ring; peak envelope decays ~100 ms.
         uint32_t w = g_scope_w.load(std::memory_order_relaxed);
-        g_scope_buf[w & (kScopeRingSize - 1)] = y_hpf;
+        g_scope_buf[w & (kScopeRingSize - 1)] = y_out;
         g_scope_w.store(w + 1, std::memory_order_release);
 
-        float abs_y = std::fabs(y_hpf);
+        float abs_y = std::fabs(y_out);
         if (abs_y > g_peak_env) g_peak_env = abs_y;
         else                    g_peak_env *= 0.9995f;   // ~100 ms decay @ 44.1kHz
 
@@ -643,6 +1177,15 @@ void acid_set_volume(float v)      { acid::g_params.master_vol.store(v); }
 void acid_set_tuning_semi(float v) { acid::g_params.tuning.store(v); }
 void acid_set_waveform(int v)      { acid::g_params.waveform.store(v); }
 
+void acid_set_delay_mix(float v)      { acid::g_params.delay_mix.store(v); }
+void acid_set_delay_feedback(float v) { acid::g_params.delay_feedback.store(v); }
+void acid_set_delay_division(int v)   { acid::g_params.delay_division.store(v); }
+
+void acid_set_od_amt(float v)   { acid::g_params.od_amt.store(v); }
+void acid_set_rev_mix(float v)  { acid::g_params.rev_mix.store(v); }
+void acid_set_rev_size(float v) { acid::g_params.rev_size.store(v); }
+void acid_set_rev_damp(float v) { acid::g_params.rev_damp.store(v); }
+
 void acid_note_on(float freq, int accent, int slide, float step_sec) {
     acid::g_cmd_freq.store(freq, std::memory_order_relaxed);
     uint32_t flags = 0b001;
@@ -680,16 +1223,98 @@ float acid_live_fc(void) {
     return acid::g_live_fc.load(std::memory_order_relaxed);
 }
 
-// ── Audio-thread sequencer API (called from UI) ─────────────────────────────
-// Each step is packed as (flags<<16 | midi) where flags bits are
-//   {rest=1, accent=2, slide=4}. Every write is a single atomic store; the
-// audio thread reads each slot when it advances to that step so a torn read
-// is not possible (slot state is self-contained per step).
+int acid_sample_rate(void) {
+    return acid::sample_rate();
+}
 
-void acid_seq_set_step(int idx, int midi, int flags) {
+// Snapshot spectrum. Pulls the most-recent 2048 samples out of the scope ring,
+// Hann-windows them, runs a radix-2 Cooley-Tukey FFT, and writes the first
+// `n_bins_request` magnitude bins (linearly spaced 0..sr/2) into `out_mags`.
+// 2048 gives ~23 Hz bin width at 48 kHz — enough to resolve bass detail while
+// staying well under 1 ms of UI-thread work. Buffers are `thread_local static`
+// so there's no per-call allocation; the call is UI-only so no race concerns.
+int acid_fft_bins(float* out_mags, int n_bins_request) {
+    if (!out_mags || n_bins_request <= 0) return 0;
+    constexpr int N       = 2048;
+    constexpr int N_bins  = N / 2;
+
+    thread_local float                       samples[N] = {};
+    thread_local std::complex<float>         x[N];
+
+    int got = acid_scope_tail(samples, N);
+    for (int i = got; i < N; ++i) samples[i] = 0.0f;
+
+    // Hann window to kill leakage from the rectangular ring cut.
+    const float two_pi_over_Nm1 = 2.0f * static_cast<float>(M_PI)
+                                / static_cast<float>(N - 1);
+    for (int i = 0; i < N; ++i) {
+        float w = 0.5f * (1.0f - std::cos(two_pi_over_Nm1 * i));
+        x[i] = { samples[i] * w, 0.0f };
+    }
+
+    // Bit-reverse permutation.
+    for (int i = 1, j = 0; i < N; ++i) {
+        int bit = N >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) std::swap(x[i], x[j]);
+    }
+
+    // Cooley-Tukey in-place.
+    for (int len = 2; len <= N; len <<= 1) {
+        float ang = -2.0f * static_cast<float>(M_PI) / static_cast<float>(len);
+        std::complex<float> wlen{ std::cos(ang), std::sin(ang) };
+        const int half = len >> 1;
+        for (int i = 0; i < N; i += len) {
+            std::complex<float> w{1.0f, 0.0f};
+            for (int j = 0; j < half; ++j) {
+                std::complex<float> u = x[i + j];
+                std::complex<float> v = x[i + j + half] * w;
+                x[i + j]        = u + v;
+                x[i + j + half] = u - v;
+                w *= wlen;
+            }
+        }
+    }
+
+    // Magnitude of the first N/2 bins. 2/N normalisation so a full-scale
+    // sine at bin k reads back at amplitude 1.0 (Hann coherent gain folded
+    // in lightly by using 2/N rather than 2/(0.5*N) = 4/N).
+    const int n = std::min(n_bins_request, N_bins);
+    const float scale = 2.0f / static_cast<float>(N);
+    for (int i = 0; i < n; ++i) {
+        out_mags[i] = std::abs(x[i]) * scale;
+    }
+    return n;
+}
+
+// ── Audio-thread sequencer API (called from UI) ─────────────────────────────
+// Each step is packed into a single u32 — see the layout comment near
+// g_seq_steps. Every write is one atomic store; the audio thread reads each
+// slot when it advances to that step so a torn read is not possible.
+
+void acid_seq_set_step_locks(int idx, int mask,
+                             float cutoff_v, float res_v,
+                             float env_v,    float accent_v) {
     if (idx < 0 || idx >= acid::kSeqMaxSteps) return;
-    uint32_t enc = (static_cast<uint32_t>(flags & 0xFF) << 16)
-                 | (static_cast<uint32_t>(midi) & 0xFFFFu);
+    auto clip = [](float v) { return std::clamp(v, 0.0f, 1.0f); };
+    acid::g_seq_lock_cut[idx].store(clip(cutoff_v), std::memory_order_relaxed);
+    acid::g_seq_lock_res[idx].store(clip(res_v),    std::memory_order_relaxed);
+    acid::g_seq_lock_env[idx].store(clip(env_v),    std::memory_order_relaxed);
+    acid::g_seq_lock_acc[idx].store(clip(accent_v), std::memory_order_relaxed);
+    // Mask last — audio thread reads mask to decide whether to look at values.
+    acid::g_seq_lock_mask[idx].store(static_cast<uint32_t>(mask & 0xF),
+                                    std::memory_order_release);
+}
+
+void acid_seq_set_step(int idx, int midi, int flags, int prob, int ratchet) {
+    if (idx < 0 || idx >= acid::kSeqMaxSteps) return;
+    int p = std::clamp(prob,   0, 100);
+    int r = std::clamp(ratchet, 1,   4) - 1;
+    uint32_t enc = (static_cast<uint32_t>(midi)    & 0xFFu)
+                 | ((static_cast<uint32_t>(flags)  & 0x07u) << 8)
+                 | ((static_cast<uint32_t>(p)      & 0x7Fu) << 11)
+                 | ((static_cast<uint32_t>(r)      & 0x03u) << 18);
     acid::g_seq_steps[idx].store(enc, std::memory_order_relaxed);
 }
 
@@ -710,6 +1335,137 @@ void acid_seq_set_swing(float s) {
 
 void acid_seq_play(void)  { acid::g_seq_playing.store(true,  std::memory_order_release); }
 void acid_seq_stop(void)  { acid::g_seq_playing.store(false, std::memory_order_release); }
+
+void acid_seq_set_drum_lane(int voice, int mask_16bit) {
+    if (voice < 0 || voice >= acid::kDrumVoices) return;
+    acid::g_seq_drum_mask[voice].store(
+        static_cast<uint32_t>(mask_16bit) & 0xFFFFu,
+        std::memory_order_relaxed);
+}
+
+void acid_seq_set_drum_gain(int voice, float v) {
+    if (voice < 0 || voice >= acid::kDrumVoices) return;
+    acid::g_seq_drum_gain[voice].store(std::clamp(v, 0.0f, 2.0f),
+                                       std::memory_order_relaxed);
+}
+
+void acid_seq_set_drum_master(float v) {
+    acid::g_seq_drum_master.store(std::clamp(v, 0.0f, 1.5f),
+                                  std::memory_order_relaxed);
+}
+
+// ── MIDI bridge (Phase 5) ───────────────────────────────────────────────────
+// These setters/getters let the MIDI backend thread poll the engine's event
+// ring and feed incoming clock/note messages back in. Everything except
+// acid_midi_consume_event is safe to call from any thread.
+
+void acid_midi_set_out_enabled(int on) {
+    acid::g_midi_out_enabled.store(on != 0, std::memory_order_relaxed);
+}
+
+int acid_midi_out_enabled(void) {
+    return acid::g_midi_out_enabled.load(std::memory_order_relaxed) ? 1 : 0;
+}
+
+void acid_midi_set_sync_in(int on) {
+    acid::g_midi_sync_in.store(on != 0, std::memory_order_relaxed);
+    if (!on) {
+        // Clear the averaging window so re-enabling doesn't snap back to an
+        // old tempo the user has meanwhile tweaked with [/].
+        acid::g_midi_clock_i      = 0;
+        acid::g_midi_clock_filled = 0;
+        acid::g_midi_clock_sum    = 0.0;
+    }
+}
+
+int acid_midi_sync_in(void) {
+    return acid::g_midi_sync_in.load(std::memory_order_relaxed) ? 1 : 0;
+}
+
+// Called by the MIDI thread on every incoming 0xF8 pulse. `now_seconds` is a
+// monotonic timestamp (e.g. from CLOCK_MONOTONIC). Averages the last 24
+// inter-pulse deltas and writes the derived BPM into g_seq_bpm.
+void acid_midi_feed_clock(double now_seconds) {
+    if (!acid::g_midi_sync_in.load(std::memory_order_relaxed)) return;
+    static double last_t = 0.0;
+    if (last_t <= 0.0) { last_t = now_seconds; return; }
+    double dt = now_seconds - last_t;
+    last_t = now_seconds;
+    // Reject absurd gaps (>0.5 s would imply the master stalled — start over).
+    if (dt <= 0.0 || dt > 0.5) {
+        acid::g_midi_clock_i      = 0;
+        acid::g_midi_clock_filled = 0;
+        acid::g_midi_clock_sum    = 0.0;
+        return;
+    }
+    int idx = acid::g_midi_clock_i;
+    if (acid::g_midi_clock_filled >= acid::kMidiClockWindow) {
+        acid::g_midi_clock_sum -= acid::g_midi_clock_delta[idx];
+    } else {
+        acid::g_midi_clock_filled += 1;
+    }
+    acid::g_midi_clock_delta[idx] = static_cast<float>(dt);
+    acid::g_midi_clock_sum       += dt;
+    acid::g_midi_clock_i          = (idx + 1) % acid::kMidiClockWindow;
+    if (acid::g_midi_clock_filled >= 4) {
+        double mean_dt = acid::g_midi_clock_sum
+                      / static_cast<double>(acid::g_midi_clock_filled);
+        // dt is seconds per 24 PPQN pulse → beat = 24*dt → bpm = 60/(24*dt).
+        double bpm = 60.0 / (24.0 * mean_dt);
+        acid::g_seq_bpm.store(std::clamp(static_cast<float>(bpm), 20.0f, 300.0f),
+                              std::memory_order_relaxed);
+    }
+}
+
+// Received 0xFA (start) or 0xFC (stop) from the master. 0xFB (continue) is
+// treated as start. The engine starts/stops its internal sequencer; if clock
+// sync is off these calls are silently ignored so a stray master message
+// can't steamroll manual playback.
+void acid_midi_feed_start_stop(int start) {
+    if (!acid::g_midi_sync_in.load(std::memory_order_relaxed)) return;
+    acid::g_seq_playing.store(start != 0, std::memory_order_release);
+}
+
+// Drain the MIDI out event ring. Caller supplies a buffer of `max_evts` 4-byte
+// events; returns the number written. Event layout matches acid::MidiEvt.
+int acid_midi_consume_events(unsigned char* out, int max_evts) {
+    if (!out || max_evts <= 0) return 0;
+    uint32_t w = acid::g_midi_w.load(std::memory_order_acquire);
+    uint32_t r = acid::g_midi_r.load(std::memory_order_relaxed);
+    int written = 0;
+    while (r != w && written < max_evts) {
+        const auto& e = acid::g_midi_ring[r & (acid::kMidiRingSize - 1)];
+        out[written * 4 + 0] = e.type;
+        out[written * 4 + 1] = e.channel;
+        out[written * 4 + 2] = e.data1;
+        out[written * 4 + 3] = e.data2;
+        ++written;
+        ++r;
+    }
+    acid::g_midi_r.store(r, std::memory_order_release);
+    return written;
+}
+
+// Incoming note from a MIDI controller. The backend converts MIDI note →
+// frequency and calls this; we pipe through the normal note_on path so the
+// synth behaves exactly like jam mode. `step_sec` is the slide ramp time when
+// slide=1; 0 when not sliding.
+void acid_midi_note_on_ext(int midi_note, int velocity) {
+    if (midi_note < 0 || midi_note > 127) return;
+    float freq = 440.0f * std::pow(2.0f, static_cast<float>(midi_note - 69) / 12.0f);
+    acid_note_on(freq, velocity >= 100 ? 1 : 0, /*slide=*/0, /*step_sec=*/0.18f);
+}
+void acid_midi_note_off_ext(int /*midi_note*/) {
+    acid_note_off();
+}
+
+// Current BPM the engine is acting on — clock-out pacing derives from this.
+float acid_current_bpm(void) {
+    return acid::g_seq_bpm.load(std::memory_order_relaxed);
+}
+int acid_is_playing(void) {
+    return acid::g_seq_playing.load(std::memory_order_relaxed) ? 1 : 0;
+}
 
 int   acid_seq_current_step(void) {
     return acid::g_seq_current_step.load(std::memory_order_relaxed);
@@ -788,12 +1544,41 @@ int acid_render_wav(const char* path,
     acid::g_gate = false; acid::g_note_accented = false;
     acid::g_hpf_xprev = acid::g_hpf_yprev = 0.0f;
     acid::g_current_freq = acid::g_target_freq = 100.0f;
-    acid::g_last_seq       = acid::g_cmd_seq.load(std::memory_order_acquire);
+    // Fresh delay state for the bounce — otherwise a previous live session
+    // leaks its repeats into the first few hundred ms of the render.
+    std::memset(acid::g_delay_buf, 0, sizeof(acid::g_delay_buf));
+    acid::g_delay_w = 0;
+    acid::g_delay_fb_lp = 0.0f;
+    acid::g_delay_time_sm = 0.0f;
+    // Reverb buffers also need wiping — old tails would bleed into bar 1.
+    std::memset(acid::g_rev_comb_buf,  0, sizeof(acid::g_rev_comb_buf));
+    std::memset(acid::g_rev_apass_buf, 0, sizeof(acid::g_rev_apass_buf));
+    for (int i = 0; i < acid::kRevCombs;  ++i) { acid::g_rev_comb_w[i]  = 0; acid::g_rev_comb_lp[i] = 0.0f; }
+    for (int i = 0; i < acid::kRevApass;  ++i) { acid::g_rev_apass_w[i] = 0; }
+    acid::g_last_seq        = acid::g_cmd_seq.load(std::memory_order_acquire);
     acid::g_seq_was_playing = false;
+    acid::g_seq_rat_left    = 0;
+    // Reset the probability RNG so back-to-back bounces of the same pattern
+    // produce identical WAVs — matters when users iterate on a groove.
+    acid::g_seq_rng         = 0x9E3779B9u;
+    // Drum voices — envelopes and phases back to idle so no leakage from a
+    // previous bounce. Masks are preserved (the drum pattern bounces too).
+    acid::g_bd = acid::DrumBD{};
+    acid::g_sd = acid::DrumSD{};
+    acid::g_ch = acid::DrumHH{ .rng = 0x1b873593u };
+    acid::g_oh = acid::DrumHH{ .rng = 0xcc9e2d51u };
+    acid::g_cl = acid::DrumCL{};
 
-    // Load the pattern into the audio-thread sequencer.
+    // Load the pattern into the audio-thread sequencer. `notes[i]` carries
+    // the same 32-bit layout the audio thread reads back — midi in the low
+    // byte, flags at bit 8, prob at bit 11, ratchet-1 at bit 18.
     for (int i = 0; i < pattern_length; ++i) {
-        acid_seq_set_step(i, notes[i] & 0xFFFF, (notes[i] >> 16) & 0xFF);
+        int enc  = notes[i];
+        int midi = enc & 0xFF;
+        int flg  = (enc >> 8)  & 0x7;
+        int prob = (enc >> 11) & 0x7F;
+        int rat  = ((enc >> 18) & 0x3) + 1;
+        acid_seq_set_step(i, midi, flg, prob, rat);
     }
     acid_seq_set_pattern_length(pattern_length);
     acid_seq_set_bpm(bpm);

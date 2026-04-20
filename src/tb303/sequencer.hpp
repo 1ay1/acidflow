@@ -216,6 +216,67 @@ using namespace maya;
         }
     });
 
+    // ── LOCK row (per-step parameter locks) ──────────────────────────────
+    // Up to four independent locks per step (cutoff / res / env / accent).
+    // We can't fit four labelled chips in 3 cols, so instead we render one
+    // centered glyph and pick its colour from the highest-priority active
+    // lock (cutoff > res > env > accent). Readers can always check WHICH
+    // params are locked in the knob panel by eye; the LOCK row just flags
+    // "this step deviates from the main knobs at all".
+    auto locks = build_row("LOCK", [&](int i, std::string& cell, std::vector<StyledRun>& rr) {
+        const auto& s = steps[static_cast<size_t>(i)];
+        bool in_pat = i < pattern_length;
+        if (!in_pat || s.lock_mask == 0) {
+            cell = " \xc2\xb7 ";
+            rr.push_back(StyledRun{0, cell.size(),
+                Style{}.with_fg(cell_colour(i, clr_grid()))});
+            return;
+        }
+        // Filled square, 3-col cell " ▪ ". Colour: classic TB-303 filter
+        // params (cutoff/res/env) ride the filter cyan-ish slide colour;
+        // accent rides the hot red. Multi-lock → just pick the first set.
+        cell = " \xe2\x96\xaa ";
+        Color tint = clr_accent();
+        if      (s.lock_mask & LOCK_CUTOFF) tint = clr_slide();
+        else if (s.lock_mask & LOCK_RES)    tint = clr_accent();
+        else if (s.lock_mask & LOCK_ENV)    tint = clr_accent_d();
+        else if (s.lock_mask & LOCK_ACCENT) tint = clr_hot();
+        rr.push_back(StyledRun{1, 3,
+            Style{}.with_fg(cell_colour(i, tint)).with_bold()});
+    });
+
+    // ── PROB row (probability % / ratchet ×N) ────────────────────────────
+    // Compact 3-col cell per step. Default (prob=100, ratchet=1) renders as
+    // a dim dot so unmodified columns visually recede. Ratchet takes visual
+    // priority because a ratcheting step changes the rhythm audibly (cyan
+    // ×N), while prob < 100 shades in cooler "slide" colour (it's a chance
+    // modifier, not a guaranteed change).
+    auto probs = build_row("PROB", [&](int i, std::string& cell, std::vector<StyledRun>& rr) {
+        const auto& s = steps[static_cast<size_t>(i)];
+        bool in_pat = i < pattern_length;
+        bool mod_r  = in_pat && !s.rest && s.ratchet > 1;
+        bool mod_p  = in_pat && !s.rest && s.prob < 100;
+        if (!in_pat || (!mod_r && !mod_p)) {
+            cell = " \xc2\xb7 ";
+            rr.push_back(StyledRun{0, cell.size(),
+                Style{}.with_fg(cell_colour(i, clr_grid()))});
+            return;
+        }
+        if (mod_r) {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "\xc3\x97%d ", s.ratchet);  // "×N "
+            cell = buf;
+            rr.push_back(StyledRun{0, cell.size(),
+                Style{}.with_fg(cell_colour(i, clr_hot())).with_bold()});
+        } else {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "%2d%%", s.prob);          // "75%"
+            cell = buf;
+            rr.push_back(StyledRun{0, cell.size(),
+                Style{}.with_fg(cell_colour(i, clr_slide())).with_bold()});
+        }
+    });
+
     // ── NOTE row (C2 / D#2 / ·) ───────────────────────────────────────────
     auto notes = build_row("NOTE", [&](int i, std::string& cell, std::vector<StyledRun>& rr) {
         const auto& s = steps[static_cast<size_t>(i)];
@@ -254,6 +315,8 @@ using namespace maya;
             std::move(nums),
             std::move(sparkline),
             std::move(leds),
+            std::move(probs),
+            std::move(locks),
             std::move(notes),
             std::move(bottom)
         );

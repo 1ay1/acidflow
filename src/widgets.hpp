@@ -16,6 +16,7 @@
 #include "tb303/knob.hpp"
 #include "tb303/waveform_toggle.hpp"
 #include "tb303/sequencer.hpp"
+#include "tb303/drums.hpp"
 #include "tb303/filter_response.hpp"
 #include "tb303/scope.hpp"
 #include "tb303/transport.hpp"

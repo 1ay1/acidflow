@@ -23,7 +23,7 @@ set(ACIDFLOW_SOURCES
 )
 
 if(APPLE)
-    list(APPEND ACIDFLOW_SOURCES src/audio_coreaudio.cpp)
+    list(APPEND ACIDFLOW_SOURCES src/audio_coreaudio.cpp src/midi_stub.cpp)
     find_library(AUDIO_TOOLBOX   AudioToolbox   REQUIRED)
     find_library(CORE_AUDIO      CoreAudio      REQUIRED)
     find_library(CORE_FOUNDATION CoreFoundation REQUIRED)
@@ -33,13 +33,13 @@ if(APPLE)
         ${CORE_FOUNDATION}
     )
 elseif(WIN32)
-    list(APPEND ACIDFLOW_SOURCES src/audio_wasapi.cpp)
+    list(APPEND ACIDFLOW_SOURCES src/audio_wasapi.cpp src/midi_stub.cpp)
     # WASAPI lives in ole32 (CoCreateInstance/MMDeviceEnumerator) and the
     # audio client headers ship with the Windows SDK. No explicit audio lib
     # needed — link ole32 for COM and winmm for timing helpers.
     set(ACIDFLOW_AUDIO_LIBS ole32 winmm)
 elseif(UNIX)
-    list(APPEND ACIDFLOW_SOURCES src/audio_alsa.cpp)
+    list(APPEND ACIDFLOW_SOURCES src/audio_alsa.cpp src/midi_alsa.cpp)
     # Prefer pkg-config (handles multiarch include paths) but fall back to a
     # plain library lookup for minimal distros.
     find_package(PkgConfig QUIET)
