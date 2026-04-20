@@ -692,15 +692,13 @@ static bool export_wav() {
         if (s.slide)  flags |= 4;
         notes[i] = (flags << 16) | (s.note & 0xFFFF);
     }
-    float step_sec = 60.0f / std::max(g_bpm, 20.0f) / 4.0f;
-
     // Stop live audio so we don't race the engine's global state.
     bool was_playing = g_playing;
     stop_playback();
     acid_stop();
 
     int rc = acid_render_wav(path.string().c_str(), notes,
-                             g_pattern_length, step_sec, /*loops=*/4);
+                             g_pattern_length, g_bpm, g_swing, /*loops=*/4);
 
     acid_start();                        // restart the live audio thread
     if (was_playing) start_playback();
@@ -718,8 +716,10 @@ static float midi_to_hz(int note) {
     return 440.0f * std::pow(2.0f, (static_cast<float>(note) - 69.0f) / 12.0f);
 }
 
-// Push current knob values into the audio engine every frame. Cheap (atomics),
-// and keeps parameters in perfect sync with the UI with no special plumbing.
+// Push current knob + sequencer state into the audio engine every frame.
+// Cheap (atomics), and keeps everything in perfect sync with the UI with no
+// special plumbing. The sequencer itself lives on the audio thread now —
+// this just keeps it fed with up-to-date pattern/transport data.
 static void push_params() {
     acid_set_cutoff(g_cutoff);
     acid_set_resonance(g_resonance);
@@ -730,6 +730,18 @@ static void push_params() {
     acid_set_volume(g_volume);
     acid_set_tuning_semi((g_tune - 0.5f) * 24.0f);
     acid_set_waveform(g_wave);
+
+    for (int i = 0; i < 16; ++i) {
+        const auto& s = g_steps[static_cast<size_t>(i)];
+        int flags = 0;
+        if (s.rest)   flags |= 1;
+        if (s.accent) flags |= 2;
+        if (s.slide)  flags |= 4;
+        acid_seq_set_step(i, s.note, flags);
+    }
+    acid_seq_set_pattern_length(g_pattern_length);
+    acid_seq_set_bpm(g_bpm);
+    acid_seq_set_swing(g_swing);
 }
 
 static void tick(float dt) {
@@ -738,56 +750,22 @@ static void tick(float dt) {
     // Toast fade runs whether or not playback is active.
     if (g_toast_t > 0.0f) g_toast_t = std::max(0.0f, g_toast_t - dt);
 
-    if (!g_playing) { g_step_phase = 0.0f; return; }
-
-    // 16th-note step duration from BPM, shuffled by the swing ratio. Swing
-    // lengthens even-indexed steps (on the grid) and shortens odd-indexed
-    // ones by the same amount, so each pair still sums to two straight 16ths
-    // — the rhythm stays locked to the bar while the feel shifts between
-    // straight (0.50), classic MPC (~0.58–0.62), and hard shuffle (0.66+).
-    const float base_sec = 60.0f / std::max(g_bpm, 20.0f) / 4.0f;
-    const float sw       = std::clamp(g_swing, 0.50f, 0.75f);
-    auto step_dur = [&](int step_idx) {
-        bool even = (step_idx % 2) == 0;
-        return base_sec * 2.0f * (even ? sw : (1.0f - sw));
-    };
-    const float cur_dur = (g_current_step < 0) ? base_sec : step_dur(g_current_step);
-
-    g_step_clock += dt;
-
-    // Track normalised position within the current step for smooth UI fades.
-    g_step_phase = std::clamp(
-        static_cast<float>(g_step_clock / std::max(cur_dur, 1e-3f)),
-        0.0f, 1.0f);
-
-    if (g_step_clock >= cur_dur) {
-        g_step_clock -= cur_dur;
-        g_current_step = (g_current_step + 1) % g_pattern_length;
-        g_step_phase   = 0.0f;
-
-        const auto& s = g_steps[static_cast<size_t>(g_current_step)];
-        if (!s.rest) {
-            // slide = "glide into this note from the previous one". Needs a
-            // real held note to glide from, so only honour it when the prev
-            // step actually played.
-            int  prev = (g_current_step - 1 + g_pattern_length) % g_pattern_length;
-            bool do_slide = s.slide && !g_steps[static_cast<size_t>(prev)].rest;
-            acid_note_on(midi_to_hz(s.note), s.accent ? 1 : 0,
-                         do_slide ? 1 : 0, step_dur(g_current_step));
-        }
-    }
+    // Pull the sequencer's published position so the UI (highlighted step,
+    // beat-sync fades) stays in lockstep with what's actually playing.
+    g_current_step = g_playing ? acid_seq_current_step() : -1;
+    g_step_phase   = g_playing ? acid_seq_step_phase()   : 0.0f;
 }
 
 static void start_playback() {
     g_playing = true;
     g_current_step = -1;
-    g_step_clock = 1e9;  // force immediate advance on the very next tick
+    acid_seq_play();
 }
 
 static void stop_playback() {
     g_playing = false;
     g_current_step = -1;
-    acid_note_off();
+    acid_seq_stop();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

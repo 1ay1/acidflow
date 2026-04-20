@@ -24,9 +24,28 @@ void acid_set_tuning_semi(float v);
 void acid_set_waveform(int v);
 
 // Trigger a note. accent/slide are 0/1 bools. step_sec is the step duration
-// used to size the portamento ramp.
+// used to size the portamento ramp. These are the legacy external-trigger
+// path; live playback now uses the in-engine sequencer (acid_seq_*) so notes
+// fire at sample-accurate boundaries rather than on UI ticks.
 void acid_note_on(float freq, int accent, int slide, float step_sec);
 void acid_note_off(void);
+
+// ── Audio-thread sequencer ──────────────────────────────────────────────────
+// The UI writes pattern + transport state into atomics; the audio thread
+// schedules step boundaries on a sample clock and fires notes itself. This
+// eliminates the ~33 ms timing jitter that a UI-driven scheduler has and makes
+// live playback match the offline WAV bounce to the sample.
+//
+// `flags` is a bitmask: rest=1, accent=2, slide=4. `midi` is the pitch in
+// MIDI note numbers. `swing` is 0.50 (straight) .. 0.75 (hard shuffle).
+void  acid_seq_set_step(int idx, int midi, int flags);
+void  acid_seq_set_pattern_length(int n);
+void  acid_seq_set_bpm(float bpm);
+void  acid_seq_set_swing(float s);
+void  acid_seq_play(void);
+void  acid_seq_stop(void);
+int   acid_seq_current_step(void);   // -1 when stopped
+float acid_seq_step_phase(void);     // 0..1 within current step, for UI fades
 
 // Pull the most-recent `n` samples out of the scope ring (capped at the ring
 // size, 4096). The UI polls this each render frame to draw the oscilloscope.
@@ -45,19 +64,20 @@ float acid_output_peak(void);
 // accent envelope rather than sitting still.
 float acid_live_fc(void);
 
-// Offline WAV bounce: render `pattern_length * step_sec * loops` seconds of
-// audio into `path` at 44.1kHz, 16-bit PCM mono, with the sequencer driving
-// notes as per the passed pattern. Uses the same DSP as live playback but
-// runs synchronously so it can't drop frames. The UI should NOT be running
+// Offline WAV bounce: render `loops` repetitions of the given pattern into
+// `path` at the engine's sample rate, 16-bit PCM mono. Uses the same in-engine
+// sequencer as live playback — swing and BPM apply identically — and runs
+// synchronously so it can't drop frames. The UI should NOT be running
 // `acid_start()` for the duration of the call (engine globals are shared).
 // Returns 0 on success, -1 on file-open failure.
 //
-// The `notes` array carries 16 entries; each slot is (midi, flags) packed as
-// one int per step where flags are bits {rest=1, accent=2, slide=4}.
+// The `notes` array carries pattern_length entries; each slot is (midi, flags)
+// packed as one int per step where flags bits are {rest=1, accent=2, slide=4}.
 int acid_render_wav(const char* path,
                     const int*  notes,       // pattern_length entries
                     int         pattern_length,
-                    float       step_sec,
+                    float       bpm,
+                    float       swing,       // 0.50..0.75
                     int         loops);
 
 #ifdef __cplusplus

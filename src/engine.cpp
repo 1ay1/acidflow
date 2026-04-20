@@ -157,6 +157,32 @@ float              g_peak_env = 0.0f;
 // keeps audio-side overhead to a single relaxed store per block.
 std::atomic<float> g_live_fc{200.0f};
 
+// ── Audio-thread sequencer ──────────────────────────────────────────────────
+// Live step scheduling is done on the audio thread against a sample-accurate
+// clock. The UI used to drive it from the 30 FPS render callback, which
+// quantised every note-on to ~33 ms and made the live version audibly looser
+// than the offline WAV bounce. Now both paths share this scheduler, so live
+// matches export to the sample.
+//
+// UI-shared atomics: pattern (packed midi|flags per slot), length, bpm,
+// swing, playing flag, plus published current step + within-step phase for
+// beat-sync animation.
+//
+// Audio-thread locals (g_seq_clock etc.) are only touched inside render().
+constexpr int kSeqMaxSteps = 16;
+std::atomic<uint32_t> g_seq_steps[kSeqMaxSteps]  {};            // bits: flags<<16 | midi
+std::atomic<int>      g_seq_pattern_length       {16};
+std::atomic<float>    g_seq_bpm                  {122.0f};
+std::atomic<float>    g_seq_swing                {0.50f};       // 0.50..0.75
+std::atomic<bool>     g_seq_playing              {false};
+std::atomic<int>      g_seq_current_step         {-1};
+std::atomic<float>    g_seq_step_phase           {0.0f};
+
+double g_seq_clock       = 0.0;         // samples into the current step
+int    g_seq_step        = -1;          // playing step (-1 = idle)
+bool   g_seq_prev_rest   = true;        // for slide-after-rest suppression
+bool   g_seq_was_playing = false;
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 // PolyBLEP residual for a waveform discontinuity at phase wrap.
@@ -257,6 +283,46 @@ inline float ladder_tpt_step(float x, float g, float k) {
     return y4;
 }
 
+// Shared note-commit logic used by both the external command ring (for
+// compatibility) and the audio-thread sequencer. Mutates audio-thread state
+// directly — only safe to call from inside render().
+//
+// Slide semantics (stock 303): the previous note's gate is still held when
+// the new note fires, so envelopes DON'T retrigger — they continue decaying
+// from wherever they were, and only the pitch CV glides to the new target.
+// Without this the "rising squelch" on slide chains gets interrupted on
+// every step.
+//
+// Accent cap: add to existing charge (does not fully discharge between fast
+// consecutive accents → rising squelch). 0.45 was measured off the real C13
+// voltage step in Stinchcombe's notes.
+inline void note_commit_on(float freq, bool accent, bool slide) {
+    g_target_freq = freq * std::pow(2.0f, g_params.tuning.load() / 12.0f);
+    const bool is_slide = slide && g_current_freq >= 10.0f;
+    if (!is_slide) {
+        g_current_freq = g_target_freq;
+        g_phase        = 0.0f;
+        g_meg          = 1.0f;
+        g_veg          = 0.0f;   // start silent — ramp up via g_veg_atk
+        g_veg_atk      = 0.0f;   // triggers the 3 ms linear attack
+        g_gate         = true;
+    }
+    g_note_accented = accent;
+    if (accent) {
+        float acc = g_params.accent_amt.load();
+        g_acc_env = std::min(1.0f, g_acc_env + 0.45f * acc);
+    }
+}
+
+inline void note_commit_off() {
+    g_gate = false;
+}
+
+// Inner sample-loop worker. All the per-block DSP constants live in the
+// captures of the lambda in render(); this function is just the declaration.
+// (Implemented inline inside render() as a lambda so it can reference those
+// constants cheaply.)
+
 }  // namespace
 
 void set_sample_rate(int sr) { g_sample_rate = sr > 0 ? sr : kDefaultSampleRate; }
@@ -266,7 +332,8 @@ void render(float* out, int frames) {
     const float sr    = static_cast<float>(g_sample_rate);
     const float dt_s  = 1.0f / sr;
 
-    // ── Commit any pending note command ─────────────────────────────────────
+    // ── External note command ring (legacy path; used by nothing now, but
+    // kept working for offline render tools / external drivers) ─────────────
     uint64_t seq = g_cmd_seq.load(std::memory_order_acquire);
     if (seq != g_last_seq) {
         g_last_seq      = seq;
@@ -275,41 +342,89 @@ void render(float* out, int frames) {
         bool accent     = (flags & 0b010);
         bool slide      = (flags & 0b100);
         float freq      = g_cmd_freq.load(std::memory_order_relaxed);
-
-        if (on) {
-            g_target_freq = freq * std::pow(2.0f, g_params.tuning.load() / 12.0f);
-            // Slide semantics (stock 303): the previous note's gate is still
-            // held when the new note fires, so envelopes DON'T retrigger —
-            // they continue decaying from wherever they were, and only the
-            // pitch CV glides to the new target. Without this the "rising
-            // squelch" on slide chains gets interrupted on every step.
-            const bool is_slide = slide && g_current_freq >= 10.0f;
-            if (!is_slide) {
-                g_current_freq = g_target_freq;
-                g_phase        = 0.0f;
-                g_meg          = 1.0f;
-                g_veg          = 0.0f;   // start silent — ramp up via g_veg_atk
-                g_veg_atk      = 0.0f;   // triggers the 3 ms linear attack
-                g_gate         = true;
-            }
-            g_note_accented = accent;
-
-            // Accent cap: add to existing charge (does not fully discharge
-            // between fast consecutive accents → rising squelch). One hit at
-            // full accent-amt should leave plenty of headroom so that two or
-            // three stacked accents keep climbing — 0.45 was measured off the
-            // real C13 voltage step in Stinchcombe's notes.
-            if (accent) {
-                float acc = g_params.accent_amt.load();
-                g_acc_env = std::min(1.0f, g_acc_env + 0.45f * acc);
-            }
-        } else {
-            // Note-off: gate down, amp envelope will decay fast below.
-            g_gate = false;
-        }
+        if (on) note_commit_on(freq, accent, slide);
+        else    note_commit_off();
     }
 
-    // ── Block-rate parameter snapshot ───────────────────────────────────────
+    // ── Sequencer snapshot + play/stop transition ──────────────────────────
+    const bool  sp_on = g_seq_playing.load(std::memory_order_acquire);
+    const int   plen  = std::clamp(g_seq_pattern_length.load(std::memory_order_relaxed),
+                                   1, kSeqMaxSteps);
+    const float bpm   = std::max(20.0f, g_seq_bpm.load(std::memory_order_relaxed));
+    const float swin  = std::clamp(g_seq_swing.load(std::memory_order_relaxed), 0.50f, 0.75f);
+    const double base_samples = 60.0 / static_cast<double>(bpm) / 4.0
+                              * static_cast<double>(sr);
+    auto step_samples = [&](int si) -> double {
+        // Even steps stretch, odd steps compress — pairs always sum to 2 × base,
+        // so the bar length stays locked to the BPM regardless of swing.
+        bool even = (si % 2) == 0;
+        return base_samples * 2.0 * (even ? swin : (1.0 - swin));
+    };
+
+    if (sp_on && !g_seq_was_playing) {
+        // Rising edge: step -1 is a sentinel whose duration is 0 so the very
+        // next pass through the advance loop bumps us to step 0 and fires the
+        // first note. Without this clock-at-zero trick, a large sentinel
+        // would chain-advance through every step in one shot.
+        g_seq_step      = -1;
+        g_seq_clock     = 0.0;
+        g_seq_prev_rest = true;
+    } else if (!sp_on && g_seq_was_playing) {
+        // Falling edge: release the gate and park.
+        note_commit_off();
+        g_seq_step = -1;
+        g_seq_current_step.store(-1, std::memory_order_relaxed);
+        g_seq_step_phase.store(0.0f,  std::memory_order_relaxed);
+    }
+    g_seq_was_playing = sp_on;
+
+    // ── Sub-block loop ─────────────────────────────────────────────────────
+    // Slice the audio block at step boundaries so note_on fires on the exact
+    // sample, matching the offline WAV bounce. Block constants (env times,
+    // filter coeffs, …) are recomputed once per sub-block — the sequencer
+    // may toggle accent mid-block and those constants depend on it.
+    int   frames_left = frames;
+    float* out_ptr    = out;
+    while (frames_left > 0) {
+        // Advance sequencer across any boundaries that are already due.
+        if (sp_on) {
+            while (true) {
+                // Pre-start (step==-1) has zero "duration" so the first
+                // iteration immediately advances to step 0 and fires its note.
+                double cur_dur = (g_seq_step < 0) ? 0.0 : step_samples(g_seq_step);
+                if (g_seq_clock < cur_dur) break;
+                g_seq_clock -= cur_dur;
+                g_seq_step   = (g_seq_step + 1) % plen;
+                uint32_t enc = g_seq_steps[g_seq_step].load(std::memory_order_relaxed);
+                int  midi  = static_cast<int>(enc & 0xFFFF);
+                int  flg   = static_cast<int>((enc >> 16) & 0xFF);
+                bool rest  = (flg & 1) != 0;
+                bool acc   = (flg & 2) != 0;
+                bool sld   = (flg & 4) != 0;
+                if (!rest) {
+                    // Mirror live tick()'s rule: a slide only counts when the
+                    // previous step actually played — you can't glide from a
+                    // rest.
+                    float freq = 440.0f * std::pow(2.0f,
+                                 static_cast<float>(midi - 69) / 12.0f);
+                    note_commit_on(freq, acc, sld && !g_seq_prev_rest);
+                }
+                g_seq_prev_rest = rest;
+                g_seq_current_step.store(g_seq_step, std::memory_order_relaxed);
+            }
+        }
+
+        // How many frames until the next step boundary?
+        int n;
+        if (sp_on && g_seq_step >= 0) {
+            double remaining = step_samples(g_seq_step) - g_seq_clock;
+            int fu = (remaining <= 1.0) ? 1 : static_cast<int>(remaining);
+            n = std::min(frames_left, fu);
+        } else {
+            n = frames_left;
+        }
+
+        // ── Block-rate parameter snapshot (per sub-block) ───────────────────
     const float fc_knob  = g_params.cutoff.load();
     const float res_knob = g_params.resonance.load();
     const float envmod_k = g_params.env_mod.load();
@@ -390,15 +505,15 @@ void render(float* out, int frames) {
     // the aliasing you'd otherwise hear as "grit" on high-Q squelches.
     const float sr2 = sr * 2.0f;
 
-    // ── Sample loop ─────────────────────────────────────────────────────────
-    for (int i = 0; i < frames; i++) {
+    // ── Sample loop (inner — runs for `n` frames of this sub-block) ─────
+    for (int i = 0; i < n; i++) {
         // Slide: exponential approach to target pitch (single-pole LPF)
         g_current_freq += slide_coef * (g_target_freq - g_current_freq);
 
         // Analog drift: generate a filtered random walk, scale to ±3 cents,
         // apply as a V/oct offset. Freq is recomputed from this offset below.
-        float n = rand_bipolar(g_drift_rng);
-        g_drift_lp  += drift_coef * (n - g_drift_lp);
+        float dn = rand_bipolar(g_drift_rng);
+        g_drift_lp  += drift_coef * (dn - g_drift_lp);
         g_drift_oct  = g_drift_lp * drift_depth_oct;
         const float freq_with_drift = g_current_freq * std::exp2(g_drift_oct);
 
@@ -478,7 +593,7 @@ void render(float* out, int frames) {
         g_hpf_xprev = y;
         g_hpf_yprev = y_hpf;
 
-        out[i] = y_hpf;
+        out_ptr[i] = y_hpf;
 
         // Scope tap: store in ring; peak envelope decays ~100 ms.
         uint32_t w = g_scope_w.load(std::memory_order_relaxed);
@@ -493,6 +608,21 @@ void render(float* out, int frames) {
         // (relaxed atomic store) and lets the UI show the envelope "scream".
         g_live_fc.store(fc_hz, std::memory_order_relaxed);
     }
+
+    // Advance sequencer clock, output cursor, remaining frames.
+    g_seq_clock += static_cast<double>(n);
+    out_ptr     += n;
+    frames_left -= n;
+
+    // Publish within-step phase for UI beat-sync fades.
+    if (sp_on && g_seq_step >= 0) {
+        double denom = step_samples(g_seq_step);
+        float  ph    = (denom > 0.0) ? static_cast<float>(g_seq_clock / denom) : 0.0f;
+        g_seq_step_phase.store(std::clamp(ph, 0.0f, 1.0f),
+                               std::memory_order_relaxed);
+    }
+    }  // end sub-block while loop
+
     g_peak.store(g_peak_env, std::memory_order_relaxed);
 }
 
@@ -550,36 +680,82 @@ float acid_live_fc(void) {
     return acid::g_live_fc.load(std::memory_order_relaxed);
 }
 
+// ── Audio-thread sequencer API (called from UI) ─────────────────────────────
+// Each step is packed as (flags<<16 | midi) where flags bits are
+//   {rest=1, accent=2, slide=4}. Every write is a single atomic store; the
+// audio thread reads each slot when it advances to that step so a torn read
+// is not possible (slot state is self-contained per step).
+
+void acid_seq_set_step(int idx, int midi, int flags) {
+    if (idx < 0 || idx >= acid::kSeqMaxSteps) return;
+    uint32_t enc = (static_cast<uint32_t>(flags & 0xFF) << 16)
+                 | (static_cast<uint32_t>(midi) & 0xFFFFu);
+    acid::g_seq_steps[idx].store(enc, std::memory_order_relaxed);
+}
+
+void acid_seq_set_pattern_length(int n) {
+    acid::g_seq_pattern_length.store(std::clamp(n, 1, acid::kSeqMaxSteps),
+                                     std::memory_order_relaxed);
+}
+
+void acid_seq_set_bpm(float bpm) {
+    acid::g_seq_bpm.store(std::clamp(bpm, 20.0f, 300.0f),
+                          std::memory_order_relaxed);
+}
+
+void acid_seq_set_swing(float s) {
+    acid::g_seq_swing.store(std::clamp(s, 0.50f, 0.75f),
+                            std::memory_order_relaxed);
+}
+
+void acid_seq_play(void)  { acid::g_seq_playing.store(true,  std::memory_order_release); }
+void acid_seq_stop(void)  { acid::g_seq_playing.store(false, std::memory_order_release); }
+
+int   acid_seq_current_step(void) {
+    return acid::g_seq_current_step.load(std::memory_order_relaxed);
+}
+
+float acid_seq_step_phase(void) {
+    return acid::g_seq_step_phase.load(std::memory_order_relaxed);
+}
+
 // ── Offline WAV render ──────────────────────────────────────────────────────
-// Runs the same DSP pipeline as live playback but synchronously — we drive
-// the command ring from this thread and pump render() ourselves. Engine
-// globals are shared with the live audio thread, so the caller must have
-// stopped live playback for the duration (main.cpp does acid_stop()→render→
-// acid_start()).
+// Drives the same in-engine sequencer as live playback — just runs render()
+// synchronously on the calling thread. Caller must have torn down the audio
+// backend (main.cpp does acid_stop() → render → acid_start()).
 int acid_render_wav(const char* path,
                     const int*  notes,
                     int         pattern_length,
-                    float       step_sec,
+                    float       bpm,
+                    float       swing,
                     int         loops) {
-    if (!path || !notes || pattern_length <= 0 || loops <= 0 || step_sec <= 0.0f)
+    if (!path || !notes || pattern_length <= 0 || loops <= 0 || bpm <= 0.0f)
         return -1;
+    pattern_length = std::min(pattern_length, acid::kSeqMaxSteps);
+    swing = std::clamp(swing, 0.50f, 0.75f);
 
     FILE* f = std::fopen(path, "wb");
     if (!f) return -1;
 
-    const int   sr          = acid::sample_rate();
-    const int   total_steps = pattern_length * loops;
-    // 350 ms release tail at the end so the last note's VEG decays to silence
-    // instead of cutting off mid-note (which would click on playback).
-    const int   tail_frames = static_cast<int>(0.35 * sr);
-    // Cumulative frame budget — every step's start is computed from the exact
-    // double-precision boundary, so per-step int truncation never drifts more
-    // than one sample over the whole render.
-    auto step_start = [&](int si) {
-        return static_cast<int>(static_cast<double>(si) * step_sec * sr);
-    };
-    const int   pattern_frames = step_start(total_steps);
-    const int   total_frames   = pattern_frames + tail_frames;
+    const int sr          = acid::sample_rate();
+    const int total_steps = pattern_length * loops;
+
+    // Compute total frame count using the same swing formula the audio thread
+    // uses, so the WAV header matches exactly what we write.
+    const double base_samples = 60.0 / static_cast<double>(bpm) / 4.0
+                              * static_cast<double>(sr);
+    double pattern_samples = 0.0;
+    for (int si = 0; si < total_steps; ++si) {
+        bool even = (si % 2) == 0;
+        pattern_samples += base_samples * 2.0 *
+                           (even ? static_cast<double>(swing)
+                                 : 1.0 - static_cast<double>(swing));
+    }
+    const int pattern_frames = static_cast<int>(pattern_samples);
+    // 350 ms release tail so the last note's VEG decays to silence instead
+    // of cutting off mid-note (which would click on playback).
+    const int tail_frames    = static_cast<int>(0.35 * sr);
+    const int total_frames   = pattern_frames + tail_frames;
 
     // ── WAV header (44-byte RIFF/PCM, 16-bit mono) ─────────────────────────
     auto write_u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
@@ -598,10 +774,7 @@ int acid_render_wav(const char* path,
     std::fwrite("data", 1, 4, f);
     write_u32(data_bytes);
 
-    // Reset engine state so every bounce starts from silence. g_last_seq is
-    // module-static and may carry whatever value the live audio thread left
-    // it at — sync it to the current command seq so the very first render
-    // call doesn't accidentally re-commit a stale note from before the stop.
+    // Reset engine state so every bounce starts from silence.
     acid::g_phase    = 0.0f;
     acid::g_osc_prev = 0.0f;
     acid::g_tpt_s[0] = acid::g_tpt_s[1] = acid::g_tpt_s[2] = acid::g_tpt_s[3] = 0.0f;
@@ -615,68 +788,46 @@ int acid_render_wav(const char* path,
     acid::g_gate = false; acid::g_note_accented = false;
     acid::g_hpf_xprev = acid::g_hpf_yprev = 0.0f;
     acid::g_current_freq = acid::g_target_freq = 100.0f;
-    acid::g_last_seq = acid::g_cmd_seq.load(std::memory_order_acquire);
+    acid::g_last_seq       = acid::g_cmd_seq.load(std::memory_order_acquire);
+    acid::g_seq_was_playing = false;
 
-    // Drive the sequencer step by step.
+    // Load the pattern into the audio-thread sequencer.
+    for (int i = 0; i < pattern_length; ++i) {
+        acid_seq_set_step(i, notes[i] & 0xFFFF, (notes[i] >> 16) & 0xFF);
+    }
+    acid_seq_set_pattern_length(pattern_length);
+    acid_seq_set_bpm(bpm);
+    acid_seq_set_swing(swing);
+    acid_seq_play();
+
+    // Render the main pattern — stop the seq exactly at the pattern boundary.
+    // Loops are handled by just rendering enough frames; the sequencer wraps
+    // on its own when it hits pattern_length.
     constexpr int kBlock = 256;
-    std::vector<float> buf(kBlock);
+    std::vector<float>   buf(kBlock);
     std::vector<int16_t> out16(kBlock);
-    auto midi_to_hz = [](int m) {
-        return 440.0f * std::pow(2.0f, (m - 69) / 12.0f);
-    };
 
     int written = 0;
-    bool prev_was_rest = true;        // before step 0, "previous" doesn't exist
-    for (int si = 0; si < total_steps; ++si) {
-        int  idx   = si % pattern_length;
-        int  enc   = notes[idx];
-        int  midi  = enc & 0xFFFF;
-        int  flags = (enc >> 16) & 0xFF;
-        bool rest  = (flags & 1);
-        bool acc   = (flags & 2);
-        bool sld   = (flags & 4);
-
-        if (!rest) {
-            // Mirror live tick(): a slide flag is only honoured when the
-            // previous step actually played — you can't glide into a note
-            // from a rest. Without this, patterns like Voodoo Ray (lots of
-            // rest→note transitions with the slide flag) sound noticeably
-            // different in the bounce than in live playback. Tuning is
-            // applied inside the engine's note-on commit, so we pass the
-            // raw frequency here — pre-multiplying would double-apply it.
-            bool do_slide = sld && !prev_was_rest;
-            acid_note_on(midi_to_hz(midi),
-                         acc ? 1 : 0, do_slide ? 1 : 0, step_sec);
+    while (written < pattern_frames) {
+        int n = std::min(kBlock, pattern_frames - written);
+        acid::render(buf.data(), n);
+        for (int i = 0; i < n; ++i) {
+            float s = std::clamp(buf[i], -1.0f, 1.0f);
+            out16[static_cast<size_t>(i)] = static_cast<int16_t>(s * 32767.0f);
         }
-        prev_was_rest = rest;
-
-        // Render exactly enough frames to land at the next step's boundary.
-        int next_boundary = (si + 1 < total_steps) ? step_start(si + 1)
-                                                   : pattern_frames;
-        while (written < next_boundary) {
-            int n = std::min(kBlock, next_boundary - written);
-            acid::render(buf.data(), n);
-            for (int i = 0; i < n; ++i) {
-                float s = std::clamp(buf[i], -1.0f, 1.0f);
-                out16[static_cast<size_t>(i)] =
-                    static_cast<int16_t>(s * 32767.0f);
-            }
-            std::fwrite(out16.data(), 2, static_cast<size_t>(n), f);
-            written += n;
-        }
+        std::fwrite(out16.data(), 2, static_cast<size_t>(n), f);
+        written += n;
     }
 
-    // Release tail — note-off then keep rendering until we've filled the tail
-    // budget. Lets the VEG / accent envelope decay to silence so the WAV ends
-    // on near-zero samples instead of a sustained tone (which would click).
-    acid_note_off();
+    // Release tail — stop the sequencer (triggers note_off on the next
+    // render call) and drain the envelopes.
+    acid_seq_stop();
     while (written < total_frames) {
         int n = std::min(kBlock, total_frames - written);
         acid::render(buf.data(), n);
         for (int i = 0; i < n; ++i) {
             float s = std::clamp(buf[i], -1.0f, 1.0f);
-            out16[static_cast<size_t>(i)] =
-                static_cast<int16_t>(s * 32767.0f);
+            out16[static_cast<size_t>(i)] = static_cast<int16_t>(s * 32767.0f);
         }
         std::fwrite(out16.data(), 2, static_cast<size_t>(n), f);
         written += n;
