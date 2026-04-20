@@ -696,32 +696,31 @@ static void randomize_pattern(int arch_hint = -1, bool silent = false) {
     auto Ui = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo,hi)(rng); };
     auto chance = [&](float p) { return U() < p; };
 
+    int gr = (arch_hint >= 0)
+        ? std::clamp(arch_hint, 0, PA_COUNT - 1)
+        : Ui(0, PA_COUNT - 1);
+
     // ── Scale library ───────────────────────────────────────────────────────
-    // Each scale is a set of semitone offsets from the root, with per-note
-    // weights. Higher weight = picked more often.
+    // Each scale: semitone offsets from root with per-note weights. Scale tones
+    // stay in one octave (0..12) — octave variation comes from the contour pass
+    // below, so a line has both scale logic AND melodic shape.
     struct ScaleNote { int semi; int w; };
-    using ScaleVec = std::array<ScaleNote, 8>;
-    // minor pentatonic — classic acid
-    static constexpr ScaleVec kMinorPenta = {{{0,4},{3,3},{5,3},{7,4},{10,2},{12,3},{15,2},{19,1}}};
-    // blues — minor penta + b5 passing tone
-    static constexpr ScaleVec kBlues      = {{{0,4},{3,3},{5,2},{6,2},{7,3},{10,2},{12,3},{15,2}}};
-    // dorian — darker, more melodic
-    static constexpr ScaleVec kDorian     = {{{0,3},{2,2},{3,3},{5,2},{7,3},{9,2},{10,3},{12,3}}};
-    // phrygian — flat-2 tension
-    static constexpr ScaleVec kPhrygian   = {{{0,3},{1,3},{3,2},{5,2},{7,2},{8,2},{10,3},{12,3}}};
-    // chromatic walk — semitone motion, very acid
-    static constexpr ScaleVec kChromatic  = {{{0,3},{1,2},{2,1},{3,3},{5,2},{6,1},{7,3},{10,2}}};
-    // mixolydian — brighter
-    static constexpr ScaleVec kMixo       = {{{0,4},{2,2},{4,2},{5,3},{7,4},{9,2},{10,3},{12,3}}};
+    using ScaleVec = std::array<ScaleNote, 6>;
+    static constexpr ScaleVec kMinorPenta = {{{0,5},{3,3},{5,3},{7,4},{10,3},{12,2}}};
+    static constexpr ScaleVec kBlues      = {{{0,4},{3,3},{5,2},{6,2},{7,3},{10,3}}};
+    static constexpr ScaleVec kDorian     = {{{0,4},{3,3},{5,2},{7,3},{9,2},{10,2}}};
+    static constexpr ScaleVec kPhrygian   = {{{0,4},{1,2},{3,3},{5,2},{7,3},{10,2}}};
+    static constexpr ScaleVec kMinor      = {{{0,4},{3,3},{5,2},{7,3},{8,2},{10,2}}};
+    static constexpr ScaleVec kMixo       = {{{0,4},{2,2},{5,3},{7,4},{9,2},{10,2}}};
 
     const ScaleVec* scales[] = {
-        &kMinorPenta, &kBlues, &kDorian, &kPhrygian, &kChromatic, &kMixo
+        &kMinorPenta, &kBlues, &kDorian, &kPhrygian, &kMinor, &kMixo
     };
     const ScaleVec& scale = *scales[Ui(0, 5)];
 
-    // Root octave — C1=24, C2=36, C3=48. Weighted toward C2.
-    static constexpr int kRoots[] = {24, 36, 36, 48};
-    int tonic = kRoots[Ui(0, 3)];
+    // Root octave — C1=24, C2=36, C3=48. Heavy C2 bias: the 303's sweet spot.
+    static constexpr int kRoots[] = {24, 36, 36, 36, 48};
+    int tonic = kRoots[Ui(0, 4)];
 
     auto pick_tone = [&]() -> int {
         int total = 0;
@@ -734,79 +733,85 @@ static void randomize_pattern(int arch_hint = -1, bool silent = false) {
         return 0;
     };
 
-    // Octave displacement — lets notes jump up/down an extra octave for range.
-    // Probability of shifting up 12 or down 12 varies by archetype.
-    auto displace = [&](int note, float up_p, float dn_p) -> int {
-        if (chance(up_p)) note += 12;
-        else if (chance(dn_p)) note -= 12;
-        return std::clamp(note, 12, 72);
+    // Strong scale degrees for downbeat fallback — root / 5 / octave.
+    auto pick_strong = [&]() -> int {
+        static constexpr int kStrong[] = {0, 0, 0, 7, 12};
+        return kStrong[Ui(0, 4)];
     };
 
-    int gr = (arch_hint >= 0)
-        ? std::clamp(arch_hint, 0, PA_COUNT - 1)
-        : Ui(0, PA_COUNT - 1);
+    // ── Contour — per-step target octave offset shaping the melodic arc ────
+    // A good bassline has direction. We pick a shape per randomization and
+    // compute, for each step, a base octave (0 = tonic oct, ±1 = displaced).
+    // Scale-tone picking still applies on top, so "arc" + "blues" gives a
+    // rising blues line instead of scale-tone confetti.
+    enum Contour { C_FLAT, C_RISE, C_FALL, C_ARCH, C_VALLEY, C_WAVE };
+    Contour contour = static_cast<Contour>(Ui(0, 5));
+    auto contour_oct = [&](int i) -> int {
+        float t = (g_pattern_length <= 1) ? 0.0f
+                : float(i) / float(g_pattern_length - 1);        // 0..1
+        float y;
+        switch (contour) {
+            case C_FLAT:   y = 0.0f;                                    break;
+            case C_RISE:   y = t;                                       break;
+            case C_FALL:   y = 1.0f - t;                                break;
+            case C_ARCH:   y = 1.0f - std::abs(2.0f * t - 1.0f);        break; // ^
+            case C_VALLEY: y = std::abs(2.0f * t - 1.0f);               break; // v
+            case C_WAVE:   y = 0.5f * (1.0f + std::sin(t * 6.2831853f * 1.5f)); break;
+            default:       y = 0.0f;                                    break;
+        }
+        // Map [0..1] → {-1, 0, +1, maybe +2 for ARCH peak}
+        if (y < 0.25f) return (contour == C_FALL || contour == C_VALLEY) ? -1 : 0;
+        if (y < 0.65f) return 0;
+        if (y < 0.90f) return 1;
+        return (contour == C_ARCH) ? 2 : 1;
+    };
 
-    // Per-archetype shape parameters:
-    //   rest_rate   : off-beat rest probability (sparseness)
-    //   root_bias   : chance a non-downbeat note picks root vs scale tone
-    //   db_root     : chance a downbeat anchors to root
-    //   slide_rate  : base slide probability
-    //   accent_off  : off-beat accent probability
-    //   oct_up/dn   : octave displacement chances
-    //   prob_rate   : fraction of steps that get <100% probability
-    //   ratchet_r   : fraction of steps that get ratchet>1
-    //   plock_r     : fraction of steps that get a p-lock
+    // Per-archetype shape parameters.
     float rest_rate=0.25f, root_bias=0.40f, db_root=0.55f;
     float slide_rate=0.25f, accent_off=0.15f;
-    float oct_up=0.15f, oct_dn=0.10f;
     float prob_rate=0.12f, ratchet_r=0.08f, plock_r=0.12f;
 
     switch (gr) {
         case PA_PEDAL:
-            rest_rate=0.20f; root_bias=0.55f; db_root=0.70f;
+            rest_rate=0.20f; root_bias=0.55f; db_root=0.75f;
             slide_rate=0.20f; accent_off=0.10f;
-            oct_up=0.05f; oct_dn=0.05f;
             prob_rate=0.08f; ratchet_r=0.04f; plock_r=0.10f;
+            contour = C_FLAT;   // pedal is always flat by definition
             break;
         case PA_DRIVING:
-            rest_rate=0.05f; root_bias=0.30f; db_root=0.45f;
+            rest_rate=0.05f; root_bias=0.35f; db_root=0.55f;
             slide_rate=0.20f; accent_off=0.30f;
-            oct_up=0.20f; oct_dn=0.15f;
             prob_rate=0.15f; ratchet_r=0.12f; plock_r=0.15f;
             break;
         case PA_MELODIC:
-            rest_rate=0.15f; root_bias=0.20f; db_root=0.40f;
+            rest_rate=0.15f; root_bias=0.25f; db_root=0.45f;
             slide_rate=0.40f; accent_off=0.20f;
-            oct_up=0.25f; oct_dn=0.20f;
             prob_rate=0.20f; ratchet_r=0.06f; plock_r=0.20f;
             break;
         case PA_DUB:
-            rest_rate=0.50f; root_bias=0.35f; db_root=0.50f;
+            rest_rate=0.50f; root_bias=0.40f; db_root=0.60f;
             slide_rate=0.50f; accent_off=0.12f;
-            oct_up=0.10f; oct_dn=0.20f;
             prob_rate=0.25f; ratchet_r=0.04f; plock_r=0.12f;
             break;
         case PA_STUTTER:
-            rest_rate=0.10f; root_bias=0.25f; db_root=0.40f;
+            rest_rate=0.10f; root_bias=0.30f; db_root=0.50f;
             slide_rate=0.10f; accent_off=0.35f;
-            oct_up=0.20f; oct_dn=0.10f;
             prob_rate=0.20f; ratchet_r=0.30f; plock_r=0.15f;
             break;
         case PA_CHROM:
-            rest_rate=0.20f; root_bias=0.15f; db_root=0.35f;
+            rest_rate=0.20f; root_bias=0.20f; db_root=0.45f;
             slide_rate=0.45f; accent_off=0.18f;
-            oct_up=0.15f; oct_dn=0.15f;
             prob_rate=0.15f; ratchet_r=0.08f; plock_r=0.25f;
             break;
     }
 
-    // Pattern length — driving/stutter favour 16, dub/pedal sometimes use 8
     if (gr == PA_DUB || gr == PA_PEDAL) {
-        if (chance(0.35f)) g_pattern_length = 8;
-        else               g_pattern_length = 16;
+        g_pattern_length = chance(0.35f) ? 8 : 16;
+    } else {
+        g_pattern_length = 16;
     }
 
-    // ── Pass 1: notes + rests ───────────────────────────────────────────────
+    // ── Pass 1: notes + rests (contour-aware) ───────────────────────────────
     bool has_accent = false;
     for (int i = 0; i < g_pattern_length; ++i) {
         auto& s = g_steps[static_cast<size_t>(i)];
@@ -815,65 +820,121 @@ static void randomize_pattern(int arch_hint = -1, bool silent = false) {
 
         if (!downbeat && chance(rest_rate)) { s.rest = true; continue; }
 
-        int pitch;
-        if (downbeat && chance(db_root)) {
-            pitch = tonic;
+        int semi;
+        if (downbeat) {
+            semi = chance(db_root) ? 0 : pick_strong();
         } else if (chance(root_bias)) {
-            pitch = tonic;
+            semi = 0;
         } else {
-            pitch = tonic + pick_tone();
+            semi = pick_tone();
         }
-        pitch = displace(pitch, oct_up, oct_dn);
+
+        int oct = contour_oct(i);
+        // Small jitter so contour doesn't flatten every variation to the same step
+        if (!downbeat && chance(0.18f)) oct += chance(0.5f) ? 1 : -1;
+
+        int pitch = tonic + semi + 12 * oct;
+        // Clamp to a usable bass register: tonic-12..tonic+15.
+        pitch = std::clamp(pitch, tonic - 12, tonic + 15);
 
         s.note   = pitch;
+        s.rest   = false;
         s.accent = downbeat ? chance(0.65f) : chance(accent_off);
         if (s.accent) has_accent = true;
     }
 
-    // ── Pass 2: slides ──────────────────────────────────────────────────────
+    // ── Pass 2: rest-run limit — no more than 2 consecutive rests ───────────
+    // Long rest runs kill the groove; break them by placing a scale tone at
+    // the contour octave.
+    {
+        int run = 0;
+        for (int i = 0; i < g_pattern_length; ++i) {
+            auto& s = g_steps[static_cast<size_t>(i)];
+            if (s.rest) {
+                ++run;
+                if (run > 2) {
+                    s.rest = false;
+                    s.note = std::clamp(tonic + pick_tone() + 12 * contour_oct(i),
+                                        tonic - 12, tonic + 15);
+                    s.accent = chance(accent_off);
+                    run = 0;
+                }
+            } else {
+                run = 0;
+            }
+        }
+    }
+
+    // ── Pass 3: slides ──────────────────────────────────────────────────────
     for (int i = 1; i < g_pattern_length; ++i) {
         auto& s = g_steps[static_cast<size_t>(i)];
         if (s.rest) continue;
         const auto& prev = g_steps[static_cast<size_t>(i - 1)];
         if (prev.rest) continue;
         float p = slide_rate;
-        if (s.note > prev.note) p *= 1.6f;   // upward pull sounds more natural
+        if (s.note > prev.note)         p *= 1.6f;
+        if (std::abs(s.note - prev.note) > 7) p *= 0.4f;  // wide leaps don't glide well
         if (chance(std::min(p, 0.90f))) s.slide = true;
     }
 
-    // ── Pass 3: probability + ratchet + p-locks ─────────────────────────────
+    // ── Pass 4: probability + ratchet + p-locks ─────────────────────────────
     static constexpr int kProbChoices[] = {75, 50, 25};
     for (int i = 0; i < g_pattern_length; ++i) {
         auto& s = g_steps[static_cast<size_t>(i)];
         if (s.rest) continue;
 
-        // Probability — skip beat 1 so the pattern always anchors the loop.
-        if (i > 0 && chance(prob_rate))
+        if (i > 0 && (i % 4) != 0 && chance(prob_rate))
             s.prob = kProbChoices[Ui(0, 2)];
 
-        // Ratchet — favour steps with accents or off-beats for the burst feel.
         if (chance(ratchet_r)) {
             s.ratchet = chance(0.6f) ? 2 : (chance(0.5f) ? 3 : 4);
             s.ratchet = std::clamp(s.ratchet, 1, 4);
         }
 
-        // P-locks — cutoff snap or env-mod surge on interesting steps.
         if (chance(plock_r)) {
-            // cutoff p-lock: snap to a specific frequency for this step
             s.lock_mask   |= 0x1;
-            s.lock_cutoff  = 0.15f + U() * 0.65f;   // 0.15..0.80
+            s.lock_cutoff  = 0.15f + U() * 0.65f;
         }
         if (chance(plock_r * 0.6f)) {
-            // env-mod p-lock: spike or suppress the sweep on this step
             s.lock_mask |= 0x4;
-            s.lock_env   = chance(0.5f) ? (0.70f + U() * 0.30f)   // big sweep
-                                        : (U() * 0.25f);            // flat
+            s.lock_env   = chance(0.5f) ? (0.70f + U() * 0.30f)
+                                        : (U() * 0.25f);
         }
     }
 
-    // ── Pass 4: musical guarantees ──────────────────────────────────────────
-    if (!has_accent) { g_steps[0].accent = true; }
-    if (g_steps[0].rest) { g_steps[0].rest = false; g_steps[0].note = tonic; }
+    // ── Pass 5: anchor + motif diversity ────────────────────────────────────
+    if (!has_accent) g_steps[0].accent = true;
+    if (g_steps[0].rest) {
+        g_steps[0].rest = false;
+        g_steps[0].note = tonic;
+    }
+
+    // Ensure at least 3 unique pitches so the pattern isn't a stuck drone.
+    {
+        std::array<int, 16> seen{}; int nseen = 0;
+        for (int i = 0; i < g_pattern_length; ++i) {
+            const auto& s = g_steps[static_cast<size_t>(i)];
+            if (s.rest) continue;
+            bool found = false;
+            for (int k = 0; k < nseen; ++k) if (seen[k] == s.note) { found = true; break; }
+            if (!found && nseen < 16) seen[nseen++] = s.note;
+        }
+        if (nseen < 3) {
+            // Inject variation on a couple of non-downbeat steps.
+            int injections = 3 - nseen;
+            for (int i = 1; i < g_pattern_length && injections > 0; ++i) {
+                if ((i % 4) == 0) continue;
+                auto& s = g_steps[static_cast<size_t>(i)];
+                int oct = contour_oct(i);
+                int candidate = std::clamp(tonic + pick_tone() + 12 * oct,
+                                           tonic - 12, tonic + 15);
+                if (candidate == s.note) candidate = tonic + 7 + 12 * oct;
+                s.note = candidate;
+                s.rest = false;
+                --injections;
+            }
+        }
+    }
 
     for (int i = g_pattern_length; i < 16; ++i) {
         g_steps[static_cast<size_t>(i)] = StepData{};
