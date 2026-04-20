@@ -568,10 +568,18 @@ int acid_render_wav(const char* path,
     if (!f) return -1;
 
     const int   sr          = acid::sample_rate();
-    const float step_freq_mul = std::pow(2.0f, acid::g_params.tuning.load() / 12.0f);
     const int   total_steps = pattern_length * loops;
-    const int   total_frames = static_cast<int>(
-        static_cast<double>(total_steps) * step_sec * sr);
+    // 350 ms release tail at the end so the last note's VEG decays to silence
+    // instead of cutting off mid-note (which would click on playback).
+    const int   tail_frames = static_cast<int>(0.35 * sr);
+    // Cumulative frame budget — every step's start is computed from the exact
+    // double-precision boundary, so per-step int truncation never drifts more
+    // than one sample over the whole render.
+    auto step_start = [&](int si) {
+        return static_cast<int>(static_cast<double>(si) * step_sec * sr);
+    };
+    const int   pattern_frames = step_start(total_steps);
+    const int   total_frames   = pattern_frames + tail_frames;
 
     // ── WAV header (44-byte RIFF/PCM, 16-bit mono) ─────────────────────────
     auto write_u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
@@ -590,7 +598,10 @@ int acid_render_wav(const char* path,
     std::fwrite("data", 1, 4, f);
     write_u32(data_bytes);
 
-    // Reset engine state so every bounce starts from silence.
+    // Reset engine state so every bounce starts from silence. g_last_seq is
+    // module-static and may carry whatever value the live audio thread left
+    // it at — sync it to the current command seq so the very first render
+    // call doesn't accidentally re-commit a stale note from before the stop.
     acid::g_phase    = 0.0f;
     acid::g_osc_prev = 0.0f;
     acid::g_tpt_s[0] = acid::g_tpt_s[1] = acid::g_tpt_s[2] = acid::g_tpt_s[3] = 0.0f;
@@ -604,6 +615,7 @@ int acid_render_wav(const char* path,
     acid::g_gate = false; acid::g_note_accented = false;
     acid::g_hpf_xprev = acid::g_hpf_yprev = 0.0f;
     acid::g_current_freq = acid::g_target_freq = 100.0f;
+    acid::g_last_seq = acid::g_cmd_seq.load(std::memory_order_acquire);
 
     // Drive the sequencer step by step.
     constexpr int kBlock = 256;
@@ -614,7 +626,8 @@ int acid_render_wav(const char* path,
     };
 
     int written = 0;
-    for (int si = 0; si < total_steps && written < total_frames; ++si) {
+    bool prev_was_rest = true;        // before step 0, "previous" doesn't exist
+    for (int si = 0; si < total_steps; ++si) {
         int  idx   = si % pattern_length;
         int  enc   = notes[idx];
         int  midi  = enc & 0xFFFF;
@@ -624,13 +637,24 @@ int acid_render_wav(const char* path,
         bool sld   = (flags & 4);
 
         if (!rest) {
-            acid_note_on(midi_to_hz(midi) * step_freq_mul,
-                         acc ? 1 : 0, sld ? 1 : 0, step_sec);
+            // Mirror live tick(): a slide flag is only honoured when the
+            // previous step actually played — you can't glide into a note
+            // from a rest. Without this, patterns like Voodoo Ray (lots of
+            // rest→note transitions with the slide flag) sound noticeably
+            // different in the bounce than in live playback. Tuning is
+            // applied inside the engine's note-on commit, so we pass the
+            // raw frequency here — pre-multiplying would double-apply it.
+            bool do_slide = sld && !prev_was_rest;
+            acid_note_on(midi_to_hz(midi),
+                         acc ? 1 : 0, do_slide ? 1 : 0, step_sec);
         }
+        prev_was_rest = rest;
 
-        int step_frames = static_cast<int>(step_sec * sr);
-        while (step_frames > 0 && written < total_frames) {
-            int n = std::min({kBlock, step_frames, total_frames - written});
+        // Render exactly enough frames to land at the next step's boundary.
+        int next_boundary = (si + 1 < total_steps) ? step_start(si + 1)
+                                                   : pattern_frames;
+        while (written < next_boundary) {
+            int n = std::min(kBlock, next_boundary - written);
             acid::render(buf.data(), n);
             for (int i = 0; i < n; ++i) {
                 float s = std::clamp(buf[i], -1.0f, 1.0f);
@@ -638,9 +662,24 @@ int acid_render_wav(const char* path,
                     static_cast<int16_t>(s * 32767.0f);
             }
             std::fwrite(out16.data(), 2, static_cast<size_t>(n), f);
-            written     += n;
-            step_frames -= n;
+            written += n;
         }
+    }
+
+    // Release tail — note-off then keep rendering until we've filled the tail
+    // budget. Lets the VEG / accent envelope decay to silence so the WAV ends
+    // on near-zero samples instead of a sustained tone (which would click).
+    acid_note_off();
+    while (written < total_frames) {
+        int n = std::min(kBlock, total_frames - written);
+        acid::render(buf.data(), n);
+        for (int i = 0; i < n; ++i) {
+            float s = std::clamp(buf[i], -1.0f, 1.0f);
+            out16[static_cast<size_t>(i)] =
+                static_cast<int16_t>(s * 32767.0f);
+        }
+        std::fwrite(out16.data(), 2, static_cast<size_t>(n), f);
+        written += n;
     }
 
     std::fclose(f);
