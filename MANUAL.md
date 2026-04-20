@@ -11,21 +11,27 @@
 3. [The first ten minutes](#3-the-first-ten-minutes)
 4. [Anatomy of the screen](#4-anatomy-of-the-screen)
 5. [The synth voice — every knob explained](#5-the-synth-voice--every-knob-explained)
-6. [The sequencer](#6-the-sequencer)
-7. [Transport: BPM, swing, length, presets](#7-transport-bpm-swing-length-presets)
-8. [Randomization](#8-randomization)
-9. [Saving, loading, exporting](#9-saving-loading-exporting)
-10. [The 16 built-in presets](#10-the-16-built-in-presets)
-11. [Mouse reference](#11-mouse-reference)
-12. [Complete keyboard reference](#12-complete-keyboard-reference)
-13. [How acidflow makes sound (DSP internals)](#13-how-acidflow-makes-sound-dsp-internals)
-14. [Architecture & threading model](#14-architecture--threading-model)
-15. [Building from source](#15-building-from-source)
-16. [Files acidflow reads & writes](#16-files-acidflow-reads--writes)
-17. [Performance notes](#17-performance-notes)
-18. [Troubleshooting](#18-troubleshooting)
-19. [Recipes — patches & patterns to try](#19-recipes--patches--patterns-to-try)
-20. [Glossary](#20-glossary)
+6. [The FX rack](#6-the-fx-rack)
+7. [The sequencer](#7-the-sequencer)
+8. [The drum machine](#8-the-drum-machine)
+9. [Transport: BPM, swing, length, presets](#9-transport-bpm-swing-length-presets)
+10. [Song mode](#10-song-mode)
+11. [Jam mode](#11-jam-mode)
+12. [MIDI I/O](#12-midi-io)
+13. [Themes](#13-themes)
+14. [Randomization & evolving mutation](#14-randomization--evolving-mutation)
+15. [Saving, loading, exporting](#15-saving-loading-exporting)
+16. [The 16 built-in presets](#16-the-16-built-in-presets)
+17. [Mouse reference](#17-mouse-reference)
+18. [Complete keyboard reference](#18-complete-keyboard-reference)
+19. [How acidflow makes sound (DSP internals)](#19-how-acidflow-makes-sound-dsp-internals)
+20. [Architecture & threading model](#20-architecture--threading-model)
+21. [Building from source](#21-building-from-source)
+22. [Files acidflow reads & writes](#22-files-acidflow-reads--writes)
+23. [Performance notes](#23-performance-notes)
+24. [Troubleshooting](#24-troubleshooting)
+25. [Recipes — patches & patterns to try](#25-recipes--patches--patterns-to-try)
+26. [Glossary](#26-glossary)
 
 ---
 
@@ -33,13 +39,17 @@
 
 acidflow is a software recreation of the **Roland TB-303 Bass Line** (1981–1984), the synthesizer that — by accident — became the founding instrument of acid house, acid techno, and most electronic music styles whose names contain the word "acid". It runs entirely in your terminal, draws its own knobs, and writes audio directly to your sound card.
 
-It's three things glued together:
+It's a set of pieces that fit together:
 
 - A **DSP engine** that models the 303's signal chain from circuit analysis (oscillator → ZDF ladder filter → VCA → output saturation) — not from sample playback.
-- A **16-step sequencer** with the same per-step controls a real 303 has: pitch, accent, slide, rest.
-- A **TUI** built on the [`maya`](https://github.com/1ay1/maya) C++26 framework — keyboard-first, mouse-aware, full-screen.
+- A **16-step sequencer** with the real-303 per-step controls (pitch, accent, slide, rest) plus extras the original never had: **probability**, **ratchet**, and **per-step parameter locks** on cutoff / resonance / env-mod / accent.
+- A **5-voice synthesized drum machine** (BD / SD / CH / OH / CL) with its own 16-step grid and a master send that routes drums through the same FX as the bass.
+- An **FX rack** — pre-filter overdrive, tempo-synced delay, plate reverb — on the master bus.
+- **MIDI I/O** on Linux (ALSA sequencer): note and drum output on channel 10, clock out, external clock/start/stop sync, and note-in routing to the bass voice. Other platforms get the UI toggles but the backend is a stub.
+- **Song mode** (chain saved slots on pattern wrap) and **jam mode** (two-octave live keyboard into the 303 voice).
+- A **TUI** built on the [`maya`](https://github.com/1ay1/maya) C++26 framework — keyboard-first, mouse-aware, full-screen, five switchable colour themes.
 
-It does **not** do MIDI in or out, polyphony, multiple voices, multiple patterns chained together as a song, or any kind of effects beyond the output saturator. It is monophonic, sequencer-driven, and 16 steps long. So was the original.
+The 303 voice itself is still monophonic — the original was, too. Everything around it (drums, FX, MIDI, chaining) is additive: skip the keybinds and you have a faithful 303; use them and you have most of a sketchpad.
 
 ---
 
@@ -135,9 +145,9 @@ Everything else in this manual is detail.
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Every panel except the title bar gets an **orange border** when it's focused. The currently-active section is also implied by the help bar at the bottom — that line changes per-section so you don't need to remember out-of-context keys.
+Every panel except the title bar gets an **orange border** (or the theme's accent colour) when it's focused. The currently-active section is also implied by the help bar at the bottom — that line changes per-section so you don't need to remember out-of-context keys.
 
-There are **three focusable sections**: **Knobs**, **Sequencer**, **Transport**. Cycle them with `Tab` (forward) or `Shift+Tab` (backward).
+There are **five focusable sections**: **Knobs**, **FX**, **Sequencer**, **Drums**, **Transport**. Cycle them with `Tab` (forward) or `Shift+Tab` (backward), or **hover the mouse** into a panel to focus it directly. The ASCII above only sketches the core layout — the FX rack sits to the right of the Knobs strip and the Drums grid sits to the right of the Sequencer, so the final layout reads as two rows of two wide panels each, plus Transport on the right.
 
 ### Visual cues
 
@@ -166,7 +176,7 @@ When the **Knobs** section is focused (orange border):
 | `0` | Reset the focused knob to its **default** value |
 | `w` | Toggle the WAVE knob (saw ↔ square) regardless of which knob is focused |
 
-You can also drive any knob with the mouse — see [§11](#11-mouse-reference).
+You can also drive any knob with the mouse — see [§17](#17-mouse-reference).
 
 ### 5.1 TUNE — oscillator pitch offset
 
@@ -272,9 +282,48 @@ Linear gain on the final output, smoothed at 15 ms to avoid zipper noise on knob
 
 ---
 
-## 6. The sequencer
+## 6. The FX rack
 
-The sequencer lives in the bottom panel and has **4 rows × 16 columns**:
+A separate focusable panel, right of the Knobs strip. Seven controls, laid out left-to-right in **signal-flow order** so reading the panel is reading the signal chain:
+
+| Idx | Label | What it does |
+|---|---|---|
+| 1 | **O-DRIVE** | Pre-filter tanh overdrive. 0 = clean, 1 = "303 into a fuzz pedal". Sits **before** the ladder, so it hits the filter pre-compressed and makes the envelope sweep more aggressive. |
+| 2 | **DLY MIX** | Wet/dry send into the tape-style delay. 0 bypasses the wet path. |
+| 3 | **DLY FB** | Delay feedback. Clamped < 1 so it can't self-oscillate into a blow-up, but high values will self-sustain until you pull the mix down. |
+| 4 | **DLY TIME** | Tempo-synced division — cycles through `1/16` → `1/16d` → `1/8` → `1/8d`. Delay time is derived from the sequencer's BPM, so repeats stay locked to the beat. |
+| 5 | **REV MIX** | Plate-reverb wet/dry send. 0 bypasses. |
+| 6 | **REV SIZE** | Scales the plate's decay time (room → hall → cathedral). |
+| 7 | **REV DAMP** | Rolls off HF inside the feedback loop so long tails darken — bright plate ↔ dark dub chamber. |
+
+The whole rack sits on the **master bus**, after the VCA and drum sum. One signal chain:
+
+```
+303 voice + drum sum → [O-DRIVE is upstream, on the 303 voice only]
+                      → delay → reverb → out
+```
+
+So the delay and reverb are shared between bass and drums. O-Drive only colours the 303 voice (and it's *pre*-filter — the saturation hits the ladder, not the output).
+
+### Editing FX
+
+When the **FX** section is focused (orange border):
+
+| Key | What it does |
+|---|---|
+| `←` / `→` | Move selection between FX knobs |
+| `↑` / `↓` | Adjust by 5% (DLY TIME steps through the four divisions) |
+| `[` / `]` | Coarse adjust by 10% |
+| `0` | Reset to default |
+| `m` | Mute the FX bus (see [§9 transport](#9-transport-bpm-swing-length-presets) — the mute keys apply per-section) |
+
+Mouse behaviour matches the main Knobs strip — click, vertical drag, scroll, right-click to reset.
+
+---
+
+## 7. The sequencer
+
+The sequencer lives in the bottom-left panel and has **4 rows × 16 columns**:
 
 - **STEP** — the step number (1–16). Highlights orange for the selected step, red for the playing step.
 - **PITCH** — a sparkline-style block glyph whose height encodes pitch relative to the lowest note in the pattern. Quick visual read of the line's contour.
@@ -295,7 +344,14 @@ When the **Sequencer** section is focused:
 | `a` | Toggle **accent** on this step (also clears rest if set) |
 | `s` | Toggle **slide** into the next step (also clears rest if set) |
 | `m` | Toggle **mute** / rest on this step |
-| `x` | **Clear** this step entirely (rest, no flags) |
+| `x` | **Clear** this step entirely (rest, no flags, no locks) |
+| `v` | Cycle **probability** — `100 → 75 → 50 → 25 → 100` |
+| `j` | Cycle **ratchet** — `1 → 2 → 3 → 4 → 1` (sub-triggers per step) |
+| `F` (Shift+F) | Snapshot current CUTOFF knob as a **p-lock** for this step |
+| `G` (Shift+G) | Snapshot current RES knob as a p-lock |
+| `H` (Shift+H) | Snapshot current ENVMOD knob as a p-lock |
+| `J` (Shift+J) | Snapshot current ACCENT knob as a p-lock |
+| `L` (Shift+L) | Clear **all** p-locks on this step |
 
 ### Per-step flags explained
 
@@ -310,17 +366,62 @@ If the previous step is a rest, slide is suppressed for that note (you can't gli
 
 **Rest.** No note plays. The previous note's envelopes continue decaying naturally. A rest in the middle of a slide chain breaks the slide — the next non-rest note retriggers fresh.
 
+### Probability, ratchet, and p-locks
+
+Extensions that a real 303 doesn't have, but that modern groove-boxes do:
+
+**Probability (`v`).** Cycles `100 → 75 → 50 → 25`. Rolled once per step at trigger time — a 50% step plays half the time. Two practical rules: probability is ignored during **WAV / MIDI export** (the file would play differently every open, which is surprising), and probability can't save a rest step (rest wins).
+
+**Ratchet (`j`).** Cycles `1 → 2 → 3 → 4`. A ratchet of N divides the step duration into N equal sub-slices and retriggers the note on each. Ratchets preserve accent and slide (slide applies to the **last** sub-trigger only, so the chain still resolves into the next step). A ratchet of 1 is the default single hit.
+
+**Per-step parameter locks (p-locks).** Four of the knobs — CUTOFF, RES, ENVMOD, ACCENT — can be **snapshot per step** with `F / G / H / J` respectively. When a p-lock is set, that step uses the locked value instead of the live knob position, regardless of where you've since moved the knob. Multiple locks compose (set cutoff and res together) and `L` clears every lock on the current step. Locks survive save/load. They're the quickest path to classic 303 tricks like "one step really opens the filter" without having to automate anything.
+
 ### What's between two steps
 
-Each step is one **16th note** at the current BPM (so 4 steps = 1 beat, 16 steps = 1 bar). Step duration is `60 / BPM / 4` seconds — shuffled by SWING (see [§7](#7-transport-bpm-swing-length-presets)).
+Each step is one **16th note** at the current BPM (so 4 steps = 1 beat, 16 steps = 1 bar). Step duration is `60 / BPM / 4` seconds — shuffled by SWING (see [§9](#9-transport-bpm-swing-length-presets)).
 
-When the sequencer fires the next step, it reads that step's flags and calls into the audio engine: `note_on(freq, accent, slide, step_sec)`. Note-off is implicit at the end of the step (the engine treats note duration as the step duration that the UI passed in).
+Steps are scheduled **on the audio thread** — the sequencer's step boundaries are sample-accurate, and live playback matches the offline WAV bounce to the sample. The old UI-driven scheduler had ~33 ms of jitter; that's gone.
 
 Notes don't play when **playback is stopped** — editing is silent. To audition a change, hit `Space`.
 
 ---
 
-## 7. Transport: BPM, swing, length, presets
+## 8. The drum machine
+
+Five synthesized drum voices that run alongside the 303, each with its own 16-step lane. The voices are **generated**, not sampled — the engine cost per voice is a handful of envelopes plus a noise LFSR. No samples on disk.
+
+| Row | Voice | What it is |
+|---|---|---|
+| 1 | **BD** | Kick — sine with a fast pitch envelope (50 Hz base, ~35 ms sweep) and a ~120 ms amp decay. |
+| 2 | **SD** | Snare — short pitched "body" tone (triangle + fast pitch drop) summed with HP-filtered white noise. |
+| 3 | **CH** | Closed hat — dense HP-filtered noise with a tight envelope. |
+| 4 | **OH** | Open hat — same noise source as CH but with a long amp decay. |
+| 5 | **CL** | 808-style clap — 3 fast noise bursts spaced ~12 ms apart, plus a long dense-noise tail. |
+
+All five voices sum into a **master drum bus** that feeds the FX chain (delay + reverb) alongside the 303 voice. Per-voice gains are baked to sit right when the bass is at defaults; a global drum-bus knob `[ / ]` scales everything.
+
+### Editing the grid
+
+When the **Drums** section is focused:
+
+| Key | What it does |
+|---|---|
+| `←` / `→` | Move step selection left / right |
+| `↑` / `↓` | Move voice selection up / down (BD → SD → CH → OH → CL) |
+| `Space` / `x` | Toggle a hit at the selected cell |
+| `1` … `9`, `0` | Quick-toggle a hit on steps 1 … 10 of the **currently-selected voice row** (great for drawing a kick or hi-hat pattern without chasing the cursor) |
+| `[` / `]` | Drum-bus master gain −/+ (reads out at the bottom of the panel) |
+| `c` | Clear every hit on the **current voice** row |
+| `C` (Shift+C) | Clear the entire kit |
+| `m` | Mute the drum bus (independent of the 303 voice — `m` in the Knobs / FX section mutes the synth instead) |
+
+The grid shows every row at once. The currently-playing column pulses red; the selected cell gets an accent-coloured glyph. Voice rows are colour-coded (kick in hot red, snare in accent, hats in cyan, clap in red-dim) so the pattern reads by timbre at a glance.
+
+Drums are stored inside the pattern slot — save to slot 3 and you save the 303 pattern, the drum grid, and the master gain. Loading slot 3 restores all three.
+
+---
+
+## 9. Transport: BPM, swing, length, presets
 
 The **Transport** panel on the right of the middle row shows playback state and the preset browser. When focused:
 
@@ -332,6 +433,9 @@ The **Transport** panel on the right of the middle row shows playback state and 
 | `[` / `]` | BPM −2 / +2, clamped to 40–220 |
 | `{` / `}` | Pattern length −1 / +1, clamped to 4–16 steps |
 | `-` / `=` | Swing −2% / +2%, clamped to 50% (straight) – 75% (hard shuffle) |
+| `m` | Mute the entire playback bus (status line retains the transport state, just silent) |
+
+The status line also surfaces mode badges when active: **SONG N** when song mode is chaining slots, **JAM Oct3 ♩A C4** when jam mode is live, and **MIDI OUT / MIDI SYNC** when the MIDI bridge is enabled. They're drawn right of the BPM/swing display so the panel stays quiet in the default case.
 
 ### BPM
 
@@ -359,19 +463,104 @@ The sequencer always has **16 slots** internally. Setting pattern length to e.g.
 
 The preset list shows all 16 built-in presets with a 16-glyph **contour preview** alongside each name — a sparkline of that preset's pitches that updates as you edit. The currently-loaded preset is marked.
 
-Loading a preset overwrites the current pattern entirely. **Save first** if you've made edits worth keeping (see [§9](#9-saving-loading-exporting)).
+Loading a preset overwrites the current pattern entirely. **Save first** if you've made edits worth keeping (see [§15](#15-saving-loading-exporting)).
 
 If you've made edits to a preset's pattern, the preset index is marked as "custom" (`-1` internally) — the displayed name will still be the preset you started from, but acidflow knows it's been modified.
 
 ---
 
-## 8. Randomization
+## 10. Song mode
 
-Two keys, four behaviours.
+Press `n` anywhere to toggle song mode. When on, the sequencer **auto-advances through saved pattern slots** on every pattern wrap — the classic hardware "chain" mode. The transport's status line shows `♪ SONG N` where N is the currently-playing slot.
+
+How it picks the next slot:
+
+- Start at the currently-loaded slot (if you loaded from a slot before enabling song mode) or the lowest saved slot otherwise.
+- On each pattern wrap (step N loops back to step 1), jump to the next saved slot 1–9 (cyclically). If only one slot is saved, song mode just re-loads that slot on every wrap (harmless — no perceptible glitch because the loaded pattern is identical).
+- Empty slots are skipped: if slots 1, 3, and 5 are saved, the chain is 1 → 3 → 5 → 1 → …
+
+You don't pre-author a chain — the chain *is* the set of saved slots, in order. To change the chain, save / erase slots. It's fast and intentionally dumb.
+
+Save pattern versions to slots 1..9 (`Shift+1 … Shift+9`) before enabling song mode, otherwise there's nothing to chain through.
+
+---
+
+## 11. Jam mode
+
+Press `k` anywhere to toggle jam mode. When on:
+
+- The sequencer **stops producing** the bass line (drums still play if you're running a drum pattern).
+- The computer keyboard turns into a **two-octave tracker-layout piano**, each press retriggering the 303 voice at that pitch.
+
+Keys are the standard Renoise / Fasttracker layout:
+
+| Row | C | C♯ | D | D♯ | E | F | F♯ | G | G♯ | A | A♯ | B |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Lower (current octave) | `z` | `s` | `x` | `d` | `c` | `v` | `g` | `b` | `h` | `n` | `j` | `m` |
+| Upper (current octave + 1) | `q` | `2` | `w` | `3` | `e` | `r` | `5` | `t` | `6` | `y` | `7` | `u` |
+
+| Key | Action |
+|---|---|
+| `←` / `→` | Octave down / up (current octave shown in the status line as `Oct3`) |
+| `'` | Toggle **accent** for subsequent presses |
+| `;` | Toggle **slide** for subsequent presses |
+| `k` or `Esc` | Leave jam mode |
+
+Terminals don't reliably deliver key-*release* events, so each press arms a short note gate (~250 ms) that auto-releases unless you press another key. This works for legato-ish phrases but isn't going to feel like a real keyboard — jam mode is for sketching lines to paste into the sequencer, not for performance.
+
+---
+
+## 12. MIDI I/O
+
+MIDI is currently **Linux-only** (ALSA sequencer). On macOS and Windows the UI keys still work, but the backend is a stub and nothing gets forwarded. The ALSA backend creates one sequencer client with a single input and single output port — connect them with `aconnect` or your DAW.
+
+| Key | What it does |
+|---|---|
+| `O` (Shift+O) | Toggle **MIDI out** — forwards bass note-on/offs, drum hits on channel 10, and clock ticks when playing |
+| `I` (Shift+I) | Toggle **MIDI sync in** — slave our BPM and transport to external `MIDI Clock` + `Start` / `Stop` messages |
+
+Note-in (an external controller → the bass voice) is always on when the backend is up; you don't need to enable anything extra to play the 303 from an external keyboard.
+
+### What gets sent when MIDI out is on
+
+- **Bass voice** — note-on with velocity 112 (accent) or 80 (non-accent), note-off at step end. Slides are rendered as a small note overlap so DAWs interpret them as legato / portamento.
+- **Drum hits** — channel 10, one note-on per hit, General MIDI kit mapping (BD = 36, SD = 38, CH = 42, OH = 46, CL = 39).
+- **MIDI clock** — 24 PPQN clock ticks at the current BPM, plus `Start` when you hit `Space` and `Stop` when you pause.
+
+### What gets received when MIDI sync in is on
+
+- **Clock ticks** average into a smoothed tempo estimate. The transport BPM readout floats toward the external tempo rather than jumping to it — this keeps the display readable even when the incoming clock jitters.
+- **Start** / **Stop** drive the transport. You don't have to press `Space`.
+
+Enabling sync in does **not** force MIDI out on — you can slave to a clock without broadcasting anything. And you can have MIDI out on without sync in (internal tempo, exporting to other gear).
+
+The backend is a zero-overhead path when both toggles are off — no allocations, no thread activity.
+
+---
+
+## 13. Themes
+
+Five palettes. Press `T` (Shift+T) to cycle them — the change is immediate and applies to every panel, border, glyph, and status light.
+
+| Theme | Feel |
+|---|---|
+| **classic** | 303-silver + Roland orange on near-black (default) |
+| **cyber** | hot pink + mint cyan on deep ink |
+| **moss** | chartreuse + amber on forest green |
+| **ice** | ice-blue + coral on steel |
+| **mono** | pure greyscale — for screenshots or "I'm done looking at colours" |
+
+Theme choice is not persisted across runs — every launch starts on **classic**.
+
+---
+
+## 14. Randomization & evolving mutation
+
+Two keys for randomization (`r`, `R`), one for mutation (`M`).
 
 ### `r` — randomize the focused section
 
-If the **Knobs** section is focused, `r` rolls a new patch. If **Sequencer** or **Transport** is focused, `r` rolls a new pattern. The currently-focused area is what gets randomized.
+If the **Knobs** section is focused, `r` rolls a new patch. If **FX** is focused, `r` rolls a new FX preset. If **Sequencer** is focused, `r` rolls a new pattern. If **Drums** is focused, `r` rolls a new drum pattern. If **Transport** is focused, `r` rolls a new BPM / swing / length. The currently-focused area is what gets randomized.
 
 acidflow's randomizer is **biased**, not flat. Naive uniform randomization across all parameters produces muddy, inaudible, or flat-out boring patches ~80% of the time. So instead:
 
@@ -405,13 +594,28 @@ Pitches are drawn from a weighted **minor pentatonic + ♭7 + octave + octave-5*
 
 Capital R. Re-rolls knobs **and** pattern in a single shot. One combined toast (`↻ all randomized`). Good for "give me something new to react to" energy.
 
+### `M` — evolving mutation
+
+Unlike `r` / `R`, which replace what you have, `M` (Shift+M) performs a **single small change** and leaves the rest of the pattern alone. Press it N times and the pattern "walks" — recognisably descended from where it started, but different. A weighted pick from:
+
+| Mutation | Roughly |
+|---|---|
+| Toggle accent on a random non-rest step | 28% |
+| Toggle slide on a random non-rest step (where the next step plays) | 24% |
+| Nudge one step's pitch by ±1 or ±2 semitones | 20% |
+| Jump one step ±12 semitones (octave hop) | 12% |
+| Toggle rest on a random step (never step 1 — that's the anchor) | 10% |
+| Rotate the whole pattern left or right by one step | 6% |
+
+Because the menu is biased toward *vibe* changes (accents and slides) over pitch churn, repeated presses keep the melodic spine intact. Great for "I like this but I want one more variation".
+
 ### Why a randomizer at all?
 
 Two reasons. First, the 303 famously *can't* be played by humans the way other synths can — its UI is a 16-step pitch grid, not a keyboard. The whole tradition of "acid" is *finding* riffs by mucking with parameters until something good comes out. The randomizer is just a faster way to "muck with parameters". Second, every randomization is musical *enough* to be a starting point — you'll edit knobs and steps from there.
 
 ---
 
-## 9. Saving, loading, exporting
+## 15. Saving, loading, exporting
 
 acidflow stores user data under `~/.config/acidflow/` (or `$XDG_CONFIG_HOME/acidflow/`). The directory is created the first time anything is written.
 
@@ -434,15 +638,15 @@ A slot file looks like this (`~/.config/acidflow/pattern_3.txt`):
 …
 ```
 
-It's plain text: header, then `pattern_length` and `bpm`, then 16 lines of `note rest accent slide`. You can edit it by hand if you want to.
+The format versions up over time — current slots carry the 303 pattern, per-step probability / ratchet / p-locks, and the drum grid + master gain. Older-format files still load (missing fields default sensibly), and newer acidflows will rewrite the file in the current format on next save.
 
 The keybinds use the **shifted top-row digits** (`! @ # $ % ^ & * (` on a US keyboard) for save. acidflow accepts both forms — whatever your terminal sends as the shifted digit will save.
 
 **Slot 0** is reserved internally; users address slots 1–9.
 
-Slot operations only touch the **pattern** (sequencer steps + BPM + length). They don't save knob values. There's no "patch save" — knobs are part of your live state.
+Slot operations save **pattern + drums + BPM + length + swing + p-locks**. They don't save knob positions or FX — knobs are part of your live state, not the pattern.
 
-### WAV export
+### WAV export (`e`)
 
 Press `e` from anywhere. acidflow:
 
@@ -455,9 +659,28 @@ You'll see a `✓ wav → bounce.wav` toast on success or `✗ wav failed` on di
 
 The 4-loop count is fixed. If you need more, run the export multiple times into different files (rename between exports) or concatenate after the fact.
 
+### MIDI export (`E`)
+
+Press `E` (Shift+E) to write a **Standard MIDI File (type 0)** to `~/.config/acidflow/bounce.mid`. One loop of the pattern is exported — a MIDI file loops natively in any DAW, unlike a WAV.
+
+Translation rules:
+
+- **Accent** → velocity 112, non-accent → 80.
+- **Slide** → an 8-tick overlap with the next step's note-on (DAWs interpret this as legato / portamento).
+- **Ratchet** → distinct sub-notes inside the step so each hit is a separate note event (matching what the audio engine does).
+- **Probability** is **ignored** in export (flat 100%). Exporting a file that plays different notes every time you open it would be surprising.
+- **Swing** is preserved — 480 PPQN with each pair of 16ths split `(240·ratio, 240·(1−ratio))` to match the audio-thread math.
+- Drums are **not** exported yet — only the 303 voice.
+
+### Shareable text export / import (`p` / `P`)
+
+Press `p` to write the current pattern to `~/.config/acidflow/pattern.txt`. Press `P` (Shift+P) to read it back. Same format as slot files — human-readable, one line per step, trivial to paste into chat or diff between variations. A quick way to share a pattern: `cat pattern.txt`, copy-paste, the receiver puts it in `~/.config/acidflow/pattern.txt` and hits `P`.
+
+The text slot is a single file, so it's overwritten on every `p`. For persistent archival, use `Shift+N` save slots or copy `pattern.txt` out to another name.
+
 ---
 
-## 10. The 16 built-in presets
+## 16. The 16 built-in presets
 
 These are **plausible reconstructions** of canonical acid tracks — not lifted MIDI. The original sequencer data for most of these isn't publicly documented; the patterns here come from community consensus (Attack Magazine tutorials, KVR / Gearspace mega-threads, Robin Whittle's analysis at firstpr.com.au) and aim to evoke each track when paired with the right knob settings.
 
@@ -484,7 +707,7 @@ Loading a preset overwrites the current pattern. The preset name stays in the tr
 
 ---
 
-## 11. Mouse reference
+## 17. Mouse reference
 
 acidflow has full mouse support. SGR mouse mode is enabled at startup; everything in the workspace is hit-tested by row.
 
@@ -535,7 +758,7 @@ When the help overlay is open (`?`), mouse input is **ignored** — close it fir
 
 ---
 
-## 12. Complete keyboard reference
+## 18. Complete keyboard reference
 
 This is the full canonical list, also accessible inside the app via `?`.
 
@@ -543,14 +766,23 @@ This is the full canonical list, also accessible inside the app via `?`.
 
 | Key | Action |
 |---|---|
-| `Tab` | Cycle focus forward (Knobs → Sequencer → Transport → Knobs …) |
+| `Tab` | Cycle focus forward (Knobs → FX → Sequencer → Drums → Transport → Knobs …) |
 | `Shift+Tab` | Cycle focus backward |
 | `Space` | Play / pause |
-| `r` | Randomize current section (knobs OR pattern) |
-| `R` | Randomize everything (knobs AND pattern) |
+| `r` | Randomize current section |
+| `R` | Randomize everything (knobs + pattern) |
+| `M` (Shift+M) | Evolve pattern — one small mutation per press |
+| `T` (Shift+T) | Cycle colour theme (classic / cyber / moss / ice / mono) |
+| `n` | Toggle **song mode** (chain saved slots on pattern wrap) |
+| `k` | Toggle **jam mode** (two-octave live keyboard into the 303 voice) |
+| `O` (Shift+O) | Toggle **MIDI out** (notes + drums + clock) |
+| `I` (Shift+I) | Toggle **MIDI sync in** (slave to external clock) |
 | `e` | Export current pattern as WAV (4 loops) |
+| `E` (Shift+E) | Export current pattern as MIDI `.mid` (one loop) |
+| `p` | Export pattern as shareable text (`pattern.txt`) |
+| `P` (Shift+P) | Import pattern from `pattern.txt` |
 | `Shift+1` … `Shift+9` | Save pattern to slot 1–9 |
-| `1` … `9` | Load pattern from slot 1–9 (only when Sequencer is not focused — those keys mean nothing to step editing) |
+| `1` … `9` | Load pattern from slot 1–9 (Sequencer / Drums consume these for their own uses, so load from any other section) |
 | `?` | Toggle keyboard reference overlay |
 | `q` / `Q` / `Esc` | Quit (closes help overlay first if open) |
 
@@ -563,6 +795,17 @@ This is the full canonical list, also accessible inside the app via `?`.
 | `[` / `]` | Coarse adjust ±10% |
 | `0` | Reset selected knob to default |
 | `w` | Toggle WAVE (saw ↔ square) |
+| `m` | Mute the 303 voice (toggle) |
+
+### When **FX** is focused
+
+| Key | Action |
+|---|---|
+| `←` / `→` | Select previous / next FX knob |
+| `↑` / `↓` | Adjust (DLY TIME steps through the four divisions) |
+| `[` / `]` | Coarse adjust |
+| `0` | Reset FX knob |
+| `m` | Mute the FX bus |
 
 ### When **Sequencer** is focused
 
@@ -576,7 +819,27 @@ This is the full canonical list, also accessible inside the app via `?`.
 | `a` | Toggle accent (clears rest if set) |
 | `s` | Toggle slide (clears rest if set) |
 | `m` | Toggle mute / rest |
-| `x` | Clear step (rest, no flags) |
+| `v` | Cycle probability (100/75/50/25) |
+| `j` | Cycle ratchet (1/2/3/4) |
+| `F` (Shift+F) | P-lock cutoff (snapshot current knob) |
+| `G` (Shift+G) | P-lock resonance |
+| `H` (Shift+H) | P-lock env-mod |
+| `J` (Shift+J) | P-lock accent amount |
+| `L` (Shift+L) | Clear all p-locks on step |
+| `x` | Clear step (rest, no flags, no locks) |
+
+### When **Drums** is focused
+
+| Key | Action |
+|---|---|
+| `←` / `→` | Select step |
+| `↑` / `↓` | Select voice (BD / SD / CH / OH / CL) |
+| `Space` / `x` | Toggle hit on selected cell |
+| `1` … `9`, `0` | Quick-toggle step 1..10 on current voice |
+| `[` / `]` | Drum-bus master gain −/+ |
+| `c` | Clear current voice row |
+| `C` (Shift+C) | Clear entire kit |
+| `m` | Mute drum bus |
 
 ### When **Transport** is focused
 
@@ -587,14 +850,19 @@ This is the full canonical list, also accessible inside the app via `?`.
 | `[` / `]` | BPM ±2 (clamped 40–220) |
 | `{` / `}` | Pattern length ±1 (clamped 4–16) |
 | `-` / `=` | Swing ±2% (clamped 50–75) |
+| `m` | Mute playback bus |
+
+### Jam mode keys
+
+See [§11](#11-jam-mode) for the full layout. While jam mode is on, the tracker piano claims most letter keys — leave jam mode (`k` or `Esc`) to go back to the regular section keybinds.
 
 ### Help overlay
 
-When open, **only** `?` and `Esc` close it. Everything else is a no-op until you close it.
+When open, **only** `?` and `Esc` close it. Everything else is a no-op until you close it. The overlay **scrolls** — use the mouse wheel over the modal to read entries that fall off the bottom on short terminals.
 
 ---
 
-## 13. How acidflow makes sound (DSP internals)
+## 19. How acidflow makes sound (DSP internals)
 
 This section describes what's actually happening inside `src/engine.cpp` when you press play. Skip it if you only care about using the instrument.
 
@@ -681,7 +949,7 @@ The audio thread renders in 256-frame blocks (~5–6 ms at 44.1 kHz). This is th
 
 ---
 
-## 14. Architecture & threading model
+## 20. Architecture & threading model
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -760,7 +1028,7 @@ Every widget is a function returning a `maya::Element`. Per-frame, `render_frame
 
 ---
 
-## 15. Building from source
+## 21. Building from source
 
 ### Standard build (Linux / macOS)
 
@@ -820,7 +1088,7 @@ acidflow expects a sibling `../maya` checkout and pulls it in via `add_subdirect
 
 ---
 
-## 16. Files acidflow reads & writes
+## 22. Files acidflow reads & writes
 
 acidflow stores everything under `~/.config/acidflow/` (or `$XDG_CONFIG_HOME/acidflow/` if set). Nothing else on your filesystem is touched. No logs, no caches, no telemetry, no network.
 
@@ -833,7 +1101,7 @@ To wipe all saved data: `rm -rf ~/.config/acidflow/`.
 
 ---
 
-## 17. Performance notes
+## 23. Performance notes
 
 - **CPU** at 44.1 kHz, 256-sample blocks: well under 5% of one core on any laptop made in the last decade. The hot loop is fully scalar; SIMD is left on the table because there's only one voice.
 - **Memory:** ~2 MB resident (dominated by the maya rendering buffer).
@@ -843,7 +1111,7 @@ To wipe all saved data: `rm -rf ~/.config/acidflow/`.
 
 ---
 
-## 18. Troubleshooting
+## 24. Troubleshooting
 
 ### "no sound"
 
@@ -890,7 +1158,7 @@ Make sure the pattern actually has notes (not all rests). The export pauses live
 
 ---
 
-## 19. Recipes — patches & patterns to try
+## 25. Recipes — patches & patterns to try
 
 A non-exhaustive starting set.
 
@@ -937,7 +1205,7 @@ A non-exhaustive starting set.
 
 ---
 
-## 20. Glossary
+## 26. Glossary
 
 | Term | Meaning |
 |---|---|

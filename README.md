@@ -6,7 +6,7 @@
 
 <p align="center">
   A <b>Roland TB-303</b> acid bass simulator that lives in your terminal.<br>
-  ZDF ladder filter. 16-step sequencer. Live scope. Mouse support. No GUI toolkit.
+  ZDF ladder. 16-step sequencer with p-locks. 5-voice drum machine. FX rack. MIDI I/O. Live scope. No GUI toolkit.
 </p>
 
 <p align="center">
@@ -31,12 +31,16 @@ Type `space` to play. Press `r` to randomize. Drag a knob. Export a WAV. Quit be
 
 - **Authentic 303 DSP.** ZDF/TPT 4-pole ladder with per-stage tanh and global feedback tanh — the diode-junction non-linearity that makes a 303 *squelch* instead of *whine*. 2× oversampling kills high-Q aliasing. Exponential V/oct envelope modulation, persistent accent capacitor that stacks across notes, exponential slide RC with τ ≈ 88 ms, ±3 cent VCO drift.
 - **9 knobs that mean what their pots mean.** TUNE · WAVE · CUTOFF · RES · ENVMOD · DECAY · ACCENT · DRIVE · VOL. Cutoff: 13 Hz – 5 kHz log. Decay: 0.2–2 s. Envmod: 0–4 octaves. Tuning: ±12 st. Resonance self-oscillates around 90% — same as the real circuit.
-- **16-step sequencer** with per-step accent / slide / rest, swing (50% straight → 75% hard shuffle), variable pattern length (4–16), and **16 hardcoded presets** inspired by *Acid Tracks*, *Higher State*, *Energy Flash*, *Voodoo Ray*, *Acperience*, Hardfloor, Plastikman, and friends.
+- **Sample-accurate 16-step sequencer** (runs on the audio thread) with per-step accent / slide / rest, **probability** (100/75/50/25), **ratchet** (1–4 hits per step), and **per-step parameter locks** on cutoff / resonance / env-mod / accent. Swing 50% straight → 75% hard shuffle. Variable pattern length 4–16. **16 hardcoded presets** inspired by *Acid Tracks*, *Higher State*, *Energy Flash*, *Voodoo Ray*, *Acperience*, Hardfloor, Plastikman, and friends.
+- **5-voice drum machine.** Synthesized (not sampled) BD / SD / CH / OH / CL with their own 16-step grid, per-voice gain, and a master drum-bus send that feeds the same FX chain as the 303 voice.
+- **FX rack.** Pre-filter overdrive, tempo-synced delay (1/16, 1/16d, 1/8, 1/8d), and plate reverb (size + HF damping). One focusable panel, live — the whole rack sits on the master bus after the VCA.
+- **MIDI I/O** (Linux/ALSA — stubbed on other platforms). Forward notes + drum hits (ch 10) + clock, or slave transport / BPM to external clock. Keyboard input drives the bass voice too.
 - **Live oscilloscope** (Braille-cell, zero-crossing triggered) and **filter response heatmap** that *moves with the envelope* so you can see the squelch.
-- **Full mouse support.** Click + drag knobs vertically. Scroll to fine-tune. Right-click to reset. Click a step to edit it. Scroll on the title to nudge BPM.
-- **Smart randomizer.** Four character archetypes (classic / squelchy / driving / dubby) for knobs; four groove archetypes (pedal / driving / melodic / dub) for patterns. No flat dice rolls — every randomization is musical.
-- **9 user save slots** (`Shift-1`…`Shift-9` to save, `1`…`9` to load).
-- **WAV export** — bounce 4 loops to `~/.config/acidflow/bounce.wav` at 44.1 kHz / 16-bit PCM.
+- **Song mode** — chain saved pattern slots on every wrap — and **jam mode** — turn the computer keyboard into a two-octave tracker piano.
+- **Full mouse support.** Click + drag knobs vertically. Scroll to fine-tune. Right-click to reset. Click a step to edit it. Hover onto a panel to focus it. Scroll on the title to nudge BPM.
+- **Smart randomizer.** Four character archetypes for knobs, four groove archetypes for patterns, plus `M` for one-at-a-time evolving mutations that "walk" a pattern without obliterating it.
+- **9 user save slots** (`Shift-1`…`Shift-9` to save, `1`…`9` to load). Export to **WAV** (4 loops), **MIDI** (.mid, one loop), or **shareable text** (`pattern.txt`).
+- **5 UI themes** — classic / cyber / moss / ice / mono — cycled with `T`.
 - **Cross-platform.** Linux (ALSA), macOS (CoreAudio), Windows (WASAPI). One DSP engine, three backends.
 - **Lock-free audio.** UI ↔ audio thread communication is atomic-only. Per-sample 15 ms parameter smoothing kills knob zipper. ~5–6 ms output latency.
 
@@ -78,16 +82,23 @@ The CMake script falls back to C++23 under MSVC (current MSVC doesn't advertise 
 ## Quickstart
 
 ```
-Tab      cycle focus (Knobs → Sequencer → Transport)
+Tab      cycle focus (Knobs → FX → Sequencer → Drums → Transport)
 Space    play / pause
 ? / Esc  open / close the keyboard reference
 r / R    randomize current section / everything
-e        export current pattern as WAV (4 loops)
+M        evolve pattern — one small mutation per press
+T        cycle colour theme
+n / k    song mode / jam mode
+O / I    toggle MIDI out / MIDI sync
+e / E    export pattern as WAV / MIDI (.mid)
+p / P    export / import shareable pattern.txt
 q        quit
 ```
 
-In the **Knobs** section: `← →` selects, `↑ ↓` adjusts by 5%, `[ ]` by 10%, `0` resets, `w` toggles waveform.
-In the **Sequencer**: `← →` selects step, `↑ ↓` semitone, `< >` octave, `a` accent, `s` slide, `m` mute, `x` clear, `c d e f g a b` set root pitch.
+In the **Knobs** section: `← →` selects, `↑ ↓` adjusts by 5%, `[ ]` by 10%, `0` resets, `w` toggles waveform, `m` mutes the synth voice.
+In the **FX** section: `← →` selects, `↑ ↓` adjusts (DLY TIME steps through the divisions), `0` resets, `m` mutes the bus.
+In the **Sequencer**: `← →` selects step, `↑ ↓` semitone, `< >` octave, `a` accent, `s` slide, `m` rest, `v` cycle probability, `j` cycle ratchet, `F/G/H/J` p-lock cutoff/res/env/accent, `L` clear locks, `x` clear step, `c d e f g a b` set root pitch.
+In the **Drums**: `← →` step, `↑ ↓` voice (BD/SD/CH/OH/CL), `Space`/`x` toggle hit, `1..9 0` quick-toggle step 1..10 on the selected voice, `[ ]` drum-bus master, `c` clear row, `C` clear kit.
 In **Transport**: `↑ ↓` browse presets, `[ ]` BPM ±2, `{ }` pattern length, `- =` swing.
 
 The full keyboard map (and every mouse interaction) is one `?` away inside the app, and lives in the **[Manual](MANUAL.md)**.
