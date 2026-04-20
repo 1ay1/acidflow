@@ -126,6 +126,19 @@ int acid_render_wav(const char* path,
                     float       swing,       // 0.50..0.75
                     int         loops);
 
+// Live recording: capture the running audio-thread output (post-FX, the same
+// samples the device hears) into a WAV file. `begin` allocates a capture
+// buffer sized for `max_seconds` and arms the audio-thread tap; `end` stops
+// the tap, writes a 16-bit PCM mono WAV to `path`, and frees the buffer.
+// Safe to call while `acid_start()` is running — no streams are torn down.
+// Returns 0 on success, -1 on allocation or file failure. Calling `begin`
+// while already recording is a no-op (-1). Calling `end` without a prior
+// `begin` is -1.
+int   acid_record_begin(int max_seconds);
+int   acid_record_end(const char* path);
+int   acid_is_recording(void);
+float acid_record_seconds(void);   // elapsed seconds since begin (0 if idle)
+
 // ── MIDI bridge (Phase 5) ───────────────────────────────────────────────────
 // Start/stop the platform's MIDI backend. On Linux this creates an ALSA
 // sequencer client with one input + one output port (connect with aconnect or

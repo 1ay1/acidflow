@@ -92,6 +92,7 @@ inline int u8cols(const char* s) {
     items.push_back({"M",     "mutate"});
     items.push_back({"T",     "theme"});
     items.push_back({"e/E",   "wav/mid"});
+    items.push_back({"W",     "rec live"});
     items.push_back({"p/P",   "text"});
     items.push_back({"n",     "song"});
     items.push_back({"k",     "jam"});

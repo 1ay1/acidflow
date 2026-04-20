@@ -119,12 +119,15 @@ static float g_rev_damp   = 0.35f;
 static bool g_midi_out  = false;
 static bool g_midi_sync = false;
 
-// Drum machine (Phase 4.3). Flat bool grid — five voices (rows) × 16 steps
+// Drum machine (Phase 4.3). Flat bool grid — nine voices (rows) × 16 steps
 // (cols). Pushed into the engine each tick via acid_seq_set_drum_lane; the
 // bool representation is kept here because it's easier to toggle than a
 // packed mask, and the pack-to-uint16 happens right before each audio push.
-static constexpr int kDrumVoices = 5;
-static constexpr const char* kDrumLabels[kDrumVoices] = {"BD","SD","CH","OH","CL"};
+static constexpr int kDrumVoices = 16;
+static constexpr const char* kDrumLabels[kDrumVoices] = {
+    "BD","SD","CH","OH","CL","LT","HT","RS","CB","SH","TB","CG",
+    "MT","CY","RD","BG"
+};
 static std::array<std::array<bool, 16>, kDrumVoices> g_drums{};
 static int   g_drum_voice_sel = 0;     // which row (voice) is being edited
 static int   g_drum_step_sel  = 0;     // which step in that row
@@ -514,6 +517,70 @@ static void start_playback();
 static void stop_playback();
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Vibe coordination — the top-level "roll everything" button picks one
+// overarching vibe and routes all five subsystems (knobs, FX, pattern, drums,
+// transport) to archetypes that go together. A random acid-house vibe should
+// land on 128 BPM with four-on-the-floor drums, a classic-squelch patch, and
+// slapback delay — not a 90 BPM dub patch with a techno drum pattern.
+//
+// Each randomize_X below accepts an optional archetype hint; individual
+// per-section dice rolls pass no hint (pure random), randomize_everything()
+// picks a Vibe from kVibes and forwards the matching hint to each helper so
+// the whole kit stays internally coherent.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// File-scope archetype enums so the Vibe table can index them by int. Each
+// matches the same ordering used inside the individual randomize_X helpers.
+enum KnobsArch  { KA_CLASSIC, KA_SQUELCH, KA_DRIVING, KA_DUBBY, KA_COUNT };
+enum PatArch    { PA_PEDAL,   PA_DRIVING, PA_MELODIC, PA_DUB,   PA_COUNT };
+enum FxArch     { FA_DRY,     FA_SLAP,    FA_DUB,     FA_CAVERN, FA_DIRTY, FA_COUNT };
+// Drum genres — must mirror the `Groove` enum inside randomize_drums().
+enum DrumArch   {
+    DA_ACID, DA_CHICAGO, DA_TECHNO, DA_MINIMAL, DA_ELECTRO,
+    DA_BREAKS, DA_DUB, DA_LATIN, DA_JAM, DA_COUNT
+};
+
+enum class Vibe {
+    ACID_HOUSE,      // Chicago '87 — classic squelch over a 4/4 kick at 128 BPM
+    DEEP_HOUSE,      // warmer, lazier — 122 BPM, dub-heavy delay, clap on 2+4
+    TECHNO,          // Detroit driving — 132 BPM, 16th hats, open filter
+    HARDFLOOR,       // acid trance — 138 BPM, self-osc, layered melodic patterns
+    ELECTRO,         // 808 electro — 125 BPM, syncopated kick + snare on 2/4
+    MINIMAL,         // sparse — 128 BPM, dry FX, minimal drums
+    DUB_TECHNO,      // 118 BPM, long reverb, half-time feel
+    BREAKS,          // breakbeat — 135 BPM, syncopated, tom + rim fills
+    LATIN_HOUSE,     // 124 BPM, conga/bongo led, classic knobs
+    AMBIENT_ACID,    // 100 BPM, long decay, pedal notes, cavernous FX
+    V_COUNT
+};
+
+struct VibeSpec {
+    const char* name;
+    int         knobs_arch;     // KA_*
+    int         pattern_arch;   // PA_*
+    int         fx_arch;        // FA_*
+    int         drums_arch;     // DA_*
+    float       bpm_center;     // target BPM (jitter ± bpm_spread)
+    float       bpm_spread;
+    float       swing_prob;     // chance of picking a shuffled swing
+    bool        square_bias;    // true = favour square wave for this vibe
+};
+
+// One row per Vibe. Order matches the Vibe enum 1:1 so we can index by int.
+static const VibeSpec kVibes[static_cast<int>(Vibe::V_COUNT)] = {
+    {"acid house",    KA_CLASSIC, PA_PEDAL,   FA_SLAP,    DA_ACID,    128.0f, 2.0f, 0.30f, false},
+    {"deep house",    KA_CLASSIC, PA_MELODIC, FA_DUB,     DA_CHICAGO, 122.0f, 2.5f, 0.55f, false},
+    {"techno",        KA_DRIVING, PA_DRIVING, FA_SLAP,    DA_TECHNO,  132.0f, 2.5f, 0.15f, false},
+    {"hardfloor",     KA_SQUELCH, PA_MELODIC, FA_DIRTY,   DA_TECHNO,  138.0f, 2.0f, 0.10f, false},
+    {"electro",       KA_CLASSIC, PA_DRIVING, FA_SLAP,    DA_ELECTRO, 125.0f, 2.0f, 0.20f, true },
+    {"minimal",       KA_DUBBY,   PA_PEDAL,   FA_DRY,     DA_MINIMAL, 128.0f, 1.5f, 0.25f, false},
+    {"dub techno",    KA_DUBBY,   PA_DUB,     FA_CAVERN,  DA_DUB,     118.0f, 2.5f, 0.50f, false},
+    {"breakbeat",     KA_DRIVING, PA_MELODIC, FA_DIRTY,   DA_BREAKS,  135.0f, 3.0f, 0.20f, false},
+    {"latin house",   KA_CLASSIC, PA_PEDAL,   FA_SLAP,    DA_LATIN,   124.0f, 2.0f, 0.55f, false},
+    {"ambient acid",  KA_DUBBY,   PA_DUB,     FA_CAVERN,  DA_MINIMAL, 100.0f, 4.0f, 0.20f, false},
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Knob randomizer — a dice roll over the *correlated* acid parameter space.
 // We pick one of four character archetypes (classic / squelchy / driving /
 // dubby), each pre-baked with sensible inter-knob relationships, then jitter
@@ -523,8 +590,12 @@ static void stop_playback();
 //   * short decay pairs with heavy env mod + high accent (snappy squelch)
 // A naive rand(0..1) across every knob usually lands on muddy / inaudible
 // patches — the archetype pass keeps each roll musical.
+//
+// `arch_hint` forces a specific archetype (used by randomize_everything to
+// match the picked Vibe); default -1 leaves the helper to roll its own dice.
 // ─────────────────────────────────────────────────────────────────────────────
-static void randomize_knobs() {
+static void randomize_knobs(int arch_hint = -1, bool square_bias = false,
+                            bool silent = false) {
     static std::mt19937 rng{std::random_device{}()};
     auto u = [&](float lo, float hi) {
         return lo + (hi - lo) * std::uniform_real_distribution<float>(0.0f, 1.0f)(rng);
@@ -533,14 +604,15 @@ static void randomize_knobs() {
         return std::uniform_real_distribution<float>(0.0f, 1.0f)(rng) < p;
     };
 
-    enum Arch { CLASSIC, SQUELCH, DRIVING, DUBBY };
-    Arch a = static_cast<Arch>(std::uniform_int_distribution<int>(0, 3)(rng));
+    int a = (arch_hint >= 0)
+        ? std::clamp(arch_hint, 0, KA_COUNT - 1)
+        : std::uniform_int_distribution<int>(0, KA_COUNT - 1)(rng);
 
     // Tuning: always near centre — detuning kills "in-key" playback. ±1 st.
     g_tune = u(0.48f, 0.52f);
 
     switch (a) {
-        case CLASSIC:
+        case KA_CLASSIC:
             // Mid cutoff, strong Q, moderate sweep, medium decay — the
             // universal acid starting point.
             g_cutoff    = u(0.30f, 0.50f);
@@ -549,7 +621,7 @@ static void randomize_knobs() {
             g_decay     = u(0.25f, 0.50f);
             g_accent    = u(0.50f, 0.75f);
             break;
-        case SQUELCH:
+        case KA_SQUELCH:
             // Self-osc territory: very high Q, low cutoff (max headroom for
             // the MEG to sweep), tight decay and heavy accent.
             g_cutoff    = u(0.15f, 0.35f);
@@ -558,7 +630,7 @@ static void randomize_knobs() {
             g_decay     = u(0.10f, 0.30f);
             g_accent    = u(0.70f, 0.90f);
             break;
-        case DRIVING:
+        case KA_DRIVING:
             // Open filter, less envelope motion, medium resonance — the
             // Beltram "Energy Flash" engine sound.
             g_cutoff    = u(0.50f, 0.75f);
@@ -567,7 +639,7 @@ static void randomize_knobs() {
             g_decay     = u(0.20f, 0.45f);
             g_accent    = u(0.55f, 0.80f);
             break;
-        case DUBBY:
+        case KA_DUBBY:
             // Low cutoff, long decay, moderate Q — Plastikman / dub techno
             // territory. Sustained filter motion over bars.
             g_cutoff    = u(0.10f, 0.30f);
@@ -579,13 +651,16 @@ static void randomize_knobs() {
     }
 
     g_volume = u(0.55f, 0.70f);           // keep output in a safe range
-    // Square is classic but ~30% of rolls — saw is canonical 303.
-    g_wave   = chance(0.30f) ? 1 : 0;
+    // Square is classic but ~30% of rolls — saw is canonical 303. A vibe hint
+    // can flip the bias (electro prefers square).
+    g_wave   = chance(square_bias ? 0.70f : 0.30f) ? 1 : 0;
 
-    static const char* kNames[] = {"classic", "squelch", "driving", "dubby"};
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "\xe2\x86\xbb knobs: %s", kNames[a]);
-    set_toast(buf);
+    if (!silent) {
+        static const char* kNames[KA_COUNT] = {"classic", "squelch", "driving", "dubby"};
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "\xe2\x86\xbb knobs: %s", kNames[a]);
+        set_toast(buf);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -607,7 +682,7 @@ static void randomize_knobs() {
 //
 // This is strictly better than a flat per-step dice roll, which produces
 // listless noise roughly 80% of the time.
-static void randomize_pattern() {
+static void randomize_pattern(int arch_hint = -1, bool silent = false) {
     static std::mt19937 rng{std::random_device{}()};
     auto U = [&]() {
         return std::uniform_real_distribution<float>(0.0f, 1.0f)(rng);
@@ -633,8 +708,9 @@ static void randomize_pattern() {
         return kScale[0];
     };
 
-    enum Groove { PEDAL, DRIVING, MELODIC, DUB };
-    Groove gr = static_cast<Groove>(std::uniform_int_distribution<int>(0, 3)(rng));
+    int gr = (arch_hint >= 0)
+        ? std::clamp(arch_hint, 0, PA_COUNT - 1)
+        : std::uniform_int_distribution<int>(0, PA_COUNT - 1)(rng);
 
     // Per-groove shape parameters.
     //   rest_rate  : probability an off-beat becomes a rest (sparseness)
@@ -643,10 +719,10 @@ static void randomize_pattern() {
     //   accent_off : off-beat accent probability
     float rest_rate = 0.25f, jump_rate = 0.35f, slide_rate = 0.25f, accent_off = 0.15f;
     switch (gr) {
-        case PEDAL:   rest_rate = 0.20f; jump_rate = 0.20f; slide_rate = 0.25f; accent_off = 0.10f; break;
-        case DRIVING: rest_rate = 0.05f; jump_rate = 0.30f; slide_rate = 0.20f; accent_off = 0.25f; break;
-        case MELODIC: rest_rate = 0.15f; jump_rate = 0.60f; slide_rate = 0.35f; accent_off = 0.20f; break;
-        case DUB:     rest_rate = 0.55f; jump_rate = 0.30f; slide_rate = 0.40f; accent_off = 0.15f; break;
+        case PA_PEDAL:   rest_rate = 0.20f; jump_rate = 0.20f; slide_rate = 0.25f; accent_off = 0.10f; break;
+        case PA_DRIVING: rest_rate = 0.05f; jump_rate = 0.30f; slide_rate = 0.20f; accent_off = 0.25f; break;
+        case PA_MELODIC: rest_rate = 0.15f; jump_rate = 0.60f; slide_rate = 0.35f; accent_off = 0.20f; break;
+        case PA_DUB:     rest_rate = 0.55f; jump_rate = 0.30f; slide_rate = 0.40f; accent_off = 0.15f; break;
     }
 
     // ── Pass 1: lay down notes + rests ──────────────────────────────────────
@@ -711,10 +787,12 @@ static void randomize_pattern() {
     g_preset_index = -1;                   // mark as "custom, not a preset"
     g_step_sel     = 0;
 
-    static const char* kNames[] = {"pedal", "driving", "melodic", "dub"};
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "\xe2\x86\xbb pattern: %s", kNames[gr]);
-    set_toast(buf);
+    if (!silent) {
+        static const char* kNames[PA_COUNT] = {"pedal", "driving", "melodic", "dub"};
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "\xe2\x86\xbb pattern: %s", kNames[gr]);
+        set_toast(buf);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -723,17 +801,18 @@ static void randomize_pattern() {
 // soaked delay), CAVERN (plate-reverb wash), DIRTY (overdrive-forward). We
 // pick archetype-friendly ranges so each roll is usable instead of mud.
 // ─────────────────────────────────────────────────────────────────────────────
-static void randomize_fx() {
+static void randomize_fx(int arch_hint = -1, bool silent = false) {
     static std::mt19937 rng{std::random_device{}()};
     auto u = [&](float lo, float hi) {
         return lo + (hi - lo) * std::uniform_real_distribution<float>(0.0f, 1.0f)(rng);
     };
 
-    enum Arch { DRY, SLAP, DUB, CAVERN, DIRTY };
-    Arch a = static_cast<Arch>(std::uniform_int_distribution<int>(0, 4)(rng));
+    int a = (arch_hint >= 0)
+        ? std::clamp(arch_hint, 0, FA_COUNT - 1)
+        : std::uniform_int_distribution<int>(0, FA_COUNT - 1)(rng);
 
     switch (a) {
-        case DRY:
+        case FA_DRY:
             g_od_amt    = u(0.00f, 0.10f);
             g_delay_mix = u(0.00f, 0.10f);
             g_delay_fb  = u(0.20f, 0.35f);
@@ -742,7 +821,7 @@ static void randomize_fx() {
             g_rev_size  = u(0.40f, 0.55f);
             g_rev_damp  = u(0.35f, 0.55f);
             break;
-        case SLAP:
+        case FA_SLAP:
             g_od_amt    = u(0.05f, 0.25f);
             g_delay_mix = u(0.20f, 0.40f);  // audible but never drowning
             g_delay_fb  = u(0.15f, 0.30f);  // short tail, not regenerative
@@ -751,7 +830,7 @@ static void randomize_fx() {
             g_rev_size  = u(0.35f, 0.55f);
             g_rev_damp  = u(0.30f, 0.50f);
             break;
-        case DUB:
+        case FA_DUB:
             g_od_amt    = u(0.10f, 0.30f);
             g_delay_mix = u(0.35f, 0.55f);  // hefty wet
             g_delay_fb  = u(0.55f, 0.78f);  // regenerative but not self-osc
@@ -760,7 +839,7 @@ static void randomize_fx() {
             g_rev_size  = u(0.55f, 0.75f);
             g_rev_damp  = u(0.40f, 0.65f);
             break;
-        case CAVERN:
+        case FA_CAVERN:
             g_od_amt    = u(0.00f, 0.15f);
             g_delay_mix = u(0.00f, 0.20f);
             g_delay_fb  = u(0.20f, 0.40f);
@@ -769,7 +848,7 @@ static void randomize_fx() {
             g_rev_size  = u(0.70f, 0.95f);  // big room
             g_rev_damp  = u(0.20f, 0.45f);  // bright, not muffled
             break;
-        case DIRTY:
+        case FA_DIRTY:
             g_od_amt    = u(0.55f, 0.85f);  // the "pedal grit" setting
             g_delay_mix = u(0.10f, 0.30f);
             g_delay_fb  = u(0.25f, 0.50f);
@@ -780,76 +859,294 @@ static void randomize_fx() {
             break;
     }
 
-    static const char* kNames[] = {"dry", "slap", "dub", "cavern", "dirty"};
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "\xe2\x86\xbb fx: %s", kNames[a]);
-    set_toast(buf);
+    if (!silent) {
+        static const char* kNames[FA_COUNT] = {"dry", "slap", "dub", "cavern", "dirty"};
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "\xe2\x86\xbb fx: %s", kNames[a]);
+        set_toast(buf);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Drum randomizer — stylistic groove templates over the 5-voice kit
-// (BD/SD/CH/OH/CL × 16). Rather than scatter bits we lay down a template hit-
-// map per groove and jitter edge steps lightly, so every roll sounds like a
-// real groove and not noise. Voice indices: 0=BD, 1=SD, 2=CH, 3=OH, 4=CL.
+// Drum randomizer — genre-grammar engine over the 16-voice kit. Instead of
+// dropping a fixed bitmap per genre, each genre declares:
+//   - a kick "backbone" (deterministic kick pattern, the genre's fingerprint)
+//   - a backbeat rule (snare / clap / rim placement)
+//   - a hat/cymbal driver (CH, OH, RD, or sparse)
+//   - a perc palette (shaker / tambourine / cowbell / conga / bongo weights)
+//   - a crash accent flag (bar-top CY on step 0 or 12)
+//   - a tom-fill chance + tom-walk preference (LT→MT→HT ladder on last beat)
+//   - a density multiplier so "more" = busier, "less" = sparser
+//
+// Then a few universal polish passes run on top (ghost notes, accent-layer
+// crash, weighted hat variation, slight 1/32 ratchet via retrigger) so every
+// roll reads like a composed groove rather than random noise.
+//
+// Voice indices: 0=BD 1=SD 2=CH 3=OH 4=CL 5=LT 6=HT 7=RS 8=CB 9=SH 10=TB
+// 11=CG 12=MT 13=CY 14=RD 15=BG.
 // ─────────────────────────────────────────────────────────────────────────────
-static void randomize_drums() {
+static void randomize_drums(int arch_hint = -1, bool silent = false) {
     static std::mt19937 rng{std::random_device{}()};
-    auto chance = [&](float p) {
-        return std::uniform_real_distribution<float>(0.0f, 1.0f)(rng) < p;
+    auto u01 = [&] {
+        return std::uniform_real_distribution<float>(0.0f, 1.0f)(rng);
+    };
+    auto chance = [&](float p) { return u01() < std::clamp(p, 0.0f, 1.0f); };
+    auto pick   = [&](int lo, int hi) {
+        return std::uniform_int_distribution<int>(lo, hi)(rng);
     };
 
-    // Clear first — callers may have a dense pattern we don't want to OR with.
+    // Clear the kit — callers may already have a dense pattern they expect to
+    // be replaced, not OR'd into. A `hit()` helper hides the clumsy array
+    // indexing everywhere downstream.
     for (auto& row : g_drums) for (auto& c : row) c = false;
-
-    enum Groove { FOURFLOOR, HOUSE, TECHNO, BREAKS, MINIMAL };
-    Groove g = static_cast<Groove>(std::uniform_int_distribution<int>(0, 4)(rng));
-
-    auto set = [&](int voice, std::initializer_list<int> steps) {
-        for (int s : steps) g_drums[static_cast<size_t>(voice)][static_cast<size_t>(s)] = true;
+    auto hit = [&](int voice, int step) {
+        if (voice < 0 || voice >= kDrumVoices) return;
+        if (step  < 0 || step  >= 16)          return;
+        g_drums[static_cast<size_t>(voice)][static_cast<size_t>(step)] = true;
+    };
+    auto unhit = [&](int voice, int step) {
+        if (voice < 0 || voice >= kDrumVoices) return;
+        if (step  < 0 || step  >= 16)          return;
+        g_drums[static_cast<size_t>(voice)][static_cast<size_t>(step)] = false;
+    };
+    auto has = [&](int voice, int step) {
+        if (voice < 0 || voice >= kDrumVoices) return false;
+        if (step  < 0 || step  >= 16)          return false;
+        return g_drums[static_cast<size_t>(voice)][static_cast<size_t>(step)];
     };
 
-    switch (g) {
-        case FOURFLOOR:
-            // Kick on every quarter, clap on 2/4, closed hat offbeats.
-            set(0, {0, 4, 8, 12});
-            set(1, {4, 12});
-            for (int i = 2; i < 16; i += 4) if (chance(0.8f)) set(2, {i});
-            if (chance(0.4f)) set(3, {6, 14});
+    // Must match the order of DA_* (file-scope) so the Vibe table's
+    // drums_arch int indexes into this switch correctly.
+    enum Groove {
+        ACID, CHICAGO, TECHNO, MINIMAL, ELECTRO,
+        BREAKS, DUB, LATIN, JAM, G_COUNT
+    };
+    static_assert(G_COUNT == DA_COUNT, "drum genre count mismatch");
+    Groove gen = (arch_hint >= 0)
+        ? static_cast<Groove>(std::clamp(arch_hint, 0, G_COUNT - 1))
+        : static_cast<Groove>(pick(0, G_COUNT - 1));
+
+    // Density roll — a per-call "how busy should this be" factor. Clusters
+    // around 0.75 (musical default) with a tail toward either side so the same
+    // genre can produce sparse OR dense grooves from successive rolls.
+    float density = std::clamp(0.75f + (u01() - 0.5f) * 0.55f, 0.45f, 1.05f);
+
+    // Hat driver — one of the three cymbal voices leads the top end:
+    //   CH = closed hat on offbeats (house / techno default)
+    //   OH = open hat offbeats (lazier, dub / deep house)
+    //   RD = ride cymbal on 8ths (driving, jazz-leaning, ambient techno)
+    // Skipping entirely ("none") is also a valid option for ultra-sparse.
+    enum Hat { HAT_CH, HAT_OH, HAT_RD, HAT_NONE };
+    auto chance_hat = [&](float ch, float oh, float rd) -> Hat {
+        float r = u01();
+        if (r < ch) return HAT_CH;
+        if (r < ch + oh) return HAT_OH;
+        if (r < ch + oh + rd) return HAT_RD;
+        return HAT_NONE;
+    };
+
+    // Universal helper: lay down a 16th-note run on a given voice with a
+    // base hit probability. Odd-step bias lets callers ask for offbeats only
+    // ("odd_only") or full 16ths ("step=1").
+    auto sprinkle = [&](int voice, float p, int step_mod, int offset) {
+        for (int i = offset; i < 16; i += step_mod) if (chance(p)) hit(voice, i);
+    };
+
+    // Tom walk — three-tom ladder LT→MT→HT, landing across the last N steps.
+    // Used as a fill at the end of bar 2 (steps 13/14/15) when the genre's
+    // fill-chance rolls through.
+    auto tom_walk = [&](int start_step) {
+        static const int voices[3] = { 5 /*LT*/, 12 /*MT*/, 6 /*HT*/ };
+        int s = std::clamp(start_step, 0, 13);
+        for (int i = 0; i < 3; ++i) hit(voices[i], s + i);
+    };
+
+    // ── Genre dispatch ──────────────────────────────────────────────────────
+    switch (gen) {
+        case ACID: {
+            // Chicago-acid skeleton: kick 4-on-the-floor, clap on 2/4, no
+            // snare. The 303 should carry the groove — drums stay sparse.
+            hit(0, 0); hit(0, 4); hit(0, 8); hit(0, 12);
+            hit(4, 4); hit(4, 12);
+            Hat h = chance_hat(0.60f, 0.10f, 0.15f);
+            if (h == HAT_CH)
+                for (int i = 2; i < 16; i += 4) if (chance(0.85f * density)) hit(2, i);
+            else if (h == HAT_OH)
+                for (int i = 2; i < 16; i += 4) if (chance(0.70f * density)) hit(3, i);
+            else if (h == HAT_RD)
+                for (int i = 0; i < 16; i += 2) if (chance(0.65f * density)) hit(14, i);
+            if (chance(0.35f * density)) hit(8, 10);                   // lonely cowbell
+            if (chance(0.35f * density))                               // rim ghosts
+                for (int i : { 3, 11 }) if (chance(0.6f)) hit(7, i);
+            if (chance(0.25f * density)) hit(13, 0);                   // crash on 1
             break;
-        case HOUSE:
-            set(0, {0, 4, 8, 12});
-            set(1, {4, 12});
-            set(2, {2, 6, 10, 14});          // offbeat chh
-            if (chance(0.5f)) set(3, {10});
-            if (chance(0.3f)) set(4, {7, 15});
+        }
+        case CHICAGO: {
+            // Deep Chicago / early UK house: kick 4-on-floor, clap on 2+4,
+            // an open hat on the 'and' of 4, soft shaker underneath.
+            for (int i = 0; i < 16; i += 4) hit(0, i);
+            hit(4, 4); hit(4, 12);
+            sprinkle(2, 0.95f * density, 4, 2);                         // CH offbeats
+            if (chance(0.55f)) hit(3, 14);                              // OH on the "and of 4"
+            if (chance(0.60f * density))
+                sprinkle(9, 0.75f, 2, 1);                               // shaker
+            if (chance(0.35f * density)) sprinkle(11, 0.4f, 4, 3);      // conga on "and"
+            if (chance(0.25f)) hit(10, 12);                             // tambourine on 4
             break;
-        case TECHNO:
-            set(0, {0, 4, 8, 12});
-            for (int i = 0; i < 16; ++i)
-                if (i % 2 == 1 && chance(0.6f)) set(2, {i});   // 16ths on odd steps
-            if (chance(0.55f)) set(3, {2, 10});
-            if (chance(0.35f)) set(4, {13});
+        }
+        case TECHNO: {
+            // Driving 4/4 techno: kick on every quarter, snappy 16ths on
+            // hats, synced cowbell syncopation, optional ride under the hat.
+            for (int i = 0; i < 16; i += 4) hit(0, i);
+            if (chance(0.45f)) hit(1, 4);                               // snare on 2
+            if (chance(0.75f)) hit(4, 12);                              // clap on 4
+            sprinkle(2, 0.55f * density, 2, 1);                         // 16th CH
+            if (chance(0.55f * density))
+                sprinkle(14, 0.55f, 2, 0);                              // ride on 8ths
+            if (chance(0.45f * density)) {                              // cb on "and"
+                hit(8, 6); hit(8, 14);
+            }
+            if (chance(0.70f * density)) sprinkle(9, 0.95f, 1, 0);      // 16th shaker drive
+            if (chance(0.35f)) hit(13, 12);                             // crash on bar-top
+            if (chance(0.20f)) tom_walk(13);                            // tom fill on last beat
             break;
-        case BREAKS:
-            // Syncopated kick + backbeat snare — breakbeat-style, not 4/4.
-            set(0, {0, 6, 10});
-            if (chance(0.5f)) set(0, {14});
-            set(1, {4, 12});
-            for (int i = 0; i < 16; ++i) if (chance(0.55f)) set(2, {i});
-            if (chance(0.4f)) set(3, {7, 15});
+        }
+        case MINIMAL: {
+            // Sparse. One kick per bar-half, one clap, maybe a rim tick.
+            hit(0, 0); hit(0, 8);
+            if (chance(0.55f)) hit(4, 12); else hit(1, 12);
+            if (chance(0.50f * density))
+                for (int i : { 2, 10 }) if (chance(0.55f)) hit(2, i);
+            if (chance(0.35f * density)) hit(3, 14);                    // "and of 4" OH
+            if (chance(0.30f * density))
+                sprinkle(9, 0.35f, 4, 2);                               // whisper shaker
+            if (chance(0.18f)) hit(8, 7);                               // single cowbell
             break;
-        case MINIMAL:
-            // Sparse. One kick per bar, single clap, a few hats.
-            set(0, {0, 8});
-            set(1, {12});
-            for (int i = 0; i < 16; i += 4) if (chance(0.4f)) set(2, {i + 2});
+        }
+        case ELECTRO: {
+            // Electro / 808: syncopated kick 1+11, snare on 4+12, no 4/4
+            // kick. Heavy on the CB and CH. 808 clap layered with snare.
+            hit(0, 0); hit(0, 11);
+            if (chance(0.50f)) hit(0, 7);                               // syncopated extra
+            hit(1, 4); hit(1, 12);
+            if (chance(0.65f)) { hit(4, 4); hit(4, 12); }               // clap layer
+            sprinkle(2, 0.65f * density, 2, 1);                         // CH offbeats
+            if (chance(0.40f)) { hit(3, 6); hit(3, 14); }
+            if (chance(0.75f))                                          // cb on 2 and 4 "ands"
+                for (int i : { 2, 6, 10, 14 }) if (chance(0.55f)) hit(8, i);
+            if (chance(0.45f * density)) sprinkle(9, 0.7f, 2, 1);       // shaker
+            if (chance(0.25f)) hit(13, 0);                              // crash on 1
             break;
+        }
+        case BREAKS: {
+            // Breakbeat: broken kick, snare on 5+13, busy hats, tom+rim fills.
+            hit(0, 0); hit(0, 10);
+            if (chance(0.55f)) hit(0, 6);
+            if (chance(0.40f)) hit(0, 14);
+            hit(1, 4); hit(1, 12);
+            if (chance(0.55f)) hit(7, 3);                               // rim ghost
+            if (chance(0.55f)) hit(7, 11);
+            sprinkle(2, 0.60f * density, 1, 0);
+            if (chance(0.45f)) hit(3, 7);
+            if (chance(0.55f)) hit(3, 15);
+            if (chance(0.60f)) tom_walk(13);
+            if (chance(0.35f)) { hit(5, 2); hit(12, 9); }               // sprinkle toms
+            if (chance(0.35f)) sprinkle(11, 0.45f, 2, 1);               // conga ghost
+            if (chance(0.20f)) hit(13, 12);                             // crash on last
+            break;
+        }
+        case DUB: {
+            // Half-time feel: single kick + long OH, claps echoed, delay-heavy
+            // arrangement friendly. Leave lots of empty space.
+            hit(0, 0);
+            if (chance(0.60f)) hit(0, 8);                               // optional 2nd kick
+            hit(4, 8);                                                  // clap on "3"
+            if (chance(0.50f)) hit(3, 4);                               // OH on 2
+            if (chance(0.50f)) hit(3, 12);                              // OH on 4
+            if (chance(0.40f * density)) sprinkle(2, 0.45f, 4, 2);      // sparse CH
+            if (chance(0.40f * density)) sprinkle(11, 0.40f, 4, 3);     // ghost conga
+            if (chance(0.55f * density))
+                for (int i = 2; i < 16; i += 4) if (chance(0.5f)) hit(9, i);
+            if (chance(0.30f)) hit(13, 0);                              // crash on 1
+            break;
+        }
+        case LATIN: {
+            // Latin-house / afro-house: kick 4/4, heavy conga+bongo grooves,
+            // cowbell clave, shaker 16ths, light clap. The perc carries more
+            // weight than the backbeat.
+            for (int i = 0; i < 16; i += 4) hit(0, i);
+            if (chance(0.70f)) hit(4, 12);                              // clap on 4
+            if (chance(0.60f)) hit(8, 6);                               // clave-ish CB
+            if (chance(0.60f)) hit(8, 10);
+            // Rumba-ish conga pattern: 0,3,6,10,13 is a common 3-2 clave cell
+            static const int conga_a[] = { 3, 6, 10, 13 };
+            for (int s : conga_a) if (chance(0.75f * density)) hit(11, s);
+            // Bongo on the "ands" — higher-pitched, so it rides on top.
+            static const int bongo_a[] = { 2, 5, 9, 14 };
+            for (int s : bongo_a) if (chance(0.65f * density)) hit(15, s);
+            if (chance(0.80f)) sprinkle(9, 0.90f, 1, 0);                // driving shaker
+            if (chance(0.35f)) sprinkle(10, 0.55f, 4, 2);               // tambourine
+            if (chance(0.20f)) hit(13, 0);
+            break;
+        }
+        case JAM: {
+            // Open jam — everyone gets a shot. Kicks half 4/4, half syncopated.
+            // Clap + snare both make appearances. Used for practice loops.
+            bool four_on_floor = chance(0.55f);
+            if (four_on_floor) for (int i = 0; i < 16; i += 4) hit(0, i);
+            else { hit(0, 0); hit(0, 7); hit(0, 10); if (chance(0.5f)) hit(0, 14); }
+            if (chance(0.70f)) { hit(1, 4); hit(1, 12); }
+            if (chance(0.55f)) { hit(4, 4); hit(4, 12); }
+            Hat h = chance_hat(0.35f, 0.20f, 0.30f);
+            if (h == HAT_CH) sprinkle(2, 0.65f * density, 2, 1);
+            if (h == HAT_OH) { hit(3, 6); hit(3, 14); if (chance(0.5f)) hit(3, 2); }
+            if (h == HAT_RD) sprinkle(14, 0.60f * density, 2, 0);
+            if (chance(0.45f)) sprinkle(11, 0.50f * density, 2, 1);     // conga
+            if (chance(0.45f)) sprinkle(15, 0.45f * density, 4, 2);     // bongo
+            if (chance(0.40f)) sprinkle(9, 0.60f * density, 2, 1);      // shaker
+            if (chance(0.35f)) sprinkle(10, 0.40f * density, 4, 0);     // tambourine
+            if (chance(0.30f)) hit(8, 6);                               // cowbell
+            if (chance(0.40f)) tom_walk(13);
+            if (chance(0.30f)) hit(13, 0);
+            break;
+        }
+        default: break;
     }
 
-    static const char* kNames[] = {"four-floor", "house", "techno", "breaks", "minimal"};
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "\xe2\x86\xbb drums: %s", kNames[g]);
-    set_toast(buf);
+    // ── Universal polish ───────────────────────────────────────────────────
+    // These passes add life on top of any genre-specific backbone without
+    // overriding it — so an ACID roll still feels like acid, just nudged.
+    //
+    // Ghost-rim: quiet rim clicks scattered on empty 16ths add micro-timing.
+    if (chance(0.55f * density)) {
+        for (int i = 1; i < 16; i += 2) {
+            if (!has(7, i) && !has(1, i) && chance(0.08f * density)) hit(7, i);
+        }
+    }
+    // Shimmer pass: a subtle tambourine doubles the clap/snare on 4 if empty.
+    if (chance(0.30f * density) && !has(10, 12) && (has(4, 12) || has(1, 12))) {
+        hit(10, 12);
+    }
+    // Final-beat accent: cymbals often hit on step 12 with the snare/clap for
+    // a musical lift into the next bar. Only fires if nothing already there.
+    if (chance(0.20f * density) && !has(13, 12) && !has(14, 12)) {
+        if (chance(0.5f)) hit(13, 12); else hit(14, 12);
+    }
+    // Constraint: if CH and RD both land on the same step, kill the CH hit
+    // there — they compete in the top-end and muddy each other.
+    for (int i = 0; i < 16; ++i) {
+        if (has(2, i) && has(14, i)) unhit(2, i);
+    }
+
+    if (!silent) {
+        static const char* kNames[G_COUNT] = {
+            "acid", "chicago", "techno", "minimal", "electro",
+            "breaks", "dub", "latin", "jam"
+        };
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), "\xe2\x86\xbb drums: %s", kNames[gen]);
+        set_toast(buf);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -858,45 +1155,70 @@ static void randomize_drums() {
 // 12/16-step patterns) rather than the full knob ranges, so a roll here
 // doesn't send the groove to 60 BPM or 7-step weirdness.
 // ─────────────────────────────────────────────────────────────────────────────
-static void randomize_transport() {
+static void randomize_transport(float bpm_center = 0.0f,
+                                float bpm_spread = 0.0f,
+                                float swing_prob = -1.0f,
+                                bool  silent     = false) {
     static std::mt19937 rng{std::random_device{}()};
     auto u = [&](float lo, float hi) {
         return lo + (hi - lo) * std::uniform_real_distribution<float>(0.0f, 1.0f)(rng);
     };
 
-    // BPM archetypes clustered around classic scene tempos: house/techno ~125,
-    // acid house ~130, techno ~135, a lazy 118 for downtempo.
-    static constexpr float kBpms[] = {118.0f, 122.0f, 125.0f, 128.0f, 132.0f, 138.0f};
-    g_bpm = kBpms[std::uniform_int_distribution<int>(0, 5)(rng)] + u(-1.5f, 1.5f);
+    if (bpm_center > 0.0f) {
+        // Vibe-coordinated tempo — jitter around the vibe's center BPM.
+        float spread = (bpm_spread > 0.0f) ? bpm_spread : 2.0f;
+        g_bpm = bpm_center + u(-spread, spread);
+    } else {
+        // Stand-alone: cluster around classic scene tempos.
+        static constexpr float kBpms[] = {118.0f, 122.0f, 125.0f, 128.0f, 132.0f, 138.0f};
+        g_bpm = kBpms[std::uniform_int_distribution<int>(0, 5)(rng)] + u(-1.5f, 1.5f);
+    }
     g_bpm = std::clamp(g_bpm, 40.0f, 220.0f);
 
-    // Swing: 60% chance straight, 40% gentle shuffle. Never hard swing here —
-    // the `-/=` keys can push it further if the user wants.
-    g_swing = (std::uniform_real_distribution<float>(0.0f, 1.0f)(rng) < 0.6f)
-                ? 0.50f
-                : u(0.54f, 0.62f);
+    // Swing: unless the vibe asks otherwise, 40% chance of a gentle shuffle.
+    // Never hard swing here — the `-/=` keys can push it further if the user
+    // wants. swing_prob >= 0 overrides the default coin-flip.
+    float p_swing = (swing_prob >= 0.0f) ? swing_prob : 0.40f;
+    g_swing = (u(0.0f, 1.0f) >= p_swing) ? 0.50f : u(0.54f, 0.62f);
 
     // Length: bias toward 16 (bar), sometimes 12 (odd meter feel) or 8 (short
     // loop). 4 and 6 are too short to sound like a finished groove.
     int r = std::uniform_int_distribution<int>(0, 9)(rng);
     g_pattern_length = (r < 6) ? 16 : (r < 9) ? 12 : 8;
 
-    char buf[40];
-    std::snprintf(buf, sizeof(buf), "\xe2\x86\xbb transport: %.0f bpm",
-                  static_cast<double>(g_bpm));
-    set_toast(buf);
+    if (!silent) {
+        char buf[40];
+        std::snprintf(buf, sizeof(buf), "\xe2\x86\xbb transport: %.0f bpm",
+                      static_cast<double>(g_bpm));
+        set_toast(buf);
+    }
 }
 
-// Randomize everything — fresh knobs, FX, pattern, drums, and transport. The
-// individual toasts from each helper would stomp each other, so we suppress
-// them and emit a single combined toast. Used by capital-R.
+// Randomize everything — pick one Vibe from kVibes and route every subsystem
+// (knobs, FX, pattern, drums, transport) to archetypes that belong together.
+// Each helper is called in silent mode so their individual toasts don't stomp
+// each other, then one combined toast names the vibe.
+//
+// This is what makes capital-R musical: an acid-house roll produces 128 BPM
+// with four-on-the-floor drums, classic-squelch knobs, and slapback delay,
+// rather than the mismatched tempo/knobs/drums you'd get from five
+// independent dice rolls.
 static void randomize_everything() {
-    randomize_knobs();
-    randomize_fx();
-    randomize_pattern();
-    randomize_drums();
-    randomize_transport();
-    set_toast("\xe2\x86\xbb all randomized");
+    static std::mt19937 rng{std::random_device{}()};
+    int vi = std::uniform_int_distribution<int>(
+        0, static_cast<int>(Vibe::V_COUNT) - 1)(rng);
+    const VibeSpec& v = kVibes[vi];
+
+    randomize_knobs    (v.knobs_arch,   v.square_bias, /*silent=*/true);
+    randomize_fx       (v.fx_arch,      /*silent=*/true);
+    randomize_pattern  (v.pattern_arch, /*silent=*/true);
+    randomize_drums    (v.drums_arch,   /*silent=*/true);
+    randomize_transport(v.bpm_center, v.bpm_spread, v.swing_prob,
+                        /*silent=*/true);
+
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "\xe2\x86\xbb %s", v.name);
+    set_toast(buf);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1035,7 +1357,11 @@ static bool save_pattern_slot(int slot) {
     std::ofstream f(pattern_path(slot));
     if (!f) return false;
 
-    f << "# acidflow pattern v4\n";
+    // v7: same header and step lines as prior versions, but the trailing
+    // drum block has kDrumVoices (16) rows. Older readers just bail at EOF
+    // — v4 consumes 5, v5 consumes 9, v6 consumes 12; trailing rows are
+    // additive and leave unknown voices silent.
+    f << "# acidflow pattern v7\n";
     f << g_pattern_length << " " << g_bpm << "\n";
     // Per-step line (v3+):
     //   note rest accent slide prob ratchet lockmask lockC lockR lockE lockA
@@ -1076,11 +1402,17 @@ static bool load_pattern_slot(int slot, bool quiet = false) {
     std::string header;
     std::getline(f, header);
     // v2 adds trailing prob+ratchet; v3 adds p-lock fields; v4 adds a drum
-    // block after the steps. Detect via the header string so we don't
-    // accidentally consume the next line.
-    bool v4 = header.find("v4") != std::string::npos;
+    // block (5 voices); v5 extends drums to 9; v6 extends to 12 (SH/TB/CG);
+    // v7 extends to 16 (MT/CY/RD/BG). The reader below always consumes up
+    // to kDrumVoices rows and bails at EOF, so older files just leave the
+    // newer voices empty.
+    bool v7 = header.find("v7") != std::string::npos;
+    bool v6 = v7 || header.find("v6") != std::string::npos;
+    bool v5 = v6 || header.find("v5") != std::string::npos;
+    bool v4 = v5 || header.find("v4") != std::string::npos;
     bool v3 = v4 || header.find("v3") != std::string::npos;
     bool v2 = v3 || header.find("v2") != std::string::npos;
+    (void)v7; (void)v6; (void)v5;
 
     int plen; float bpm;
     if (!(f >> plen >> bpm)) return false;
@@ -1120,20 +1452,25 @@ static bool load_pattern_slot(int slot, bool quiet = false) {
             }
         }
     }
-    // v4: drum block — "drums <master>\n" header, then 5 rows of 16 ints.
-    // Always reset the kit first so older-format loads wipe any drums from a
-    // prior session rather than leaking them into a drum-less pattern.
+    // v4+: drum block — "drums <master>\n" header, then N rows of 16 ints
+    // (v4 = 5 rows, v5 = 9 rows). We always read up to kDrumVoices rows and
+    // stop early if the stream dries up, so v4 files still load cleanly with
+    // the 4 extra voices empty. Always reset the kit first so older-format
+    // loads wipe any drums from a prior session rather than leaking them
+    // into a drum-less pattern.
     for (auto& row : g_drums) for (auto& c : row) c = false;
     if (v4) {
         std::string tag; float dm = 1.0f;
         if (f >> tag >> dm && tag == "drums") {
             g_drum_master = std::clamp(dm, 0.0f, 1.5f);
             for (int v = 0; v < kDrumVoices; ++v) {
+                bool row_ok = true;
                 for (int i = 0; i < 16; ++i) {
                     int x = 0;
-                    if (!(f >> x)) break;
+                    if (!(f >> x)) { row_ok = false; break; }
                     g_drums[static_cast<size_t>(v)][static_cast<size_t>(i)] = x != 0;
                 }
+                if (!row_ok) break;      // short file → leave remaining voices empty
             }
         }
     }
@@ -1199,6 +1536,33 @@ static bool export_wav() {
     set_toast(rc == 0 ? "\xe2\x9c\x93 wav \xe2\x86\x92 bounce.wav"
                       : "\xe2\x9c\x97 wav failed");
     return rc == 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Live recording — tap the running audio thread's output into
+// ~/.config/acidflow/live.wav. Unlike the offline bounce (export_wav) this
+// captures knob tweaks, jammed notes, MIDI-in hits, and pattern edits as
+// they happen. Toggle with capital `W`; max 10 minutes per take.
+// ─────────────────────────────────────────────────────────────────────────────
+static constexpr int kLiveRecordMaxSeconds = 600;
+
+static bool toggle_live_record() {
+    if (acid_is_recording()) {
+        std::error_code ec;
+        std::filesystem::create_directories(config_dir(), ec);
+        auto path = config_dir() / "live.wav";
+        int rc = acid_record_end(path.string().c_str());
+        set_toast(rc == 0 ? "\xe2\x9c\x93 live \xe2\x86\x92 live.wav"
+                          : "\xe2\x9c\x97 live save failed");
+        return rc == 0;
+    }
+    int rc = acid_record_begin(kLiveRecordMaxSeconds);
+    if (rc != 0) {
+        set_toast("\xe2\x9c\x97 record begin failed");
+        return false;
+    }
+    set_toast("\xe2\x97\x8f REC  (W again to stop)");
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1367,7 +1731,9 @@ static bool export_mid() {
 // into chat or commit them to a gist. URL-safe alphabet so the code can sit
 // bare in URLs / terminals / markdown without escapes.
 //
-// Byte 0:   version (1 = legacy, 2 = +prob/ratchet, 3 = +p-locks)
+// Byte 0:   version (1 = legacy, 2 = +prob/ratchet, 3 = +p-locks,
+//                    4 = +9 drums, 5 = +3 drum voices: SH/TB/CG,
+//                    6 = +4 drum voices: MT/CY/RD/BG)
 // Byte 1:   pattern_length
 // Bytes 2-3: bpm * 10 as LE u16    (e.g. 1225 = 122.5 bpm)
 // Byte 4:   swing u8  (0=0.50, 255=0.75)
@@ -1378,9 +1744,14 @@ static bool export_mid() {
 // Bytes 21-52: 16 steps × (note u8, flags u8) where flags = rest|accent<<1|slide<<2
 // Bytes 53-84: 16 steps × (prob u8 [0..100], ratchet u8 [1..4])  — v2+
 // Bytes 85-164: 16 steps × (mask u8, lockC u8, lockR u8, lockE u8, lockA u8)
-//               — v3 only. Lock values are the same u8-scaled knob mapping.
-// Total 165 bytes for v3 → ~220 base64 chars. Older readers silently zero
-// the fields they don't understand. Roundtrips via bit-exact encode/decode.
+//               — v3+ only. Lock values are the same u8-scaled knob mapping.
+// Byte 165: drum_master u8  (0..255 maps to 0..1.5 — scaled-clamp on decode) — v4+
+// Bytes 166-.. : N × drum_mask u16 LE  (bit i = hit on step i) — v4+
+//                v4 codes carry 9 voices, v5 carries 12, v6 carries
+//                kDrumVoices (16).
+// Total 165 / 184 / 190 / 198 bytes → ~245 / 254 / 264 base64 chars. Older
+// readers silently zero the fields they don't understand. Roundtrips via
+// bit-exact encode/decode.
 // ─────────────────────────────────────────────────────────────────────────────
 
 static std::string base64_encode(const uint8_t* data, size_t n) {
@@ -1437,13 +1808,14 @@ static bool base64_decode(const std::string& s, std::vector<uint8_t>& out) {
 }
 
 static std::string pattern_encode_string() {
-    constexpr size_t kN = 165;
+    // 165 bytes of v3 header + 1 byte drum_master + kDrumVoices × 2 drum masks.
+    constexpr size_t kN = 165 + 1 + kDrumVoices * 2;
     uint8_t buf[kN] = {};
     auto u8 = [](float v) -> uint8_t {
         int i = static_cast<int>(std::round(std::clamp(v, 0.0f, 1.0f) * 255.0f));
         return static_cast<uint8_t>(std::clamp(i, 0, 255));
     };
-    buf[0] = 3;                                                // version
+    buf[0] = 6;                                                // version
     buf[1] = static_cast<uint8_t>(std::clamp(g_pattern_length, 1, 16));
     int bpm10 = std::clamp(static_cast<int>(std::round(g_bpm * 10.0f)), 200, 3000);
     buf[2] = static_cast<uint8_t>(bpm10 & 0xFF);
@@ -1483,15 +1855,38 @@ static std::string pattern_encode_string() {
         buf[L + 3] = u8(s.lock_env);
         buf[L + 4] = u8(s.lock_accent);
     }
+    // v4 drum block. Master is 0..1.5, scale-encode as u8 where 255 = 1.5.
+    {
+        int dm = static_cast<int>(std::round(
+            std::clamp(g_drum_master, 0.0f, 1.5f) / 1.5f * 255.0f));
+        buf[165] = static_cast<uint8_t>(std::clamp(dm, 0, 255));
+        for (int v = 0; v < kDrumVoices; ++v) {
+            uint16_t mask = 0;
+            for (int i = 0; i < 16; ++i) {
+                if (g_drums[static_cast<size_t>(v)][static_cast<size_t>(i)])
+                    mask |= static_cast<uint16_t>(1u << i);
+            }
+            buf[166 + v * 2 + 0] = static_cast<uint8_t>(mask & 0xFF);
+            buf[166 + v * 2 + 1] = static_cast<uint8_t>((mask >> 8) & 0xFF);
+        }
+    }
     return base64_encode(buf, kN);
 }
 
 static bool pattern_decode_string(const std::string& code) {
     std::vector<uint8_t> buf;
     if (!base64_decode(code, buf)) return false;
-    if (buf.size() < 53 || buf[0] < 1 || buf[0] > 3) return false;
+    if (buf.size() < 53 || buf[0] < 1 || buf[0] > 6) return false;
     const bool v2 = (buf[0] >= 2) && (buf.size() >= 85);
     const bool v3 = (buf[0] >= 3) && (buf.size() >= 165);
+    // Drum block: v4 codes carry 9 voices (184 bytes), v5 carries 12 (190
+    // bytes), v6 carries kDrumVoices (16 → 198 bytes). We detect the version
+    // from byte 0 and read only as many voices as that version promised so
+    // short payloads decode cleanly without reaching past the buffer.
+    const int  v_drums  = (buf[0] >= 6) ? kDrumVoices
+                        : (buf[0] >= 5) ? 12
+                        : 9;
+    const bool v4 = (buf[0] >= 4) && (buf.size() >= 165 + 1 + static_cast<size_t>(v_drums) * 2);
     auto f8 = [](uint8_t v) -> float { return static_cast<float>(v) / 255.0f; };
 
     g_pattern_length = std::clamp(static_cast<int>(buf[1]), 1, 16);
@@ -1540,6 +1935,26 @@ static bool pattern_decode_string(const std::string& code) {
             s.lock_mask   = 0;
             s.lock_cutoff = s.lock_res = s.lock_env = s.lock_accent = 0.0f;
         }
+    }
+    // Drum block. Always wipe the kit first so older codes (v1-v3, no drums)
+    // land in a cleared grid rather than leaking the previous pattern's hits.
+    // v4 payloads carry 9 voices; v5 adds SH/TB/CG; v6 adds MT/CY/RD/BG.
+    // Unknown (newer) voices stay silent when loading older codes.
+    for (auto& row : g_drums) for (auto& c : row) c = false;
+    if (v4) {
+        g_drum_master = std::clamp(
+            static_cast<float>(buf[165]) / 255.0f * 1.5f, 0.0f, 1.5f);
+        for (int v = 0; v < v_drums; ++v) {
+            uint16_t m = static_cast<uint16_t>(buf[166 + v * 2 + 0])
+                       | (static_cast<uint16_t>(buf[166 + v * 2 + 1]) << 8);
+            for (int i = 0; i < 16; ++i) {
+                g_drums[static_cast<size_t>(v)][static_cast<size_t>(i)]
+                    = (m & (1u << i)) != 0;
+            }
+        }
+    } else {
+        // v1-v3 codes carry no drums; leave drum_master at its current value
+        // (the user's knob state) rather than forcing it to 1.0.
     }
     g_preset_index = -1;
     g_step_sel     = 0;
@@ -1817,9 +2232,11 @@ static int letter_to_semitone(char c) {
 //   row 0              title bar
 //   rows 1..12         voice_row = SYNTH VOICE (grow 8) | FX RACK (grow 6)
 //                       12 rows = 1 border + 1 header + 8 knobs + 1 caption + 1 border
-//   rows 13..H-12      middle_row (filter+scope on left, transport on right)
-//   rows H-11..H-2     step_row = SEQUENCER (grow 1) | DRUMS (grow 1)
-//                       10 rows = max(seq panel 10, drum panel 9) via align Stretch
+//   rows 13..H-15      middle_row (filter+scope on left, transport on right)
+//   rows H-14..H-2     step_row = SEQUENCER (grow 1) | DRUMS (grow 1)
+//                       13 rows = max(seq panel 10, drum panel 13) via align Stretch
+//                       — drum panel wants 1 border + 1 header + 9 voices +
+//                       1 bus caption + 1 border = 13, seq stretches to match.
 //   row H-1            help bar
 //
 // Content widths (what justify-center lines up inside each panel):
@@ -1925,58 +2342,61 @@ static HitZone hit_test(int col, int row) {
         return {};
     }
 
-    // ── Step row (rows H-11..H-2): seq | drums, 1:1 split, 10 rows tall ──
+    // ── Step row (bottom): sequencer fills the full width, 10 rows tall. Data
+    // rows (STEP/PITCH/FLAG/PROB/LOCK/NOTE) live at step_top + 2 .. step_top + 7.
     int step_top = g_term_h - 11;
     int step_bot = g_term_h - 2;
     if (row >= step_top && row <= step_bot) {
-        int avail  = std::max(0, g_term_w - 1);
-        int seq_w  = flex_first_share(avail, 1, 2);
-        int drum_x = seq_w + 1;
-        int drum_w = std::max(0, g_term_w - drum_x);
+        int avail     = std::max(0, g_term_w - 1);
+        int interior_x = 1 + 1;                                  // border + pad
+        int interior_w = std::max(0, avail - 3);
+        constexpr int kSeqW = 7 + 16 * 4 + 1;                     // 72
+        int seq_start = interior_x + std::max(0, (interior_w - kSeqW) / 2);
+        int rel = col - seq_start;
+        if (rel < 8 || rel >= kSeqW) return {};
+        int cell_rel = rel - 8;
+        int step = cell_rel / 4;
+        if (step < 0 || step >= 16) return {};
+        if (row < step_top + 2 || row > step_top + 7) return {};
+        return {HitZone::Step, step, 0};
+    }
 
-        if (col < seq_w) {
-            // Sequencer panel: border(1) + top-rule(1) + 6 data rows
-            // (STEP/PITCH/FLAG/PROB/LOCK/NOTE) + bot-rule(1) + border(1) = 10.
-            int interior_x = 1 + 1;                              // border + pad
-            int interior_w = std::max(0, seq_w - 4);
-            constexpr int kSeqW = 7 + 16 * 4 + 1;                 // 72
-            int seq_start = interior_x + std::max(0, (interior_w - kSeqW) / 2);
-            int rel = col - seq_start;
-            if (rel < 8 || rel >= kSeqW) return {};                // label + left wall
-            int cell_rel = rel - 8;
-            int step = cell_rel / 4;
-            if (step < 0 || step >= 16) return {};                 // past last cell
-            // Only respond inside the 6 data rows.
-            if (row < step_top + 2 || row > step_top + 7) return {};
-            return {HitZone::Step, step, 0};
-        }
-        if (col >= drum_x) {
-            // Drum panel: border(1) + header(1) + 5 voices + bus(1) + filler +
-            // border(1). Voice rows live at step_top + 2 .. step_top + 6.
-            int interior_x = drum_x + 1 + 1;                      // border + pad
+    // ── Middle row: left_col (scope + filter) | transport | drums. Split
+    // via 3:2:2 flex shares, matching the dsl hstack that builds this row.
+    // left_col (3) carries the filter chart so it reads at full width;
+    // transport (2) and drums (2) stay equal on the right side.
+    int mid_top = 13;
+    int mid_bot = step_top - 1;
+    if (row >= mid_top && row <= mid_bot) {
+        // 3 panels + 2 gaps fill g_term_w exactly, so the panels share
+        // (g_term_w - 2) columns. NB: the voice_row hit_test uses
+        // `g_term_w - 1` because it has only one gap; we need to subtract
+        // one cell per gap, hence -2 here.
+        int flex = std::max(0, g_term_w - 2);
+        int left_w      = flex_first_share(flex, 3, 7);
+        int tail        = flex - left_w;
+        int transport_w = flex_first_share(tail, 2, 4);
+        int drum_w      = tail - transport_w;
+        int transport_x = left_w + 1;
+        int drum_x      = transport_x + transport_w + 1;
+
+        if (col >= drum_x && col < drum_x + drum_w) {
+            // Drum panel: border(1) + header(1) + kDrumVoices voice rows +
+            // bus(1) + border(1). Voice rows live at mid_top + 2 .. + 2+N-1.
+            int interior_x = drum_x + 1 + 1;                     // border + pad
             int interior_w = std::max(0, drum_w - 4);
             constexpr int kDrumW = 4 + 16 * 3;                    // 52
             int drum_start = interior_x + std::max(0, (interior_w - kDrumW) / 2);
             int rel = col - drum_start;
-            if (rel < 4 || rel >= kDrumW) return {};               // label gutter / past end
+            if (rel < 4 || rel >= kDrumW) return {};
             int cell_rel = rel - 4;
             int step = cell_rel / 3;
             if (step < 0 || step >= 16) return {};
-            int voice = row - (step_top + 2);
-            if (voice < 0 || voice >= 5) return {};
+            int voice = row - (mid_top + 2);
+            if (voice < 0 || voice >= kDrumVoices) return {};
             return {HitZone::DrumCell, step, voice};
         }
-        return {};
-    }
-
-    // ── Middle row: right 3/5 is the transport zone (preset browser); left
-    // 2/5 is the filter + scope stack (status-only, clicks just focus the
-    // sequencer so there's no dead zone).
-    int mid_top = 13;
-    int mid_bot = step_top - 1;
-    if (row >= mid_top && row <= mid_bot) {
-        int split = (g_term_w * 2) / 5;
-        if (col >= split) return {HitZone::TransportArea, 0, 0};
+        if (col >= transport_x) return {HitZone::TransportArea, 0, 0};
         return {HitZone::ScopeArea, 0, 0};
     }
 
@@ -2022,21 +2442,30 @@ static void handle_mouse(const MouseEvent& m) {
             g_focus = (hc < synth_w) ? Section::Knobs : Section::FX;
             return;
         }
-        // Step row: sequencer panel vs drums panel (1:1 split).
+        // Step row: sequencer spans full width at the bottom.
         int step_top = g_term_h - 11;
         int step_bot = g_term_h - 2;
         if (hr >= step_top && hr <= step_bot) {
-            int avail = std::max(0, g_term_w - 1);
-            int seq_w = flex_first_share(avail, 1, 2);
-            g_focus = (hc < seq_w) ? Section::Sequencer : Section::Drums;
+            g_focus = Section::Sequencer;
             return;
         }
-        // Middle band: scope (left) vs transport (right), 2:3 split.
+        // Middle band: left_col | transport | drums, 3:2:2 flex split matching
+        // the dsl::hstack that builds this row (gap 1 between cells).
+        // Uses g_term_w - 2 (one cell per gap) — same correction as hit_test.
         int mid_top = 13;
         int mid_bot = step_top - 1;
         if (hr >= mid_top && hr <= mid_bot) {
-            int split = (g_term_w * 2) / 5;
-            g_focus = (hc >= split) ? Section::Transport : Section::Sequencer;
+            int flex        = std::max(0, g_term_w - 2);
+            int left_w      = flex_first_share(flex, 3, 7);
+            int tail        = flex - left_w;
+            int transport_w = flex_first_share(tail, 2, 4);
+            int transport_x = left_w + 1;
+            int drum_x      = transport_x + transport_w + 1;
+            // Left third has no interactive widgets — leave focus where it
+            // was rather than hijacking it to the sequencer (which lives in
+            // a totally different row).
+            if (hc >= drum_x)            g_focus = Section::Drums;
+            else if (hc >= transport_x)  g_focus = Section::Transport;
             return;
         }
         return;
@@ -2309,6 +2738,7 @@ static void handle_event(const Event& ev) {
     }
     if (key(ev, 'e')) { export_wav(); return; }
     if (key(ev, 'E')) { export_mid(); return; }
+    if (key(ev, 'W')) { toggle_live_record(); return; }
     if (key(ev, 'p')) { export_pattern_text(); return; }
     if (key(ev, 'P')) { import_pattern_text(); return; }
     // Jam mode toggle — take over the keyboard for live two-octave playing.
@@ -2983,29 +3413,19 @@ static Element render_frame() {
 
     // Left column stacks FILTER RESPONSE on top of SCOPE so the two visual
     // analyses share the same width (both read horizontally as log-freq /
-    // time), while TRANSPORT owns the right side.
-    auto left_col = (dsl::v(
-        std::move(filter_box) | dsl::grow(3),
-        std::move(scope_box)  | dsl::grow(2)
-    ) | dsl::gap(0) | dsl::grow(1)).build();
-
-    auto middle_row = (dsl::h(
-        std::move(left_col)  | dsl::grow(2),
-        std::move(transport) | dsl::grow(3)
-    ) | dsl::gap(1) | dsl::grow(1)).build();
-
-    auto seq = tb303::build_sequencer(g_steps, g_pattern_length, g_step_sel,
-                                      g_playing ? g_current_step : -1);
-    auto seq_panel = dsl::vstack()
-        .border(BorderStyle::Round)
-        .border_color(g_synth_mute ? tb303::clr_dim()
-                      : g_focus == Section::Sequencer ? tb303::clr_accent() : tb303::clr_panel_hi())
-        .border_text(g_synth_mute ? " SEQUENCER \xc2\xb7 MUTED (m) " : " SEQUENCER ", BorderTextPos::Top)
-        .align_self(Align::Stretch)
+    // time). basis(0) + min_width(0) lets middle_row's flex algorithm
+    // distribute horizontal space by grow factors alone; without this the
+    // filter chart's natural width would claim most of the row.
+    auto left_col = dsl::vstack()
+        .gap(0)
+        .grow(1.0f)
         .basis(Dimension::fixed(0))
         .min_width(Dimension::fixed(0))
         .overflow(Overflow::Hidden)
-        .padding(0, 1, 0, 1)(std::move(seq));
+        (
+            std::move(filter_box) | dsl::grow(3),
+            std::move(scope_box)  | dsl::grow(2)
+        );
 
     auto drums = tb303::build_drums(g_drums,
                                     g_drum_voice_sel, g_drum_step_sel,
@@ -3017,11 +3437,32 @@ static Element render_frame() {
         .border_color(g_drums_mute ? tb303::clr_dim()
                       : g_focus == Section::Drums ? tb303::clr_accent() : tb303::clr_panel_hi())
         .border_text(g_drums_mute ? " DRUMS \xc2\xb7 MUTED (m) " : " DRUMS ", BorderTextPos::Top)
-        .align_self(Align::Stretch)
         .basis(Dimension::fixed(0))
         .min_width(Dimension::fixed(0))
         .overflow(Overflow::Hidden)
         .padding(0, 1, 0, 1)(std::move(drums));
+
+    // Middle row hosts three stacked panels side by side: scope/filter (left),
+    // transport (centre), drums (right). voice_row (below) is given shrink(1)
+    // so on short terminals the knob row compresses first and middle_row keeps
+    // enough height to render the 16-voice drum grid unclipped.
+    auto middle_row = (dsl::h(
+        std::move(left_col)   | dsl::grow(3),
+        std::move(transport)  | dsl::grow(2),
+        std::move(drum_panel) | dsl::grow(2)
+    ) | dsl::gap(1) | dsl::grow(1)).build();
+
+    auto seq = tb303::build_sequencer(g_steps, g_pattern_length, g_step_sel,
+                                      g_playing ? g_current_step : -1);
+    auto seq_panel = dsl::vstack()
+        .border(BorderStyle::Round)
+        .border_color(g_synth_mute ? tb303::clr_dim()
+                      : g_focus == Section::Sequencer ? tb303::clr_accent() : tb303::clr_panel_hi())
+        .border_text(g_synth_mute ? " SEQUENCER \xc2\xb7 MUTED (m) " : " SEQUENCER ", BorderTextPos::Top)
+        .basis(Dimension::fixed(0))
+        .min_width(Dimension::fixed(0))
+        .overflow(Overflow::Hidden)
+        .padding(0, 1, 0, 1)(std::move(seq));
 
     int help_auto = static_cast<int>(g_help_bar_auto_t / kHelpBarChipDur);
     auto help_bar = tb303::build_help_bar(g_focus, g_help_open,
@@ -3070,12 +3511,29 @@ static Element render_frame() {
         }};
     } else {
         if (!g_toast.empty()) g_toast.clear();
-        status_el = Element{TextElement{
-            .content = g_playing ? "\xe2\x97\x8f  live" : "\xe2\x97\x8b  idle",
-            .style   = Style{}.with_fg(g_playing ? tb303::clr_hot() : tb303::clr_muted())
-                             .with_bold(),
-            .wrap    = TextWrap::NoWrap,
-        }};
+        // When the user is tracking to live.wav, replace the play glyph with
+        // a bright blinking REC + elapsed seconds so the indicator is
+        // unmissable during a take. Blink rate is ~1 Hz off the same timer
+        // the toast uses — coarse enough to read, not enough to distract.
+        if (acid_is_recording()) {
+            float sec = acid_record_seconds();
+            bool blink_on = (static_cast<int>(sec * 2.0f) & 1) == 0;
+            char buf[48];
+            std::snprintf(buf, sizeof(buf), "%s REC  %5.1fs",
+                          blink_on ? "\xe2\x97\x8f" : " ", sec);
+            status_el = Element{TextElement{
+                .content = buf,
+                .style   = Style{}.with_fg(tb303::clr_hot()).with_bold(),
+                .wrap    = TextWrap::NoWrap,
+            }};
+        } else {
+            status_el = Element{TextElement{
+                .content = g_playing ? "\xe2\x97\x8f  live" : "\xe2\x97\x8b  idle",
+                .style   = Style{}.with_fg(g_playing ? tb303::clr_hot() : tb303::clr_muted())
+                                 .with_bold(),
+                .wrap    = TextWrap::NoWrap,
+            }};
+        }
     }
 
     // Group brand on the left, status on the right, with `justify(SpaceBetween)`
@@ -3106,21 +3564,14 @@ static Element render_frame() {
         ) | dsl::gap(0)).build();
     }
 
-    // Sequencer + drums live side-by-side: the two step-grids are both 16
-    // columns wide, so pairing them horizontally gives a classic "bass row
-    // + drum row" groovebox layout that reads left-to-right without scrolling.
-    // align(Stretch) forces both panels to the hstack's full cross-axis height
-    // — the drum grid's natural height is shorter than the sequencer, so
-    // without stretch the drum panel's border ends mid-way down. shrink(0)
-    // keeps the whole row at its natural height on terminal resize so the
-    // sequencer rows don't get clipped when the user shrinks vertically —
-    // middle_row (grow=1) absorbs all the vertical flex.
+    // Sequencer spans the full width at the bottom — drums moved up next to
+    // transport so step_row is a single-panel row. shrink(0) pins its natural
+    // height on terminal resize so only middle_row flexes.
     auto step_row = dsl::hstack()
-        .gap(1)
-        .align_items(Align::Stretch)
+        .gap(0)
+        .align_items(Align::End)
         .shrink(0)(
-            std::move(seq_panel)  | dsl::grow(1),
-            std::move(drum_panel) | dsl::grow(1)
+            std::move(seq_panel) | dsl::grow(1)
         );
 
     // Synth voice + FX rack on one row — the voice panel is ~8 knobs wide, FX
@@ -3131,7 +3582,7 @@ static Element render_frame() {
     auto voice_row = dsl::hstack()
         .gap(1)
         .align_items(Align::Stretch)
-        .shrink(0)(
+        .shrink(1)(
             std::move(knob_row) | dsl::grow(8),
             std::move(fx_row)   | dsl::grow(6)
         );

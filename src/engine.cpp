@@ -54,11 +54,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace acid {
@@ -209,6 +211,19 @@ float              g_peak_env = 0.0f;
 // keeps audio-side overhead to a single relaxed store per block.
 std::atomic<float> g_live_fc{200.0f};
 
+// ── Live recorder ───────────────────────────────────────────────────────────
+// Captures the raw post-FX output (the same y_out the backend writes to the
+// device) into a preallocated heap buffer while `g_rec_on` is true. The UI
+// allocates the buffer up-front, flips the flag on, and later flips it off +
+// writes a WAV. We never allocate on the audio thread, and we only free on
+// the UI side after the flag has been off for >1 block. `g_rec_overflow`
+// latches if the buffer fills mid-take so the UI can warn the user.
+float*                g_rec_buf      = nullptr;
+std::atomic<uint32_t> g_rec_cap      {0};
+std::atomic<uint32_t> g_rec_w        {0};
+std::atomic<bool>     g_rec_on       {false};
+std::atomic<bool>     g_rec_overflow {false};
+
 // ── Audio-thread sequencer ──────────────────────────────────────────────────
 // Live step scheduling is done on the audio thread against a sample-accurate
 // clock. The UI used to drive it from the 30 FPS render callback, which
@@ -278,62 +293,201 @@ inline uint32_t seq_rand_u32() {
 }
 
 // ── Drum machine (Phase 4.3) ────────────────────────────────────────────────
-// Five synthesized percussion voices — BD / SD / CH / OH / CL — each with its
-// own 16-step bitmask lane. Triggers fire on step boundaries alongside the
-// bass voice. Voices render in parallel per sample and sum into the master
-// bus BEFORE the delay so they hit the same FX the bass does.
-constexpr int kDrumVoices = 5;
+// Nine synthesized percussion voices — BD / SD / CH / OH / CL / LT / HT / RS /
+// CB — each with its own 16-step bitmask lane. Triggers fire on step
+// boundaries alongside the bass voice. Voices render in parallel per sample
+// and sum into the master bus BEFORE the delay so they hit the same FX the
+// bass does.
+//
+// Voices 0..8 are the legacy kit (kept at same indices so v4 slot files and
+// v3/v4 pattern.txt still load). 9..11 extend with shaker/tambourine/conga
+// (the texture layer). 12..15 add a mid tom plus two cymbals and a bongo so
+// the kit covers the full drum-family triangle (kicks/toms/perc, snares/claps,
+// hats/cymbals):
+//   SH — continuous 16th-note shuffle (bandpassed noise, short tail)
+//   TB — metallic jangle that sits on offbeats (noise + high bandpass)
+//   CG — pitched mid-perc that fills between kick and snare
+//   MT — mid tom (between LT and HT) so tom fills have a 3-step ladder
+//   CY — crash cymbal (long, noisy, bar-top accent on step 1 / 13)
+//   RD — ride cymbal (medium, pings on top, drives techno/house at 8ths)
+//   BG — bongo (higher-pitched than CG, fast decay, latin/jam fills)
+constexpr int kDrumVoices = 16;
 constexpr int kDrumBD = 0, kDrumSD = 1, kDrumCH = 2, kDrumOH = 3, kDrumCL = 4;
+constexpr int kDrumLT = 5, kDrumHT = 6, kDrumRS = 7, kDrumCB = 8;
+constexpr int kDrumSH = 9, kDrumTB = 10, kDrumCG = 11;
+constexpr int kDrumMT = 12, kDrumCY = 13, kDrumRD = 14, kDrumBG = 15;
 
 std::atomic<uint32_t> g_seq_drum_mask[kDrumVoices] {};
 // Per-voice baseline gain — picked so a four-on-the-floor BD + off-beat CH
-// sits roughly at the bass voice's level with DRUM knob at 1.0.
+// sits roughly at the bass voice's level with DRUM knob at 1.0. Toms sit a
+// touch under the kick so layered hits feel like accent rather than two-kick
+// mud; rimshot is low by default (it's a transient, easy to over-weight); CB
+// is low because a metallic square stacks hard into the mix. SH/TB stay
+// quiet so they colour the groove without muddying, CG sits between toms and
+// rim.
 std::atomic<float> g_seq_drum_gain[kDrumVoices] {
-    {0.95f}, {0.70f}, {0.35f}, {0.40f}, {0.60f}
+    {0.95f}, {0.70f}, {0.35f}, {0.40f}, {0.60f},
+    {0.80f}, {0.75f}, {0.55f}, {0.45f},
+    {0.30f}, {0.35f}, {0.65f},
+    // MT sits between the two existing toms (LT 0.80 / HT 0.75). CY is a
+    // once-per-bar accent so the baseline leans loud; RD sits under the CH
+    // level so a steady ride doesn't ride over the kick; BG sits a touch above
+    // CG because bongos historically ride on top of the conga.
+    {0.78f}, {0.50f}, {0.32f}, {0.55f}
 };
 // Master drum-bus send. UI knob; 0 = drums silent, 1 = nominal.
 std::atomic<float> g_seq_drum_master {1.0f};
 
 // Per-voice audio-thread synth state. Plain floats (no atomics — only the
-// render thread touches these). Each voice is ~4 floats of state so the
-// whole drum machine is ~20 floats, negligible cache-wise.
+// render thread touches these). All the state is a few floats per voice so
+// the whole drum machine is < 100 B, negligible cache-wise.
 struct DrumBD {
-    float env   = 0.0f;    // amp envelope (decays ~0.12 s)
-    float penv  = 0.0f;    // pitch envelope (sweeps ~0.035 s)
-    float phase = 0.0f;    // sine phase
+    float env     = 0.0f;    // amp envelope (decays ~0.20 s)
+    float penv    = 0.0f;    // pitch envelope (sweeps ~0.050 s)
+    float click   = 0.0f;    // attack transient (~2 ms)
+    float phase   = 0.0f;    // sine phase
 };
 struct DrumSD {
-    float env        = 0.0f;
-    float body_env   = 0.0f;
-    float body_phase = 0.0f;
-    float hp_x       = 0.0f;
-    float hp_y       = 0.0f;
+    float env        = 0.0f;    // amp envelope
+    float body_env   = 0.0f;    // body tone decay (~35 ms)
+    float body_phase1 = 0.0f;   // low body sine (~180 Hz)
+    float body_phase2 = 0.0f;   // high body sine (~330 Hz)
+    float noise_env   = 0.0f;   // noise component decay (~120 ms)
+    float bp_x1 = 0.0f, bp_y1 = 0.0f;   // snare bandpass state 1
+    float bp_x2 = 0.0f, bp_y2 = 0.0f;   // bandpass state 2
     uint32_t rng     = 0xc3a5c85cu;
 };
-struct DrumHH {
-    float env  = 0.0f;
-    float hp_x = 0.0f;
-    float hp_y = 0.0f;
+// Metallic hat oscillator — 6 detuned squares at inharmonic ratios, the
+// classic 808 recipe. Each voice carries its own phase bank so CH and OH
+// stay out of sync even when both fire on the same step.
+struct DrumHat {
+    float env    = 0.0f;
+    float bp_x   = 0.0f, bp_y = 0.0f;      // bandpass (resonant ~8 kHz)
+    float hp_x   = 0.0f, hp_y = 0.0f;      // output HPF removes low mud
+    float phase[6] = {0.0f, 0.1f, 0.2f, 0.3f, 0.4f, 0.5f};  // square phases
     uint32_t rng;
 };
 struct DrumCL {
     float env         = 0.0f;       // per-burst fast env (~7 ms)
-    float tail_env    = 0.0f;       // long tail (~250 ms)
+    float tail_env    = 0.0f;       // long tail (~280 ms)
     int   bursts_left = 0;
     float burst_clock = 0.0f;       // seconds until next retrigger
-    float hp_x        = 0.0f;
-    float hp_y        = 0.0f;
+    float bp_x        = 0.0f;       // bandpass ~1.3 kHz for hand-clap body
+    float bp_y        = 0.0f;
     uint32_t rng      = 0x52a43d26u;
+};
+// Tom (LT / HT) — pitched sine with small pitch envelope. Shares structure
+// with the kick but with a longer amp decay and narrower pitch sweep.
+struct DrumTom {
+    float env     = 0.0f;
+    float penv    = 0.0f;
+    float phase   = 0.0f;
+    float base_hz = 80.0f;      // set per-instance (LT = 80, HT = 180)
+    float peak_hz = 110.0f;     //                  (LT = 110, HT = 230)
+    float env_tc  = 0.30f;      //                  (LT = 0.30s, HT = 0.22s)
+    float penv_tc = 0.07f;
+};
+// Rimshot — sharp click: two sines + a short noise burst through a high
+// bandpass. All the energy lives in 1.5–2.5 kHz.
+struct DrumRS {
+    float env         = 0.0f;
+    float sine1_phase = 0.0f;
+    float sine2_phase = 0.0f;
+    float bp_x        = 0.0f;
+    float bp_y        = 0.0f;
+    uint32_t rng      = 0x85ebca6bu;
+};
+// 808 cowbell — two detuned squares at 540 + 800 Hz through a bandpass.
+// Short-medium decay (~0.18s) gives the classic "clonk". Phases seeded apart
+// so the first cycle has the right interference pattern.
+struct DrumCB {
+    float env     = 0.0f;
+    float phase1  = 0.0f;
+    float phase2  = 0.35f;
+    float bp_x    = 0.0f;
+    float bp_y    = 0.0f;
+};
+// Shaker — short pink-ish noise burst with a quick attack curve + gentle
+// bandpass near 4 kHz. Very short decay (~60 ms) makes a 16th-note shaker
+// pattern feel driving without smearing.
+struct DrumSH {
+    float env    = 0.0f;
+    float bp_x   = 0.0f, bp_y = 0.0f;
+    float hp_x   = 0.0f, hp_y = 0.0f;
+    uint32_t rng = 0x9e3779b9u;
+};
+// Tambourine — noise through two bandpasses (one around 4 kHz for body, one
+// around 8 kHz for jingle), a touch longer than the shaker (~140 ms) so the
+// sizzle sits on top of the groove rather than vanishing instantly.
+struct DrumTB {
+    float env    = 0.0f;
+    float bp1_x  = 0.0f, bp1_y = 0.0f;   // body ~4 kHz
+    float bp2_x  = 0.0f, bp2_y = 0.0f;   // jingle ~8 kHz
+    uint32_t rng = 0x7f4a7c15u;
+};
+// Conga — pitched sine with a brief pitch envelope and tiny click transient.
+// Sits above the toms (base 260 Hz, peak 340 Hz) so it reads as a mid-perc
+// "tuk" rather than a drum, ideal for latin/techno fills.
+struct DrumCG {
+    float env     = 0.0f;
+    float penv    = 0.0f;
+    float phase   = 0.0f;
+};
+// Cymbal — longer cousin of the 808 hat. Same 6-square metallic stack but a
+// wider bandpass and a longer tail, voiced per-instance for crash vs ride.
+//   CY (crash): ~0.80s decay, open bandpass, heavy noise component.
+//   RD (ride):  ~0.45s decay, tighter bandpass + a sine "ping" on attack.
+struct DrumCym {
+    float env      = 0.0f;
+    float bp_x     = 0.0f, bp_y  = 0.0f;
+    float hp_x     = 0.0f, hp_y  = 0.0f;
+    float phase[6] = {0.0f, 0.13f, 0.27f, 0.41f, 0.55f, 0.69f};
+    float ping     = 0.0f;        // attack sine envelope (ride only)
+    float ping_ph  = 0.0f;
+    // Per-instance recipe. CY uses 6 inharmonic squares (same as the hat but
+    // octave-down so the lot sits in 400-3k), RD uses 6 above the hat so the
+    // ping is bright. Exposed so the render lambda can read them.
+    float ping_hz  = 0.0f;        // 0 = disabled (crash); RD sets ~420 Hz
+    uint32_t rng   = 0x13578bdfu;
+};
+// Bongo — pitched sine like the conga but tuned higher (380→470 Hz) and with
+// a faster decay (~90 ms). Sits above the conga so a bongo/conga pair reads
+// as two separate pitches.
+struct DrumBongo {
+    float env     = 0.0f;
+    float penv    = 0.0f;
+    float phase   = 0.0f;
 };
 
 DrumBD g_bd;
 DrumSD g_sd;
-DrumHH g_ch{ .rng = 0x1b873593u };
-DrumHH g_oh{ .rng = 0xcc9e2d51u };
+DrumHat g_ch{ .rng = 0x1b873593u };
+DrumHat g_oh{ .rng = 0xcc9e2d51u };
 DrumCL g_cl;
+DrumTom g_lt{ .base_hz = 80.0f,  .peak_hz = 110.0f, .env_tc = 0.30f, .penv_tc = 0.080f };
+DrumTom g_ht{ .base_hz = 180.0f, .peak_hz = 230.0f, .env_tc = 0.22f, .penv_tc = 0.060f };
+DrumRS  g_rs;
+DrumCB  g_cb;
+DrumSH  g_sh;
+DrumTB  g_tb;
+DrumCG  g_cg;
+// New: mid tom fills the octave gap between LT (80 Hz) and HT (180 Hz) so the
+// three toms read as a proper low→high ladder when a tom fill walks up.
+DrumTom g_mt{ .base_hz = 128.0f, .peak_hz = 160.0f, .env_tc = 0.26f, .penv_tc = 0.070f };
+DrumCym g_cy{ .ping_hz = 0.0f,    .rng = 0x9d2c5680u };
+DrumCym g_rd{ .ping_hz = 420.0f,  .rng = 0xefc60000u };
+DrumBongo g_bg;
 
-inline void drum_trig_bd() { g_bd.env = 1.0f; g_bd.penv = 1.0f; g_bd.phase = 0.0f; }
-inline void drum_trig_sd() { g_sd.env = 1.0f; g_sd.body_env = 1.0f; g_sd.body_phase = 0.0f; }
+inline void drum_trig_bd() {
+    g_bd.env = 1.0f; g_bd.penv = 1.0f; g_bd.click = 1.0f; g_bd.phase = 0.0f;
+}
+inline void drum_trig_sd() {
+    g_sd.env = 1.0f;
+    g_sd.body_env = 1.0f;
+    g_sd.noise_env = 1.0f;
+    g_sd.body_phase1 = 0.0f;
+    g_sd.body_phase2 = 0.0f;
+}
 inline void drum_trig_ch() { g_ch.env = 1.0f; }
 inline void drum_trig_oh() { g_oh.env = 1.0f; }
 inline void drum_trig_cl() {
@@ -345,6 +499,30 @@ inline void drum_trig_cl() {
     g_cl.bursts_left = 2;
     g_cl.burst_clock = 0.012f;
 }
+inline void drum_trig_tom(DrumTom& t) {
+    t.env = 1.0f; t.penv = 1.0f; t.phase = 0.0f;
+}
+inline void drum_trig_rs() {
+    g_rs.env = 1.0f;
+    g_rs.sine1_phase = 0.0f;
+    g_rs.sine2_phase = 0.25f;
+}
+inline void drum_trig_cb() {
+    g_cb.env = 1.0f;
+    // Don't reset phases — seeded offset gives the signature cowbell interference.
+}
+inline void drum_trig_sh() { g_sh.env = 1.0f; }
+inline void drum_trig_tb() { g_tb.env = 1.0f; }
+inline void drum_trig_cg() {
+    g_cg.env = 1.0f; g_cg.penv = 1.0f; g_cg.phase = 0.0f;
+}
+inline void drum_trig_cym(DrumCym& c) {
+    c.env = 1.0f;
+    if (c.ping_hz > 0.0f) { c.ping = 1.0f; c.ping_ph = 0.0f; }
+}
+inline void drum_trig_bg() {
+    g_bg.env = 1.0f; g_bg.penv = 1.0f; g_bg.phase = 0.0f;
+}
 inline void drum_fire(int voice) {
     switch (voice) {
         case kDrumBD: drum_trig_bd(); break;
@@ -352,6 +530,17 @@ inline void drum_fire(int voice) {
         case kDrumCH: drum_trig_ch(); break;
         case kDrumOH: drum_trig_oh(); break;
         case kDrumCL: drum_trig_cl(); break;
+        case kDrumLT: drum_trig_tom(g_lt); break;
+        case kDrumHT: drum_trig_tom(g_ht); break;
+        case kDrumRS: drum_trig_rs(); break;
+        case kDrumCB: drum_trig_cb(); break;
+        case kDrumSH: drum_trig_sh(); break;
+        case kDrumTB: drum_trig_tb(); break;
+        case kDrumCG: drum_trig_cg(); break;
+        case kDrumMT: drum_trig_tom(g_mt); break;
+        case kDrumCY: drum_trig_cym(g_cy); break;
+        case kDrumRD: drum_trig_cym(g_rd); break;
+        case kDrumBG: drum_trig_bg(); break;
     }
 }
 
@@ -379,10 +568,18 @@ std::atomic<bool>    g_midi_out_enabled {false};
 // — GM convention). Most DAWs and hardware expect this layout.
 constexpr uint8_t    kMidiBassChan = 0;
 constexpr uint8_t    kMidiDrumChan = 9;
-// GM drum mapping for our 5 voices: BD=35, SD=38, CH=42, OH=46, CL=39. Stock
+// GM drum mapping for our 9 voices. BD=35 (acoustic bass drum), SD=38 (snare),
+// CH=42 (closed hat), OH=46 (open hat), CL=39 (hand clap), LT=41 (low floor
+// tom), HT=48 (hi mid tom), RS=37 (side stick / rim), CB=56 (cowbell). Stock
 // enough that a plugged-in drum module or a GM softsynth will just play the
 // right sound without remapping.
-constexpr uint8_t    kDrumMidiNote[5] = { 35, 38, 42, 46, 39 };
+// GM note mapping per voice. Extras: SH=70 (maracas), TB=54 (tambourine),
+// CG=63 (high conga). v6 kit adds MT=47 (low-mid tom), CY=49 (crash cymbal 1),
+// RD=51 (ride cymbal 1), BG=60 (hi bongo).
+constexpr uint8_t    kDrumMidiNote[16] = {
+    35, 38, 42, 46, 39, 41, 48, 37, 56, 70, 54, 63,
+    47, 49, 51, 60
+};
 // Track the currently-gated bass note so the audio thread can emit a matching
 // note-off before the next note-on (otherwise external synths stack voices).
 uint8_t              g_midi_last_bass_note = 0;
@@ -898,11 +1095,14 @@ void render(float* out, int frames) {
     // ── Drum precomputes ────────────────────────────────────────────────────
     // Per-voice envelope decay coefficients (exp(-dt/tau)) and the per-voice
     // bus gains loaded once per sub-block. Time constants are tuned by ear:
-    //   BD: 120 ms amp / 35 ms pitch sweep → TR-808 kick shape
-    //   SD: 80 ms amp / 40 ms body → snappy snare
-    //   CH: 25 ms → classic tight closed hat
-    //   OH: 200 ms → brassy open hat
-    //   CL: 7 ms per burst / 250 ms tail → 808 clap
+    //   BD: 200 ms amp / 50 ms pitch sweep / 2 ms click → deep punchy kick
+    //   SD: 120 ms noise / 35 ms body → snappy two-tone snare
+    //   CH: 25 ms → classic tight 808-style metallic closed hat
+    //   OH: 320 ms → brassy open hat
+    //   CL: 7 ms per burst / 280 ms tail → 808 clap
+    //   LT / HT: 300 / 220 ms amp, 80 / 60 ms pitch → tom sweep
+    //   RS: 18 ms → sharp rimshot click
+    //   CB: 180 ms → 808 cowbell ring
     const float drum_master = std::clamp(
         g_seq_drum_master.load(std::memory_order_relaxed), 0.0f, 1.5f);
     float drum_gain[kDrumVoices];
@@ -910,14 +1110,34 @@ void render(float* out, int frames) {
         drum_gain[v] = g_seq_drum_gain[v].load(std::memory_order_relaxed)
                      * drum_master;
     }
-    const float bd_env_dec  = std::exp(-dt_s / 0.12f);
-    const float bd_penv_dec = std::exp(-dt_s / 0.035f);
-    const float sd_env_dec  = std::exp(-dt_s / 0.08f);
-    const float sd_body_dec = std::exp(-dt_s / 0.04f);
-    const float ch_env_dec  = std::exp(-dt_s / 0.025f);
-    const float oh_env_dec  = std::exp(-dt_s / 0.20f);
-    const float cl_env_dec  = std::exp(-dt_s / 0.007f);
-    const float cl_tail_dec = std::exp(-dt_s / 0.25f);
+    const float bd_env_dec   = std::exp(-dt_s / 0.20f);
+    const float bd_penv_dec  = std::exp(-dt_s / 0.050f);
+    const float bd_click_dec = std::exp(-dt_s / 0.002f);
+    const float sd_env_dec   = std::exp(-dt_s / 0.12f);
+    const float sd_body_dec  = std::exp(-dt_s / 0.035f);
+    const float sd_noise_dec = std::exp(-dt_s / 0.12f);
+    const float ch_env_dec   = std::exp(-dt_s / 0.025f);
+    const float oh_env_dec   = std::exp(-dt_s / 0.32f);
+    const float cl_env_dec   = std::exp(-dt_s / 0.007f);
+    const float cl_tail_dec  = std::exp(-dt_s / 0.28f);
+    const float lt_env_dec   = std::exp(-dt_s / g_lt.env_tc);
+    const float lt_penv_dec  = std::exp(-dt_s / g_lt.penv_tc);
+    const float ht_env_dec   = std::exp(-dt_s / g_ht.env_tc);
+    const float ht_penv_dec  = std::exp(-dt_s / g_ht.penv_tc);
+    const float rs_env_dec   = std::exp(-dt_s / 0.018f);
+    const float cb_env_dec   = std::exp(-dt_s / 0.18f);
+    const float sh_env_dec   = std::exp(-dt_s / 0.060f);
+    const float tb_env_dec   = std::exp(-dt_s / 0.140f);
+    const float cg_env_dec   = std::exp(-dt_s / 0.180f);
+    const float cg_penv_dec  = std::exp(-dt_s / 0.040f);
+    const float mt_env_dec   = std::exp(-dt_s / g_mt.env_tc);
+    const float mt_penv_dec  = std::exp(-dt_s / g_mt.penv_tc);
+    const float cy_env_dec   = std::exp(-dt_s / 0.80f);
+    const float cy_ping_dec  = std::exp(-dt_s / 0.015f);
+    const float rd_env_dec   = std::exp(-dt_s / 0.45f);
+    const float rd_ping_dec  = std::exp(-dt_s / 0.040f);
+    const float bg_env_dec   = std::exp(-dt_s / 0.090f);
+    const float bg_penv_dec  = std::exp(-dt_s / 0.030f);
 
     // ── Sample loop (inner — runs for `n` frames of this sub-block) ─────
     for (int i = 0; i < n; i++) {
@@ -1015,47 +1235,89 @@ void render(float* out, int frames) {
         // Every voice checks its env > ~0 gate so silent voices cost nothing
         // beyond a compare+branch. Output sums into drum_bus, then folded
         // into y_hpf BEFORE delay/reverb so drums carry the same FX send.
+        //
+        // The six-phase `kHatPitches` / `kCbPitches` tables are the 808-era
+        // inharmonic-square recipes — detuned prime-ish ratios that give the
+        // hat its metallic tone and the cowbell its unmistakable clonk.
+        static constexpr float kHatPitches[6] = {
+            205.0f, 370.0f, 540.0f, 775.0f, 1050.0f, 1400.0f
+        };
         float drum_bus = 0.0f;
         if (g_bd.env > 1e-4f) {
-            g_bd.env  *= bd_env_dec;
-            g_bd.penv *= bd_penv_dec;
-            // 50 Hz base + 80 Hz pitch sweep = 130→50 Hz, the 808/909 kick shape.
-            float bd_hz = 50.0f + 80.0f * g_bd.penv;
+            g_bd.env   *= bd_env_dec;
+            g_bd.penv  *= bd_penv_dec;
+            g_bd.click *= bd_click_dec;
+            // Wider pitch sweep than the old recipe — 150→50 Hz is the proper
+            // 808 "punch down" range. 100 Hz of excursion over 50 ms gives the
+            // classic low-end "whomp".
+            float bd_hz = 50.0f + 100.0f * g_bd.penv;
             g_bd.phase += bd_hz / sr;
             if (g_bd.phase >= 1.0f) g_bd.phase -= 1.0f;
-            float tone  = std::sin(2.0f * static_cast<float>(M_PI) * g_bd.phase);
-            // Click transient on attack — disappears as pitch_env decays.
-            float click = g_bd.penv * g_bd.penv;
-            drum_bus += (tone * g_bd.env + click * 0.25f) * drum_gain[kDrumBD];
+            float tone = std::sin(2.0f * static_cast<float>(M_PI) * g_bd.phase);
+            // Two attack components: a pitch-envelope-shaped "body click" that
+            // fades with the sweep, plus a very short (~2 ms) noise-free
+            // transient that gives the kick a drum-stick snap on top.
+            float body_click = g_bd.penv * g_bd.penv;
+            float attack     = g_bd.click * g_bd.click;
+            drum_bus += (tone * g_bd.env
+                         + body_click * 0.20f
+                         + attack     * 0.35f)
+                        * drum_gain[kDrumBD];
         }
-        if (g_sd.env > 1e-4f) {
-            g_sd.env      *= sd_env_dec;
-            g_sd.body_env *= sd_body_dec;
-            g_sd.body_phase += 220.0f / sr;
-            if (g_sd.body_phase >= 1.0f) g_sd.body_phase -= 1.0f;
-            float body  = std::sin(2.0f * static_cast<float>(M_PI)
-                                   * g_sd.body_phase) * g_sd.body_env;
-            float noise = rand_bipolar(g_sd.rng);
-            // Gentle HPF gives the noise component "crack" instead of hiss.
-            float nhp = noise - g_sd.hp_x + 0.93f * g_sd.hp_y;
-            g_sd.hp_x = noise; g_sd.hp_y = nhp;
-            drum_bus += (body * 0.55f + nhp * 0.8f) * g_sd.env
-                        * drum_gain[kDrumSD];
+        if (g_sd.env > 1e-4f || g_sd.noise_env > 1e-4f) {
+            g_sd.env       *= sd_env_dec;
+            g_sd.body_env  *= sd_body_dec;
+            g_sd.noise_env *= sd_noise_dec;
+            // Two-tone body — 180 + 330 Hz — closer to a real snare's dual
+            // membrane fundamentals than the old single 220 Hz tone.
+            g_sd.body_phase1 += 180.0f / sr;
+            g_sd.body_phase2 += 330.0f / sr;
+            if (g_sd.body_phase1 >= 1.0f) g_sd.body_phase1 -= 1.0f;
+            if (g_sd.body_phase2 >= 1.0f) g_sd.body_phase2 -= 1.0f;
+            float body = (std::sin(2.0f * static_cast<float>(M_PI) * g_sd.body_phase1)
+                        + std::sin(2.0f * static_cast<float>(M_PI) * g_sd.body_phase2) * 0.6f)
+                        * g_sd.body_env;
+            // Two cascaded bandpass-ish one-poles give the noise a 1.5k/4k
+            // shape — the "crack + sizzle" profile the old single-HPF missed.
+            float n = rand_bipolar(g_sd.rng);
+            float b1 = n - g_sd.bp_x1 + 0.80f * g_sd.bp_y1;
+            g_sd.bp_x1 = n; g_sd.bp_y1 = b1;
+            float b2 = b1 - g_sd.bp_x2 + 0.60f * g_sd.bp_y2;
+            g_sd.bp_x2 = b1; g_sd.bp_y2 = b2;
+            drum_bus += (body * 0.50f + b2 * 0.85f * g_sd.noise_env)
+                        * g_sd.env * drum_gain[kDrumSD];
         }
-        if (g_ch.env > 1e-4f) {
-            g_ch.env *= ch_env_dec;
-            float n  = rand_bipolar(g_ch.rng);
-            float h  = n - g_ch.hp_x + 0.97f * g_ch.hp_y;
-            g_ch.hp_x = n; g_ch.hp_y = h;
-            drum_bus += h * g_ch.env * drum_gain[kDrumCH];
-        }
-        if (g_oh.env > 1e-4f) {
-            g_oh.env *= oh_env_dec;
-            float n  = rand_bipolar(g_oh.rng);
-            float h  = n - g_oh.hp_x + 0.95f * g_oh.hp_y;
-            g_oh.hp_x = n; g_oh.hp_y = h;
-            drum_bus += h * g_oh.env * drum_gain[kDrumOH];
-        }
+        // Hat oscillator (shared between CH / OH). 6 squares at inharmonic
+        // ratios summed, then passed through a resonant bandpass around 8 kHz
+        // and an HPF to clear the low-mid mud. Mixed with a little white noise
+        // so the attack has some hiss on top of the metallic body.
+        auto render_hat = [&](DrumHat& h, float env_dec, float hpf_a) -> float {
+            if (!(h.env > 1e-4f)) return 0.0f;
+            h.env *= env_dec;
+            float metal = 0.0f;
+            for (int i = 0; i < 6; ++i) {
+                h.phase[i] += kHatPitches[i] / sr;
+                if (h.phase[i] >= 1.0f) h.phase[i] -= 1.0f;
+                metal += (h.phase[i] < 0.5f) ? 1.0f : -1.0f;
+            }
+            metal *= (1.0f / 6.0f);
+            // Bandpass — simple resonant one-pole pair centered near 8 kHz
+            // emphasises the "tss" component while letting the metal tone
+            // carry the body.
+            float bp = metal - h.bp_x + 0.55f * h.bp_y;
+            h.bp_x = metal; h.bp_y = bp;
+            // Noise injection — 30% white mixed into the metal to humanise
+            // the otherwise-repetitive square stack.
+            float n  = rand_bipolar(h.rng);
+            float mix = bp * 0.7f + n * 0.3f;
+            // Output HPF — rolls off everything below ~500 Hz so the hat
+            // doesn't mud the mix when it layers with the kick.
+            float out = mix - h.hp_x + hpf_a * h.hp_y;
+            h.hp_x = mix; h.hp_y = out;
+            return out * h.env;
+        };
+        drum_bus += render_hat(g_ch, ch_env_dec, 0.97f) * drum_gain[kDrumCH];
+        drum_bus += render_hat(g_oh, oh_env_dec, 0.95f) * drum_gain[kDrumOH];
         if (g_cl.env > 1e-4f || g_cl.tail_env > 1e-4f) {
             g_cl.env      *= cl_env_dec;
             g_cl.tail_env *= cl_tail_dec;
@@ -1068,11 +1330,154 @@ void render(float* out, int frames) {
                 }
             }
             float n = rand_bipolar(g_cl.rng);
-            // Gentler HPF (0.85) keeps more body — a clap is "thicker" than a hat.
-            float h = n - g_cl.hp_x + 0.85f * g_cl.hp_y;
-            g_cl.hp_x = n; g_cl.hp_y = h;
-            float amp = std::max(g_cl.env, g_cl.tail_env * 0.3f);
-            drum_bus += h * amp * drum_gain[kDrumCL];
+            // Bandpass around ~1.3 kHz gives the tail the cupped-hands body
+            // a real clap has. Coefficients picked to emphasise 1k-2k.
+            float b = n - g_cl.bp_x + 0.88f * g_cl.bp_y;
+            g_cl.bp_x = n; g_cl.bp_y = b;
+            float amp = std::max(g_cl.env, g_cl.tail_env * 0.35f);
+            drum_bus += b * amp * drum_gain[kDrumCL];
+        }
+        // Toms — pitched sines with small pitch envelope. Same structure as
+        // BD but longer decay and narrower sweep so the pitch stays obvious.
+        auto render_tom = [&](DrumTom& t, float env_dec, float penv_dec) -> float {
+            if (!(t.env > 1e-4f)) return 0.0f;
+            t.env  *= env_dec;
+            t.penv *= penv_dec;
+            float hz = t.base_hz + (t.peak_hz - t.base_hz) * t.penv;
+            t.phase += hz / sr;
+            if (t.phase >= 1.0f) t.phase -= 1.0f;
+            float s = std::sin(2.0f * static_cast<float>(M_PI) * t.phase);
+            // Tiny click adds initial transient without the tom losing its tuned character.
+            float click = t.penv * t.penv * 0.18f;
+            return (s * t.env + click) * t.env;
+        };
+        drum_bus += render_tom(g_lt, lt_env_dec, lt_penv_dec) * drum_gain[kDrumLT];
+        drum_bus += render_tom(g_ht, ht_env_dec, ht_penv_dec) * drum_gain[kDrumHT];
+        if (g_rs.env > 1e-4f) {
+            g_rs.env *= rs_env_dec;
+            g_rs.sine1_phase += 1650.0f / sr;
+            g_rs.sine2_phase += 2200.0f / sr;
+            if (g_rs.sine1_phase >= 1.0f) g_rs.sine1_phase -= 1.0f;
+            if (g_rs.sine2_phase >= 1.0f) g_rs.sine2_phase -= 1.0f;
+            float s1 = std::sin(2.0f * static_cast<float>(M_PI) * g_rs.sine1_phase);
+            float s2 = std::sin(2.0f * static_cast<float>(M_PI) * g_rs.sine2_phase);
+            float n  = rand_bipolar(g_rs.rng);
+            // High bandpass — noise component lives 1.5–2.5 kHz along with the sines.
+            float b  = n - g_rs.bp_x + 0.72f * g_rs.bp_y;
+            g_rs.bp_x = n; g_rs.bp_y = b;
+            float body = s1 * 0.5f + s2 * 0.5f + b * 0.6f;
+            drum_bus += body * g_rs.env * drum_gain[kDrumRS];
+        }
+        if (g_cb.env > 1e-4f) {
+            g_cb.env *= cb_env_dec;
+            // Two detuned squares — the 540/800 Hz ratio is the signature 808
+            // cowbell. Unblepped: these are low enough that a naive square
+            // doesn't alias audibly.
+            g_cb.phase1 += 540.0f / sr;
+            g_cb.phase2 += 800.0f / sr;
+            if (g_cb.phase1 >= 1.0f) g_cb.phase1 -= 1.0f;
+            if (g_cb.phase2 >= 1.0f) g_cb.phase2 -= 1.0f;
+            float sq1 = (g_cb.phase1 < 0.5f) ? 1.0f : -1.0f;
+            float sq2 = (g_cb.phase2 < 0.5f) ? 1.0f : -1.0f;
+            float m   = (sq1 + sq2) * 0.5f;
+            // Bandpass keeps the mid-range body and drops the harsh square edges.
+            float b = m - g_cb.bp_x + 0.70f * g_cb.bp_y;
+            g_cb.bp_x = m; g_cb.bp_y = b;
+            drum_bus += b * g_cb.env * drum_gain[kDrumCB];
+        }
+        if (g_sh.env > 1e-4f) {
+            g_sh.env *= sh_env_dec;
+            // Shaker: white noise through a resonant bandpass ~4 kHz then a
+            // gentle HPF so low-mid rattle doesn't muddy the kick. The env²
+            // shape gives it a fast percussive snap rather than a linear fade.
+            float n  = rand_bipolar(g_sh.rng);
+            float bp = n - g_sh.bp_x + 0.60f * g_sh.bp_y;
+            g_sh.bp_x = n; g_sh.bp_y = bp;
+            float out = bp - g_sh.hp_x + 0.93f * g_sh.hp_y;
+            g_sh.hp_x = bp; g_sh.hp_y = out;
+            drum_bus += out * (g_sh.env * g_sh.env) * drum_gain[kDrumSH];
+        }
+        if (g_tb.env > 1e-4f) {
+            g_tb.env *= tb_env_dec;
+            // Tambourine: two parallel bandpasses on white noise give "body"
+            // (~4 kHz jingle) and "shimmer" (~8 kHz). Summed roughly equal so
+            // the hit reads as bright without being harsh.
+            float n   = rand_bipolar(g_tb.rng);
+            float b1  = n - g_tb.bp1_x + 0.72f * g_tb.bp1_y;
+            g_tb.bp1_x = n; g_tb.bp1_y = b1;
+            float b2  = n - g_tb.bp2_x + 0.45f * g_tb.bp2_y;
+            g_tb.bp2_x = n; g_tb.bp2_y = b2;
+            drum_bus += (b1 * 0.55f + b2 * 0.75f) * g_tb.env * drum_gain[kDrumTB];
+        }
+        if (g_cg.env > 1e-4f) {
+            g_cg.env  *= cg_env_dec;
+            g_cg.penv *= cg_penv_dec;
+            // Conga: 260→340 Hz pitch sweep gives the hand-slap attack pitch.
+            // Click transient (penv²) doubles the initial impact like a real
+            // conga's skin strike.
+            float hz = 260.0f + 80.0f * g_cg.penv;
+            g_cg.phase += hz / sr;
+            if (g_cg.phase >= 1.0f) g_cg.phase -= 1.0f;
+            float s = std::sin(2.0f * static_cast<float>(M_PI) * g_cg.phase);
+            float click = g_cg.penv * g_cg.penv * 0.25f;
+            drum_bus += (s * g_cg.env + click) * g_cg.env * drum_gain[kDrumCG];
+        }
+        drum_bus += render_tom(g_mt, mt_env_dec, mt_penv_dec) * drum_gain[kDrumMT];
+        // Cymbals — shared recipe with the hat (6 inharmonic squares + BP),
+        // but with longer decays, wider bandpass and, for RD, a sine "ping"
+        // on the attack so the bell rings above the noise. Uses the same
+        // kHatPitches table as CH/OH so the whole cymbal section shares a
+        // consistent metallic signature.
+        auto render_cym = [&](DrumCym& c, float env_dec, float ping_dec,
+                              float bp_res, float hpf_a) -> float {
+            if (!(c.env > 1e-4f) && !(c.ping > 1e-4f)) return 0.0f;
+            c.env  *= env_dec;
+            c.ping *= ping_dec;
+            float metal = 0.0f;
+            for (int i = 0; i < 6; ++i) {
+                c.phase[i] += kHatPitches[i] / sr;
+                if (c.phase[i] >= 1.0f) c.phase[i] -= 1.0f;
+                metal += (c.phase[i] < 0.5f) ? 1.0f : -1.0f;
+            }
+            metal *= (1.0f / 6.0f);
+            float bp = metal - c.bp_x + bp_res * c.bp_y;
+            c.bp_x = metal; c.bp_y = bp;
+            float n  = rand_bipolar(c.rng);
+            // Crash leans noisier (0.55 noise vs 0.45 metal) so the hit
+            // reads as a splash; ride leans cleaner so the ping stays
+            // audible under steady 8th-note playing.
+            float noise_mix = (c.ping_hz > 0.0f) ? 0.35f : 0.55f;
+            float mix = bp * (1.0f - noise_mix) + n * noise_mix;
+            float out = mix - c.hp_x + hpf_a * c.hp_y;
+            c.hp_x = mix; c.hp_y = out;
+            // Ride ping: short pure sine on the attack, panned under the
+            // metallic wash so each ride hit has a pitched "bell" transient.
+            float ping_sig = 0.0f;
+            if (c.ping_hz > 0.0f) {
+                c.ping_ph += c.ping_hz / sr;
+                if (c.ping_ph >= 1.0f) c.ping_ph -= 1.0f;
+                ping_sig = std::sin(2.0f * static_cast<float>(M_PI) * c.ping_ph)
+                         * c.ping * 0.45f;
+            }
+            return out * c.env + ping_sig;
+        };
+        // Crash: wide BP (low res), bright HPF → big splash. Ride: tight BP,
+        // darker HPF so the ping carries without competing with the noise.
+        drum_bus += render_cym(g_cy, cy_env_dec, cy_ping_dec, 0.30f, 0.90f)
+                    * drum_gain[kDrumCY];
+        drum_bus += render_cym(g_rd, rd_env_dec, rd_ping_dec, 0.55f, 0.85f)
+                    * drum_gain[kDrumRD];
+        if (g_bg.env > 1e-4f) {
+            g_bg.env  *= bg_env_dec;
+            g_bg.penv *= bg_penv_dec;
+            // Bongo: pitched one octave above the conga so a CG/BG pair
+            // reads as two distinct drums. Same sine + click recipe.
+            float hz = 380.0f + 90.0f * g_bg.penv;
+            g_bg.phase += hz / sr;
+            if (g_bg.phase >= 1.0f) g_bg.phase -= 1.0f;
+            float s = std::sin(2.0f * static_cast<float>(M_PI) * g_bg.phase);
+            float click = g_bg.penv * g_bg.penv * 0.30f;
+            drum_bus += (s * g_bg.env + click) * g_bg.env * drum_gain[kDrumBG];
         }
         y_hpf += drum_bus;
 
@@ -1133,6 +1538,19 @@ void render(float* out, int frames) {
         uint32_t w = g_scope_w.load(std::memory_order_relaxed);
         g_scope_buf[w & (kScopeRingSize - 1)] = y_out;
         g_scope_w.store(w + 1, std::memory_order_release);
+
+        // Live-record tap: linear append into the preallocated capture buffer
+        // while the flag is on. No allocation, no I/O — just a bounded store.
+        if (g_rec_on.load(std::memory_order_acquire)) {
+            uint32_t rw  = g_rec_w.load(std::memory_order_relaxed);
+            uint32_t cap = g_rec_cap.load(std::memory_order_relaxed);
+            if (g_rec_buf && rw < cap) {
+                g_rec_buf[rw] = y_out;
+                g_rec_w.store(rw + 1, std::memory_order_release);
+            } else {
+                g_rec_overflow.store(true, std::memory_order_relaxed);
+            }
+        }
 
         float abs_y = std::fabs(y_out);
         if (abs_y > g_peak_env) g_peak_env = abs_y;
@@ -1565,9 +1983,21 @@ int acid_render_wav(const char* path,
     // previous bounce. Masks are preserved (the drum pattern bounces too).
     acid::g_bd = acid::DrumBD{};
     acid::g_sd = acid::DrumSD{};
-    acid::g_ch = acid::DrumHH{ .rng = 0x1b873593u };
-    acid::g_oh = acid::DrumHH{ .rng = 0xcc9e2d51u };
+    acid::g_ch = acid::DrumHat{ .rng = 0x1b873593u };
+    acid::g_oh = acid::DrumHat{ .rng = 0xcc9e2d51u };
     acid::g_cl = acid::DrumCL{};
+    acid::g_lt = acid::DrumTom{ .base_hz = 80.0f,  .peak_hz = 110.0f, .env_tc = 0.30f, .penv_tc = 0.080f };
+    acid::g_ht = acid::DrumTom{ .base_hz = 180.0f, .peak_hz = 230.0f, .env_tc = 0.22f, .penv_tc = 0.060f };
+    acid::g_rs = acid::DrumRS{};
+    acid::g_cb = acid::DrumCB{};
+    acid::g_sh = acid::DrumSH{};
+    acid::g_tb = acid::DrumTB{};
+    acid::g_cg = acid::DrumCG{};
+    acid::g_mt = acid::DrumTom{
+        .base_hz = 128.0f, .peak_hz = 160.0f, .env_tc = 0.26f, .penv_tc = 0.070f };
+    acid::g_cy = acid::DrumCym{ .ping_hz = 0.0f,   .rng = 0x9d2c5680u };
+    acid::g_rd = acid::DrumCym{ .ping_hz = 420.0f, .rng = 0xefc60000u };
+    acid::g_bg = acid::DrumBongo{};
 
     // Load the pattern into the audio-thread sequencer. `notes[i]` carries
     // the same 32-bit layout the audio thread reads back — midi in the low
@@ -1620,6 +2050,104 @@ int acid_render_wav(const char* path,
 
     std::fclose(f);
     return 0;
+}
+
+// ── Live recorder ───────────────────────────────────────────────────────────
+// Unlike acid_render_wav (which synthesises offline), this captures the
+// audio-thread output in real time so every knob tweak, jammed note, and
+// MIDI-input hit winds up on tape. Allocation is UI-side, freeing is UI-side,
+// and the audio thread only appends to a preallocated buffer while a flag is
+// set — so there's no allocation or blocking on the render path.
+int acid_record_begin(int max_seconds) {
+    if (acid::g_rec_on.load(std::memory_order_acquire)) return -1;
+    if (max_seconds <= 0) max_seconds = 60;
+    // Clamp so a careless call can't OOM — 1 hour @ 48 kHz = ~690 MB raw.
+    if (max_seconds > 3600) max_seconds = 3600;
+
+    const int      sr  = acid::sample_rate();
+    const uint32_t cap = static_cast<uint32_t>(sr) *
+                         static_cast<uint32_t>(max_seconds);
+    float* buf = nullptr;
+    try { buf = new float[cap]; }
+    catch (...) { return -1; }
+
+    acid::g_rec_buf = buf;
+    acid::g_rec_cap.store(cap, std::memory_order_relaxed);
+    acid::g_rec_w.store(0,   std::memory_order_relaxed);
+    acid::g_rec_overflow.store(false, std::memory_order_relaxed);
+    // Release: everything above must be visible before the audio thread
+    // sees the flag flip.
+    acid::g_rec_on.store(true, std::memory_order_release);
+    return 0;
+}
+
+int acid_record_end(const char* path) {
+    if (!path) return -1;
+    if (!acid::g_rec_on.load(std::memory_order_acquire) && !acid::g_rec_buf)
+        return -1;
+
+    // Flip the flag off first so the audio thread stops appending.
+    acid::g_rec_on.store(false, std::memory_order_release);
+    // Give the audio thread one render block to finish any in-flight write.
+    // kBufFrames @ 44.1 kHz ≈ 5.8 ms; sleep 20 ms for plenty of margin.
+    // (Using a simple busy-ish spin via a C++11 sleep keeps the header light.)
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    uint32_t frames = acid::g_rec_w.load(std::memory_order_acquire);
+    float*   buf    = acid::g_rec_buf;
+    acid::g_rec_buf = nullptr;
+    acid::g_rec_cap.store(0, std::memory_order_relaxed);
+
+    if (!buf) return -1;
+    if (frames == 0) { delete[] buf; return -1; }
+
+    FILE* f = std::fopen(path, "wb");
+    if (!f) { delete[] buf; return -1; }
+
+    const int sr = acid::sample_rate();
+    auto write_u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
+    auto write_u16 = [&](uint16_t v) { std::fwrite(&v, 2, 1, f); };
+    uint32_t data_bytes = frames * 2u;
+    std::fwrite("RIFF", 1, 4, f);
+    write_u32(36u + data_bytes);
+    std::fwrite("WAVEfmt ", 1, 8, f);
+    write_u32(16);
+    write_u16(1);
+    write_u16(1);
+    write_u32(static_cast<uint32_t>(sr));
+    write_u32(static_cast<uint32_t>(sr * 2));
+    write_u16(2);
+    write_u16(16);
+    std::fwrite("data", 1, 4, f);
+    write_u32(data_bytes);
+
+    constexpr uint32_t kChunk = 4096;
+    std::vector<int16_t> out16(kChunk);
+    uint32_t written = 0;
+    while (written < frames) {
+        uint32_t n = std::min(kChunk, frames - written);
+        for (uint32_t i = 0; i < n; ++i) {
+            float s = std::clamp(buf[written + i], -1.0f, 1.0f);
+            out16[i] = static_cast<int16_t>(s * 32767.0f);
+        }
+        std::fwrite(out16.data(), 2, n, f);
+        written += n;
+    }
+    std::fclose(f);
+    delete[] buf;
+    return 0;
+}
+
+int acid_is_recording(void) {
+    return acid::g_rec_on.load(std::memory_order_acquire) ? 1 : 0;
+}
+
+float acid_record_seconds(void) {
+    if (!acid::g_rec_on.load(std::memory_order_acquire)) return 0.0f;
+    uint32_t w = acid::g_rec_w.load(std::memory_order_relaxed);
+    int sr = acid::sample_rate();
+    if (sr <= 0) return 0.0f;
+    return static_cast<float>(w) / static_cast<float>(sr);
 }
 
 }  // extern "C"

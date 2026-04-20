@@ -388,17 +388,21 @@ Notes don't play when **playback is stopped** — editing is silent. To audition
 
 ## 8. The drum machine
 
-Five synthesized drum voices that run alongside the 303, each with its own 16-step lane. The voices are **generated**, not sampled — the engine cost per voice is a handful of envelopes plus a noise LFSR. No samples on disk.
+Nine synthesized drum voices that run alongside the 303, each with its own 16-step lane. The voices are **generated**, not sampled — the engine cost per voice is a handful of envelopes plus a noise LFSR or a small oscillator bank. No samples on disk.
 
 | Row | Voice | What it is |
 |---|---|---|
-| 1 | **BD** | Kick — sine with a fast pitch envelope (50 Hz base, ~35 ms sweep) and a ~120 ms amp decay. |
-| 2 | **SD** | Snare — short pitched "body" tone (triangle + fast pitch drop) summed with HP-filtered white noise. |
-| 3 | **CH** | Closed hat — dense HP-filtered noise with a tight envelope. |
-| 4 | **OH** | Open hat — same noise source as CH but with a long amp decay. |
-| 5 | **CL** | 808-style clap — 3 fast noise bursts spaced ~12 ms apart, plus a long dense-noise tail. |
+| 1 | **BD** | Kick — sine with a 150→50 Hz pitch sweep, ~50 ms sweep / ~200 ms amp decay, plus a 2 ms transient click for the initial snap. |
+| 2 | **SD** | Snare — two-tone body (180 + 330 Hz sines, fast decay) summed with cascaded-bandpass noise (~1.5k / 4k emphasis). |
+| 3 | **CH** | Closed hat — 808-style six-square metallic oscillator (205/370/540/775/1050/1400 Hz) through a bandpass + HPF with a dash of white-noise hiss. Tight ~25 ms env. |
+| 4 | **OH** | Open hat — same metallic oscillator as CH but with a ~320 ms envelope. |
+| 5 | **CL** | 808-style clap — 3 fast noise bursts spaced ~12 ms apart, plus a ~280 ms bandpassed (~1.3 kHz) dense-noise tail. |
+| 6 | **LT** | Low tom — 80 Hz sine with a narrow pitch sweep (110→80 Hz) and a 300 ms amp decay. Pitched percussion. |
+| 7 | **HT** | High tom — 180 Hz sine, 230→180 Hz sweep, 220 ms amp decay. |
+| 8 | **RS** | Rimshot — 1.65 kHz + 2.2 kHz sines plus a bandpassed noise burst, 18 ms decay. Sharp transient click. |
+| 9 | **CB** | 808 cowbell — two detuned squares (540 + 800 Hz) through a bandpass, 180 ms decay. Classic metallic "clonk". |
 
-All five voices sum into a **master drum bus** that feeds the FX chain (delay + reverb) alongside the 303 voice. Per-voice gains are baked to sit right when the bass is at defaults; a global drum-bus knob `[ / ]` scales everything.
+All nine voices sum into a **master drum bus** that feeds the FX chain (delay + reverb) alongside the 303 voice. Per-voice gains are baked to sit right when the bass is at defaults; a global drum-bus knob `[ / ]` scales everything.
 
 ### Editing the grid
 

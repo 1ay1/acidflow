@@ -527,6 +527,9 @@ struct RichText {
         .border(BorderStyle::Round)
         .border_color(border_col)
         .border_text(" TRANSPORT ", BorderTextPos::Top)
+        .basis(Dimension::fixed(0))
+        .min_width(Dimension::fixed(0))
+        .overflow(Overflow::Hidden)
         .padding(1, 2, 1, 2)(std::move(body));
 }
 
