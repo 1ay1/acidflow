@@ -134,6 +134,63 @@ The audio thread runs `acid::render(buf, 256)` and blocks on the OS device. The 
 
 If you want the deep version of all of that, plus every keystroke documented and every knob explained — that's in **[MANUAL.md](MANUAL.md)**.
 
+## AI-generated patterns
+
+acidflow's slot files are plain text — easy for an AI to write. Paste this prompt into Claude, ChatGPT, or any LLM:
+
+```
+Generate an acidflow v8 slot file for: [describe the vibe]
+Examples: "dark minimal techno, 130 BPM, heavy resonance"
+          "funky rolling bassline, 122 BPM, lots of slides"
+          "sparse industrial, 138 BPM, low cutoff, dry"
+
+The format is:
+
+# acidflow pattern v8
+<pattern_length> <bpm>
+[16 step lines: note rest accent slide prob ratchet lockmask lockC lockR lockE lockA]
+drums <master_gain>
+[16 drum rows (BD SD CH OH CL LT HT RS CB SH TB CG MT CY RD BG), each: 16 space-separated 0/1 values]
+knobs <swing> <wave> <tune> <cutoff> <resonance> <env_mod> <decay> <accent> <drive> <volume>
+fx <od_amt> <delay_mix> <delay_fb> <delay_div> <rev_mix> <rev_size> <rev_damp>
+
+Field rules:
+  note       MIDI note number — 36=C2 (bass root), 48=C3, 60=C4. Typical range 36–60.
+  rest       0 or 1 (1 = silence this step)
+  accent     0 or 1 (louder + faster filter sweep, stacks on back-to-back hits)
+  slide      0 or 1 (legato portamento into this step, τ ≈ 88 ms)
+  prob       0–100 (% chance the step fires; 100 = always)
+  ratchet    1–4 (sub-triggers per step; 1 = normal, 4 = quad 32nd-note burst)
+  lockmask   0–15 bitmask — bit0=cutoff, bit1=res, bit2=env-mod, bit3=accent p-lock active
+  lockC/R/E/A  0.0–1.0 (p-lock override values, only applied when the corresponding bit is set)
+
+  swing      0.50 = straight 16ths, 0.62 = classic MPC swing, 0.75 = hard shuffle
+  wave       0 = sawtooth, 1 = square
+  tune       0.0–1.0 (maps to ±12 semitones; 0.5 = centre/concert pitch)
+  cutoff     0.0–1.0 (13 Hz at 0, ~5 kHz at 1 — keep 0.2–0.6 for most acid patches)
+  resonance  0.0–1.0 (self-oscillates above ~0.9; 0.6–0.85 is the classic squelch zone)
+  env_mod    0.0–1.0 (envelope modulation depth; 0.5–0.8 for screaming sweeps)
+  decay      0.0–1.0 (filter/amp decay; 0.0 ≈ 0.2 s, 1.0 ≈ 2 s)
+  accent     0.0–1.0 (accent intensity)
+  drive      0.0–1.0 (pre-filter saturation; 0 = clean, 0.5+ = gritty)
+  volume     0.0–1.0
+  od_amt     0.0–1.0 (master-bus overdrive; 0 = bypass)
+  delay_mix  0.0–1.0 (0 = dry)
+  delay_fb   0.0–1.0 (delay feedback; 0.3–0.5 typical)
+  delay_div  0=1/16, 1=1/16 dotted, 2=1/8, 3=1/8 dotted
+  rev_mix    0.0–1.0 (0 = dry)
+  rev_size   0.0–1.0 (reverb decay time)
+  rev_damp   0.0–1.0 (high-frequency damping; 0 = bright, 1 = dark)
+  master_gain  0.0–1.5 for the drum bus
+```
+
+Save the output as `slot1.txt` (or `slot2.txt` … `slot9.txt`) in:
+
+- **Linux / macOS:** `~/.config/acidflow/`
+- **Windows:** `%APPDATA%\acidflow\`
+
+Then press `1`–`9` in acidflow to load it. Use `Shift-1`…`Shift-9` to overwrite a slot with your current session.
+
 ## Built on
 
 - **[maya](https://github.com/1ay1/maya)** — the C++26 TUI framework that does the rendering, layout, and event loop.

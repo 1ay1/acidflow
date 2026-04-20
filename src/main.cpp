@@ -1357,11 +1357,10 @@ static bool save_pattern_slot(int slot) {
     std::ofstream f(pattern_path(slot));
     if (!f) return false;
 
-    // v7: same header and step lines as prior versions, but the trailing
-    // drum block has kDrumVoices (16) rows. Older readers just bail at EOF
-    // — v4 consumes 5, v5 consumes 9, v6 consumes 12; trailing rows are
-    // additive and leave unknown voices silent.
-    f << "# acidflow pattern v7\n";
+    // v8: adds knobs + fx lines after the drum block so v4-v7 readers stop
+    // at EOF cleanly. v7 had kDrumVoices (16) drum rows; v8 keeps that and
+    // appends swing/wave/tune/knobs and od/delay/reverb FX params.
+    f << "# acidflow pattern v8\n";
     f << g_pattern_length << " " << g_bpm << "\n";
     // Per-step line (v3+):
     //   note rest accent slide prob ratchet lockmask lockC lockR lockE lockA
@@ -1386,6 +1385,16 @@ static bool save_pattern_slot(int slot) {
         }
         f << "\n";
     }
+    // v8 knobs + FX block — appended after drums so v4-v7 readers stop at EOF
+    // cleanly. The wave field is an int; all others are floats on [0..1] except
+    // delay_div (0..3) which is also an int.
+    f << "knobs " << g_swing << " " << g_wave << " " << g_tune
+      << " " << g_cutoff    << " " << g_resonance << " " << g_env_mod
+      << " " << g_decay     << " " << g_accent    << " " << g_drive
+      << " " << g_volume    << "\n";
+    f << "fx " << g_od_amt   << " " << g_delay_mix << " " << g_delay_fb
+      << " " << g_delay_div  << " " << g_rev_mix   << " " << g_rev_size
+      << " " << g_rev_damp   << "\n";
     bool ok = static_cast<bool>(f);
     if (ok) {
         char buf[32];
@@ -1403,10 +1412,11 @@ static bool load_pattern_slot(int slot, bool quiet = false) {
     std::getline(f, header);
     // v2 adds trailing prob+ratchet; v3 adds p-lock fields; v4 adds a drum
     // block (5 voices); v5 extends drums to 9; v6 extends to 12 (SH/TB/CG);
-    // v7 extends to 16 (MT/CY/RD/BG). The reader below always consumes up
-    // to kDrumVoices rows and bails at EOF, so older files just leave the
-    // newer voices empty.
-    bool v7 = header.find("v7") != std::string::npos;
+    // v7 extends to 16 (MT/CY/RD/BG); v8 adds knobs + fx lines after drums.
+    // The reader always consumes up to kDrumVoices rows and bails at EOF,
+    // so older files leave newer voices empty.
+    bool v8 = header.find("v8") != std::string::npos;
+    bool v7 = v8 || header.find("v7") != std::string::npos;
     bool v6 = v7 || header.find("v6") != std::string::npos;
     bool v5 = v6 || header.find("v5") != std::string::npos;
     bool v4 = v5 || header.find("v4") != std::string::npos;
@@ -1471,6 +1481,39 @@ static bool load_pattern_slot(int slot, bool quiet = false) {
                     g_drums[static_cast<size_t>(v)][static_cast<size_t>(i)] = x != 0;
                 }
                 if (!row_ok) break;      // short file → leave remaining voices empty
+            }
+        }
+    }
+    // v8: knobs + FX lines appended after the drum block.
+    if (v8) {
+        std::string tag;
+        if (f >> tag && tag == "knobs") {
+            float sw, tune, cut, res, em, dec, acc, drv, vol;
+            int   wav;
+            if (f >> sw >> wav >> tune >> cut >> res >> em >> dec >> acc >> drv >> vol) {
+                g_swing      = std::clamp(sw,   0.50f, 0.75f);
+                g_wave       = std::clamp(wav, 0, 1);
+                g_tune       = std::clamp(tune, 0.0f, 1.0f);
+                g_cutoff     = std::clamp(cut,  0.0f, 1.0f);
+                g_resonance  = std::clamp(res,  0.0f, 1.0f);
+                g_env_mod    = std::clamp(em,   0.0f, 1.0f);
+                g_decay      = std::clamp(dec,  0.0f, 1.0f);
+                g_accent     = std::clamp(acc,  0.0f, 1.0f);
+                g_drive      = std::clamp(drv,  0.0f, 1.0f);
+                g_volume     = std::clamp(vol,  0.0f, 1.0f);
+            }
+        }
+        if (f >> tag && tag == "fx") {
+            float od, dmix, dfb, rmix, rsize, rdamp;
+            int   ddiv;
+            if (f >> od >> dmix >> dfb >> ddiv >> rmix >> rsize >> rdamp) {
+                g_od_amt    = std::clamp(od,    0.0f, 1.0f);
+                g_delay_mix = std::clamp(dmix,  0.0f, 1.0f);
+                g_delay_fb  = std::clamp(dfb,   0.0f, 1.0f);
+                g_delay_div = std::clamp(ddiv,  0, 3);
+                g_rev_mix   = std::clamp(rmix,  0.0f, 1.0f);
+                g_rev_size  = std::clamp(rsize, 0.0f, 1.0f);
+                g_rev_damp  = std::clamp(rdamp, 0.0f, 1.0f);
             }
         }
     }
