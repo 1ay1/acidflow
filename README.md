@@ -63,7 +63,17 @@ cmake --build build -j
 ./build/acidflow
 ```
 
-macOS and Windows: same recipe — backends are picked automatically.
+macOS: same recipe — the CoreAudio backend is picked automatically.
+
+Windows: use a Visual Studio generator (MSVC toolchain from VS 2022 or 2026) and pass `--config Release` because the generator is multi-config:
+
+```bat
+cmake -B build -G "Visual Studio 18 2026" -A x64
+cmake --build build --config Release
+.\build\Release\acidflow.exe
+```
+
+The CMake script falls back to C++23 under MSVC (current MSVC doesn't advertise `cxx_std_26` to CMake) and adds `_USE_MATH_DEFINES` + `/utf-8` for MSVC only. GCC/Clang builds stay on C++26. Run the binary in a terminal that speaks ANSI + UTF-8 (Windows Terminal, WezTerm, Alacritty) — the legacy `cmd.exe` console won't render it correctly.
 
 ## Quickstart
 

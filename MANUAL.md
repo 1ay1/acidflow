@@ -762,7 +762,7 @@ Every widget is a function returning a `maya::Element`. Per-frame, `render_frame
 
 ## 15. Building from source
 
-### Standard build
+### Standard build (Linux / macOS)
 
 ```bash
 cmake -B build
@@ -770,6 +770,23 @@ cmake --build build -j
 ```
 
 The default build type is `Release` with `-O3 -march=native -funroll-loops` on GCC/Clang, `/O2` on MSVC. The optimization level matters — Debug builds will use measurably more CPU per audio block.
+
+### Windows build
+
+Windows uses a multi-config generator (Visual Studio), so you need to pass `--config` explicitly and launch the binary from the per-config output directory:
+
+```bat
+cmake -B build -G "Visual Studio 18 2026" -A x64
+cmake --build build --config Release
+.\build\Release\acidflow.exe
+```
+
+Two MSVC-only knobs live in `CMakeLists.txt`:
+
+- **C++23 fallback.** Current MSVC (VS 2026 / 19.50) doesn't advertise the `cxx_std_26` language dialect to CMake, so the script drops to C++23 when `MSVC` is defined. GCC/Clang builds remain on C++26. Nothing in the codebase currently requires a C++26-only feature.
+- **`_USE_MATH_DEFINES` + `/utf-8`.** The former exposes `M_PI` (MSVC hides it behind that macro by default); the latter tells `cl.exe` the source is UTF-8 so the Unicode glyphs in `maya/style/border.hpp` don't trigger C4566 warnings.
+
+Run the executable in a terminal that supports ANSI escapes and UTF-8 — Windows Terminal, WezTerm, Alacritty, or similar. The legacy `cmd.exe` console lacks both and will render garbage.
 
 ### Debug build
 

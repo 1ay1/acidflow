@@ -1,7 +1,11 @@
 cmake_minimum_required(VERSION 3.28)
 project(acidflow VERSION 0.1.0 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 26)
+if(MSVC)
+    set(CMAKE_CXX_STANDARD 23)
+else()
+    set(CMAKE_CXX_STANDARD 26)
+endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -59,7 +63,10 @@ target_link_libraries(acidflow PRIVATE maya ${ACIDFLOW_AUDIO_LIBS})
 target_include_directories(acidflow PRIVATE src)
 target_compile_options(acidflow PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O3 -march=native -funroll-loops>
-    $<$<CXX_COMPILER_ID:MSVC>:/O2>
+    $<$<CXX_COMPILER_ID:MSVC>:/O2 /utf-8>
+)
+target_compile_definitions(acidflow PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:_USE_MATH_DEFINES>
 )
 
 # Worker thread in audio_alsa.cpp / audio_wasapi.cpp needs pthreads on
