@@ -130,6 +130,13 @@ static int   g_drum_voice_sel = 0;     // which row (voice) is being edited
 static int   g_drum_step_sel  = 0;     // which step in that row
 static float g_drum_master    = 1.0f;  // drum-bus master send (0 = silent)
 
+// Per-section mute toggles — `m` in any non-sequencer section flips the
+// relevant flag. Sequencer keeps `m` for its per-step rest toggle (each step
+// is its own "channel"). Mutes are applied right before pushing volumes to
+// the engine so the rest of the state stays intact.
+static bool  g_synth_mute  = false;    // silences the 303 voice (knobs/FX/seq)
+static bool  g_drums_mute  = false;    // silences the drum bus
+
 // UI focus
 static Section g_focus      = Section::Sequencer;
 static int     g_knob_sel   = 2;   // K_CUTOFF — the signature 303 knob
@@ -162,6 +169,11 @@ static float g_knob_drag_v0  = 0.0f;
 //   help_ov    — vertical scroll (line offset), bumped by wheel inside the
 //                help overlay modal
 static int   g_help_bar_scroll = 0;
+// Seconds accumulator for the help bar's marquee animation. Every
+// `kHelpBarChipDur` seconds the bar advances by one chip; the builder only
+// applies the rotation when the full chip set is wider than the terminal.
+static float g_help_bar_auto_t   = 0.0f;
+static constexpr float kHelpBarChipDur = 1.2f;
 static int   g_help_ov_scroll  = 0;
 
 static void set_toast(std::string s) {
@@ -705,12 +717,185 @@ static void randomize_pattern() {
     set_toast(buf);
 }
 
-// Randomize everything — fresh knobs AND a fresh pattern. The individual
-// toasts from each helper would stomp each other, so we suppress them and
-// emit a single combined toast. Used by capital-R.
+// ─────────────────────────────────────────────────────────────────────────────
+// FX randomizer — five named archetypes, matched to how the 303 actually gets
+// processed in a rack: DRY (clean), SLAP (close-mic echo), DUB (feedback-
+// soaked delay), CAVERN (plate-reverb wash), DIRTY (overdrive-forward). We
+// pick archetype-friendly ranges so each roll is usable instead of mud.
+// ─────────────────────────────────────────────────────────────────────────────
+static void randomize_fx() {
+    static std::mt19937 rng{std::random_device{}()};
+    auto u = [&](float lo, float hi) {
+        return lo + (hi - lo) * std::uniform_real_distribution<float>(0.0f, 1.0f)(rng);
+    };
+
+    enum Arch { DRY, SLAP, DUB, CAVERN, DIRTY };
+    Arch a = static_cast<Arch>(std::uniform_int_distribution<int>(0, 4)(rng));
+
+    switch (a) {
+        case DRY:
+            g_od_amt    = u(0.00f, 0.10f);
+            g_delay_mix = u(0.00f, 0.10f);
+            g_delay_fb  = u(0.20f, 0.35f);
+            g_delay_div = 2;                // 1/8 — neutral tempo sync
+            g_rev_mix   = u(0.00f, 0.10f);
+            g_rev_size  = u(0.40f, 0.55f);
+            g_rev_damp  = u(0.35f, 0.55f);
+            break;
+        case SLAP:
+            g_od_amt    = u(0.05f, 0.25f);
+            g_delay_mix = u(0.20f, 0.40f);  // audible but never drowning
+            g_delay_fb  = u(0.15f, 0.30f);  // short tail, not regenerative
+            g_delay_div = std::uniform_int_distribution<int>(0, 1)(rng);  // 1/16 or 1/16d
+            g_rev_mix   = u(0.05f, 0.15f);
+            g_rev_size  = u(0.35f, 0.55f);
+            g_rev_damp  = u(0.30f, 0.50f);
+            break;
+        case DUB:
+            g_od_amt    = u(0.10f, 0.30f);
+            g_delay_mix = u(0.35f, 0.55f);  // hefty wet
+            g_delay_fb  = u(0.55f, 0.78f);  // regenerative but not self-osc
+            g_delay_div = std::uniform_int_distribution<int>(2, 3)(rng);  // 1/8 or 1/8d
+            g_rev_mix   = u(0.15f, 0.30f);
+            g_rev_size  = u(0.55f, 0.75f);
+            g_rev_damp  = u(0.40f, 0.65f);
+            break;
+        case CAVERN:
+            g_od_amt    = u(0.00f, 0.15f);
+            g_delay_mix = u(0.00f, 0.20f);
+            g_delay_fb  = u(0.20f, 0.40f);
+            g_delay_div = std::uniform_int_distribution<int>(1, 3)(rng);
+            g_rev_mix   = u(0.45f, 0.70f);  // lush plate
+            g_rev_size  = u(0.70f, 0.95f);  // big room
+            g_rev_damp  = u(0.20f, 0.45f);  // bright, not muffled
+            break;
+        case DIRTY:
+            g_od_amt    = u(0.55f, 0.85f);  // the "pedal grit" setting
+            g_delay_mix = u(0.10f, 0.30f);
+            g_delay_fb  = u(0.25f, 0.50f);
+            g_delay_div = std::uniform_int_distribution<int>(0, 3)(rng);
+            g_rev_mix   = u(0.05f, 0.25f);
+            g_rev_size  = u(0.40f, 0.65f);
+            g_rev_damp  = u(0.35f, 0.60f);
+            break;
+    }
+
+    static const char* kNames[] = {"dry", "slap", "dub", "cavern", "dirty"};
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "\xe2\x86\xbb fx: %s", kNames[a]);
+    set_toast(buf);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Drum randomizer — stylistic groove templates over the 5-voice kit
+// (BD/SD/CH/OH/CL × 16). Rather than scatter bits we lay down a template hit-
+// map per groove and jitter edge steps lightly, so every roll sounds like a
+// real groove and not noise. Voice indices: 0=BD, 1=SD, 2=CH, 3=OH, 4=CL.
+// ─────────────────────────────────────────────────────────────────────────────
+static void randomize_drums() {
+    static std::mt19937 rng{std::random_device{}()};
+    auto chance = [&](float p) {
+        return std::uniform_real_distribution<float>(0.0f, 1.0f)(rng) < p;
+    };
+
+    // Clear first — callers may have a dense pattern we don't want to OR with.
+    for (auto& row : g_drums) for (auto& c : row) c = false;
+
+    enum Groove { FOURFLOOR, HOUSE, TECHNO, BREAKS, MINIMAL };
+    Groove g = static_cast<Groove>(std::uniform_int_distribution<int>(0, 4)(rng));
+
+    auto set = [&](int voice, std::initializer_list<int> steps) {
+        for (int s : steps) g_drums[static_cast<size_t>(voice)][static_cast<size_t>(s)] = true;
+    };
+
+    switch (g) {
+        case FOURFLOOR:
+            // Kick on every quarter, clap on 2/4, closed hat offbeats.
+            set(0, {0, 4, 8, 12});
+            set(1, {4, 12});
+            for (int i = 2; i < 16; i += 4) if (chance(0.8f)) set(2, {i});
+            if (chance(0.4f)) set(3, {6, 14});
+            break;
+        case HOUSE:
+            set(0, {0, 4, 8, 12});
+            set(1, {4, 12});
+            set(2, {2, 6, 10, 14});          // offbeat chh
+            if (chance(0.5f)) set(3, {10});
+            if (chance(0.3f)) set(4, {7, 15});
+            break;
+        case TECHNO:
+            set(0, {0, 4, 8, 12});
+            for (int i = 0; i < 16; ++i)
+                if (i % 2 == 1 && chance(0.6f)) set(2, {i});   // 16ths on odd steps
+            if (chance(0.55f)) set(3, {2, 10});
+            if (chance(0.35f)) set(4, {13});
+            break;
+        case BREAKS:
+            // Syncopated kick + backbeat snare — breakbeat-style, not 4/4.
+            set(0, {0, 6, 10});
+            if (chance(0.5f)) set(0, {14});
+            set(1, {4, 12});
+            for (int i = 0; i < 16; ++i) if (chance(0.55f)) set(2, {i});
+            if (chance(0.4f)) set(3, {7, 15});
+            break;
+        case MINIMAL:
+            // Sparse. One kick per bar, single clap, a few hats.
+            set(0, {0, 8});
+            set(1, {12});
+            for (int i = 0; i < 16; i += 4) if (chance(0.4f)) set(2, {i + 2});
+            break;
+    }
+
+    static const char* kNames[] = {"four-floor", "house", "techno", "breaks", "minimal"};
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "\xe2\x86\xbb drums: %s", kNames[g]);
+    set_toast(buf);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Transport randomizer — tempo / swing / length. Stays inside the musical
+// envelope of actual acid records (115-140 BPM, straight or lightly shuffled,
+// 12/16-step patterns) rather than the full knob ranges, so a roll here
+// doesn't send the groove to 60 BPM or 7-step weirdness.
+// ─────────────────────────────────────────────────────────────────────────────
+static void randomize_transport() {
+    static std::mt19937 rng{std::random_device{}()};
+    auto u = [&](float lo, float hi) {
+        return lo + (hi - lo) * std::uniform_real_distribution<float>(0.0f, 1.0f)(rng);
+    };
+
+    // BPM archetypes clustered around classic scene tempos: house/techno ~125,
+    // acid house ~130, techno ~135, a lazy 118 for downtempo.
+    static constexpr float kBpms[] = {118.0f, 122.0f, 125.0f, 128.0f, 132.0f, 138.0f};
+    g_bpm = kBpms[std::uniform_int_distribution<int>(0, 5)(rng)] + u(-1.5f, 1.5f);
+    g_bpm = std::clamp(g_bpm, 40.0f, 220.0f);
+
+    // Swing: 60% chance straight, 40% gentle shuffle. Never hard swing here —
+    // the `-/=` keys can push it further if the user wants.
+    g_swing = (std::uniform_real_distribution<float>(0.0f, 1.0f)(rng) < 0.6f)
+                ? 0.50f
+                : u(0.54f, 0.62f);
+
+    // Length: bias toward 16 (bar), sometimes 12 (odd meter feel) or 8 (short
+    // loop). 4 and 6 are too short to sound like a finished groove.
+    int r = std::uniform_int_distribution<int>(0, 9)(rng);
+    g_pattern_length = (r < 6) ? 16 : (r < 9) ? 12 : 8;
+
+    char buf[40];
+    std::snprintf(buf, sizeof(buf), "\xe2\x86\xbb transport: %.0f bpm",
+                  static_cast<double>(g_bpm));
+    set_toast(buf);
+}
+
+// Randomize everything — fresh knobs, FX, pattern, drums, and transport. The
+// individual toasts from each helper would stomp each other, so we suppress
+// them and emit a single combined toast. Used by capital-R.
 static void randomize_everything() {
     randomize_knobs();
+    randomize_fx();
     randomize_pattern();
+    randomize_drums();
+    randomize_transport();
     set_toast("\xe2\x86\xbb all randomized");
 }
 
@@ -1410,7 +1595,7 @@ static void push_params() {
     acid_set_decay(g_decay);
     acid_set_accent_amt(g_accent);
     acid_set_drive(g_drive);
-    acid_set_volume(g_volume);
+    acid_set_volume(g_synth_mute ? 0.0f : g_volume);
     acid_set_tuning_semi((g_tune - 0.5f) * 24.0f);
     acid_set_waveform(g_wave);
     acid_set_delay_mix(g_delay_mix);
@@ -1448,14 +1633,30 @@ static void push_params() {
         }
         acid_seq_set_drum_lane(v, mask);
     }
-    acid_seq_set_drum_master(g_drum_master);
+    acid_seq_set_drum_master(g_drums_mute ? 0.0f : g_drum_master);
 }
 
 static void tick(float dt) {
     push_params();
 
+    // Upgrade maya's default mouse tracking (1000 + 1002 = press/release/drag)
+    // to any-event motion (1003) so bare hover deltas are reported. maya's
+    // RunConfig only enables click+drag; we opt into full motion tracking once
+    // the runtime has finished its own terminal init by writing the DECSET
+    // sequence to stdout on the first tick. The teardown ? 1003l runs on exit.
+    static bool motion_on = false;
+    if (!motion_on) {
+        std::fputs("\x1b[?1003h", stdout);
+        std::fflush(stdout);
+        motion_on = true;
+    }
+
     // Toast fade runs whether or not playback is active.
     if (g_toast_t > 0.0f) g_toast_t = std::max(0.0f, g_toast_t - dt);
+
+    // Help-bar marquee clock. Advances whether or not playback is active so
+    // the bar always keeps rotating when narrow terminals clip it.
+    g_help_bar_auto_t += dt;
 
     // Jam-mode gate: terminals don't deliver key-up events, so every live
     // keypress arms a short sustain window and we send the note-off when it
@@ -1800,7 +2001,46 @@ static void handle_mouse(const MouseEvent& m) {
         g_knob_drag_idx = -1;
         return;
     }
-    if (m.kind == MouseEventKind::Move) return;
+
+    // ── Hover focus ────────────────────────────────────────────────────────
+    // Drag the cursor across a panel and the focused section follows — the
+    // bottom help bar and key shortcuts then match what's under the pointer.
+    // We use broad panel regions (not the widget-precise hit_test zones) so
+    // hovering a border, padding cell, or empty gutter still counts; the
+    // user's intent on hover is "this panel", not "this exact knob".
+    if (m.kind == MouseEventKind::Move) {
+        if (g_help_open) return;
+        if (g_term_w <= 0 || g_term_h <= 0) return;
+        int hc = col - 1;       // SGR → 0-indexed
+        int hr = row - 1;
+        if (hr <= 0 || hr >= g_term_h - 1) return;   // title / help bar rows
+
+        // Voice row: synth panel (8/14) vs FX panel (6/14).
+        if (hr >= 1 && hr <= 12) {
+            int avail   = std::max(0, g_term_w - 1);
+            int synth_w = flex_first_share(avail, 8, 14);
+            g_focus = (hc < synth_w) ? Section::Knobs : Section::FX;
+            return;
+        }
+        // Step row: sequencer panel vs drums panel (1:1 split).
+        int step_top = g_term_h - 11;
+        int step_bot = g_term_h - 2;
+        if (hr >= step_top && hr <= step_bot) {
+            int avail = std::max(0, g_term_w - 1);
+            int seq_w = flex_first_share(avail, 1, 2);
+            g_focus = (hc < seq_w) ? Section::Sequencer : Section::Drums;
+            return;
+        }
+        // Middle band: scope (left) vs transport (right), 2:3 split.
+        int mid_top = 13;
+        int mid_bot = step_top - 1;
+        if (hr >= mid_top && hr <= mid_bot) {
+            int split = (g_term_w * 2) / 5;
+            g_focus = (hc >= split) ? Section::Transport : Section::Sequencer;
+            return;
+        }
+        return;
+    }
 
     HitZone z = hit_test(col, row);
 
@@ -2048,8 +2288,13 @@ static void handle_event(const Event& ev) {
     // everything (knobs + pattern) for a full fresh patch + groove combo.
     // The sequencer's previous per-step rest toggle moved to `m` (mute).
     if (key(ev, 'r')) {
-        if (g_focus == Section::Knobs) randomize_knobs();
-        else                           randomize_pattern();
+        switch (g_focus) {
+            case Section::Knobs:     randomize_knobs();     break;
+            case Section::FX:        randomize_fx();        break;
+            case Section::Sequencer: randomize_pattern();   break;
+            case Section::Drums:     randomize_drums();     break;
+            case Section::Transport: randomize_transport(); break;
+        }
         return;
     }
     if (key(ev, 'R')) { randomize_everything(); return; }
@@ -2166,6 +2411,11 @@ static void handle_event(const Event& ev) {
             if (key(ev, '['))               { adjust_knob(g_knob_sel, -0.10f); return; }
             if (key(ev, '0'))               { reset_knob(g_knob_sel); return; }
             if (key(ev, 'w'))               { g_wave = 1 - g_wave; return; }
+            if (key(ev, 'm')) {
+                g_synth_mute = !g_synth_mute;
+                set_toast(g_synth_mute ? "synth muted" : "synth live");
+                return;
+            }
             break;
         }
         case Section::FX: {
@@ -2176,6 +2426,11 @@ static void handle_event(const Event& ev) {
             if (key(ev, ']'))               { adjust_fx(g_fx_sel, +0.10f); return; }
             if (key(ev, '['))               { adjust_fx(g_fx_sel, -0.10f); return; }
             if (key(ev, '0'))               { reset_fx(g_fx_sel); return; }
+            if (key(ev, 'm')) {
+                g_synth_mute = !g_synth_mute;
+                set_toast(g_synth_mute ? "synth muted" : "synth live");
+                return;
+            }
             break;
         }
         case Section::Sequencer: {
@@ -2268,6 +2523,11 @@ static void handle_event(const Event& ev) {
             }
             if (key(ev, '[')) { g_drum_master = std::max(0.0f, g_drum_master - 0.05f); return; }
             if (key(ev, ']')) { g_drum_master = std::min(1.5f, g_drum_master + 0.05f); return; }
+            if (key(ev, 'm')) {
+                g_drums_mute = !g_drums_mute;
+                set_toast(g_drums_mute ? "drums muted" : "drums live");
+                return;
+            }
             // `c` clears the focused row; `C` clears the entire kit. Mirrors
             // the sequencer's `x = clear step` ergonomics at the row level.
             if (key(ev, 'c')) {
@@ -2316,6 +2576,14 @@ static void handle_event(const Event& ev) {
             if (key(ev, '=')) { g_swing = std::min(0.75f, g_swing + 0.02f); return; }
             if (key(ev, ',')) { load_preset(g_preset_index - 1); return; }
             if (key(ev, '.')) { load_preset(g_preset_index + 1); return; }
+            if (key(ev, 'm')) {
+                // Master mute: if either bus is live, silence both; otherwise unmute both.
+                bool any_live = !g_synth_mute || !g_drums_mute;
+                g_synth_mute = any_live;
+                g_drums_mute = any_live;
+                set_toast(any_live ? "all muted" : "all live");
+                return;
+            }
             break;
         }
     }
@@ -2505,13 +2773,15 @@ static Element build_knob_row() {
     // size — so a long focused-knob caption would inflate the SYNTH panel and
     // squeeze the FX panel on the same row. Overflow::Hidden clips any content
     // wider than the allotted slot cleanly.
+    const char* synth_title = g_synth_mute
+        ? " \xe2\x97\x87 SYNTH VOICE \xc2\xb7 MUTED (m) \xe2\x97\x87 "
+        : " \xe2\x97\x87 SYNTH VOICE \xc2\xb7 VCO\xe2\x86\x92VCF\xe2\x86\x92VCA"
+          " \xc2\xb7 24 dB/oct LADDER \xe2\x97\x87 ";
     return dsl::vstack()
         .border(BorderStyle::Round)
-        .border_color(g_focus == Section::Knobs ? tb303::clr_accent() : tb303::clr_panel_hi())
-        .border_text(
-            " \xe2\x97\x87 SYNTH VOICE \xc2\xb7 VCO\xe2\x86\x92VCF\xe2\x86\x92VCA"
-            " \xc2\xb7 24 dB/oct LADDER \xe2\x97\x87 ",   // ◇ SYNTH VOICE · VCO→VCF→VCA · 24 dB/oct LADDER ◇
-            BorderTextPos::Top)
+        .border_color(g_synth_mute ? tb303::clr_dim()
+                      : g_focus == Section::Knobs ? tb303::clr_accent() : tb303::clr_panel_hi())
+        .border_text(synth_title, BorderTextPos::Top)
         .align_self(Align::Stretch)
         .basis(Dimension::fixed(0))
         .min_width(Dimension::fixed(0))
@@ -2658,12 +2928,14 @@ static Element build_fx_row() {
 
     // Same basis/min_width pin as the SYNTH panel — keeps this panel's width
     // strictly at its flex-grow share (6/14) regardless of caption length.
+    const char* fx_title = g_synth_mute
+        ? " \xe2\x97\x87 FX RACK \xc2\xb7 MUTED (m) \xe2\x97\x87 "
+        : " \xe2\x97\x87 FX RACK \xc2\xb7 OD\xe2\x86\x92" "DELAY\xe2\x86\x92" "REVERB \xe2\x97\x87 ";
     return dsl::vstack()
         .border(BorderStyle::Round)
-        .border_color(g_focus == Section::FX ? tb303::clr_accent() : tb303::clr_panel_hi())
-        .border_text(" \xe2\x97\x87 FX RACK \xc2\xb7 OD\xe2\x86\x92"
-                     "DELAY\xe2\x86\x92REVERB \xe2\x97\x87 ",
-                     BorderTextPos::Top)
+        .border_color(g_synth_mute ? tb303::clr_dim()
+                      : g_focus == Section::FX ? tb303::clr_accent() : tb303::clr_panel_hi())
+        .border_text(fx_title, BorderTextPos::Top)
         .align_self(Align::Stretch)
         .basis(Dimension::fixed(0))
         .min_width(Dimension::fixed(0))
@@ -2726,8 +2998,9 @@ static Element render_frame() {
                                       g_playing ? g_current_step : -1);
     auto seq_panel = dsl::vstack()
         .border(BorderStyle::Round)
-        .border_color(g_focus == Section::Sequencer ? tb303::clr_accent() : tb303::clr_panel_hi())
-        .border_text(" SEQUENCER ", BorderTextPos::Top)
+        .border_color(g_synth_mute ? tb303::clr_dim()
+                      : g_focus == Section::Sequencer ? tb303::clr_accent() : tb303::clr_panel_hi())
+        .border_text(g_synth_mute ? " SEQUENCER \xc2\xb7 MUTED (m) " : " SEQUENCER ", BorderTextPos::Top)
         .align_self(Align::Stretch)
         .basis(Dimension::fixed(0))
         .min_width(Dimension::fixed(0))
@@ -2741,15 +3014,18 @@ static Element render_frame() {
                                     g_focus == Section::Drums);
     auto drum_panel = dsl::vstack()
         .border(BorderStyle::Round)
-        .border_color(g_focus == Section::Drums ? tb303::clr_accent() : tb303::clr_panel_hi())
-        .border_text(" DRUMS ", BorderTextPos::Top)
+        .border_color(g_drums_mute ? tb303::clr_dim()
+                      : g_focus == Section::Drums ? tb303::clr_accent() : tb303::clr_panel_hi())
+        .border_text(g_drums_mute ? " DRUMS \xc2\xb7 MUTED (m) " : " DRUMS ", BorderTextPos::Top)
         .align_self(Align::Stretch)
         .basis(Dimension::fixed(0))
         .min_width(Dimension::fixed(0))
         .overflow(Overflow::Hidden)
         .padding(0, 1, 0, 1)(std::move(drums));
 
-    auto help_bar = tb303::build_help_bar(g_focus, g_help_open, g_help_bar_scroll);
+    int help_auto = static_cast<int>(g_help_bar_auto_t / kHelpBarChipDur);
+    auto help_bar = tb303::build_help_bar(g_focus, g_help_open,
+                                          g_help_bar_scroll, g_term_w, help_auto);
 
     // Title bar: a compact brand strip with a pulse-colored dot that flips
     // from muted → red while playing, so the play state is legible from a
@@ -2907,6 +3183,11 @@ int main() {
             }).grow(1)};
         }
     );
+
+    // Pair with the 1003h DECSET in tick() — without this the host shell can
+    // inherit all-motion mouse tracking and spray SGR escapes at the prompt.
+    std::fputs("\x1b[?1003l", stdout);
+    std::fflush(stdout);
 
     acid_midi_stop();
     acid_stop();
