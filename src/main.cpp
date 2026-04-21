@@ -22,6 +22,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <random>
@@ -85,6 +87,30 @@ static float g_swing   = 0.50f;
 // audio-thread coupling is needed.
 static bool g_song_mode = false;
 static int  g_song_slot = 0;
+
+// Per-slot bar count for song mode. Each slot (1..9) holds for N bars (N
+// pattern wraps) before the chain advances. Defaults to 4 bars — one
+// reasonable musical phrase per slot — so manual chains sound like sections
+// rather than flash-cuts. The auto-arranger (Shift+A) overwrites per-slot
+// values to shape a full song: intro 32 → build 32 → peak 64 → outro 16 etc.
+// Session-only; not persisted across restarts.
+static constexpr int kDefaultSongBars = 4;
+static std::array<int, 10> g_song_bars{
+    kDefaultSongBars, kDefaultSongBars, kDefaultSongBars, kDefaultSongBars,
+    kDefaultSongBars, kDefaultSongBars, kDefaultSongBars, kDefaultSongBars,
+    kDefaultSongBars, kDefaultSongBars
+};
+static int g_song_bars_left = 0;            // decrements each pattern wrap
+
+// Knob automation — arm a knob in DAW-style "write mode" while playing. Each
+// UI tick, the current global-knob value is written into the current step's
+// p-lock slot and the lock bit is set. Only cutoff/res/env/accent have
+// p-lock slots in the engine, so those are the only automatable knobs. To
+// clear a recorded sweep: press `L` in the sequencer (all-locks clear) on
+// the steps you want to unlock, or re-arm and walk through with the knob
+// held at the value you want.
+//   Index: 0=CUTOFF 1=RES 2=ENV 3=ACCENT.
+static std::array<bool, 4> g_auto_arm{};
 
 // Jam mode (Phase 4.2). When enabled, the sequencer is silenced and the
 // computer keyboard becomes a two-octave piano (tracker layout). Terminals
@@ -175,6 +201,16 @@ static int   g_knob_drag_idx = -1;   // -1 when not dragging
 static int   g_knob_drag_y0  = 0;
 static float g_knob_drag_v0  = 0.0f;
 
+// Drum panel geometry — captured each render by a ComponentElement wrapping
+// the drum widget so we can hit-test clicks without hard-coding layout math
+// that breaks when the panel is clipped / stretched / split across terminals
+// of different heights. drum_panel_top is the 1-indexed terminal row of the
+// panel's top border; drum_visible_rows counts only the voice rows that
+// actually drew to the screen (the rest were clipped by overflow:Hidden).
+static int g_drum_panel_top    = -1;
+static int g_drum_panel_rows   = 0;
+static int g_drum_visible_voices = 0;
+
 // Scroll offsets for areas that may overflow the visible region:
 //   help_bar   — horizontal scroll (units of items), bumped by wheel on row H-1
 //   help_ov    — vertical scroll (line offset), bumped by wheel inside the
@@ -190,6 +226,97 @@ static int   g_help_ov_scroll  = 0;
 static void set_toast(std::string s) {
     g_toast   = std::move(s);
     g_toast_t = kToastDur;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Undo / redo — destructive operations (randomize, mutate, preset/slot load,
+// clear row / kit / step) snapshot the full musical state before running,
+// and `u` pops the last snapshot back. `U` redoes. Keeps the "load random,
+// tweak, escape hatch" workflow smooth: if a roll of `R` wrecks a bassline
+// you were halfway into, one keypress gets it back.
+// ─────────────────────────────────────────────────────────────────────────────
+struct Snapshot {
+    // Pattern.
+    std::array<StepData, 16> steps;
+    int pattern_length;
+    int preset_index;
+    // Drums.
+    std::array<std::array<bool, 16>, kDrumVoices> drums;
+    std::array<bool, kDrumVoices>                 drum_voice_mute;
+    float                                         drum_master;
+    // Synth knobs.
+    float tune, cutoff, resonance, env_mod, decay, accent, drive, volume;
+    int   wave;
+    // Transport.
+    float bpm, swing;
+    // FX.
+    float od_amt, delay_mix, delay_fb, rev_mix, rev_size, rev_damp;
+    int   delay_div;
+};
+
+static constexpr size_t kUndoMax = 32;
+static std::deque<Snapshot> g_undo_past;
+static std::deque<Snapshot> g_undo_future;
+
+static Snapshot capture_snapshot() {
+    Snapshot s;
+    s.steps            = g_steps;
+    s.pattern_length   = g_pattern_length;
+    s.preset_index     = g_preset_index;
+    s.drums            = g_drums;
+    s.drum_voice_mute  = g_drum_voice_mute;
+    s.drum_master      = g_drum_master;
+    s.tune = g_tune;     s.cutoff = g_cutoff; s.resonance = g_resonance;
+    s.env_mod = g_env_mod; s.decay = g_decay; s.accent = g_accent;
+    s.drive = g_drive;   s.volume = g_volume; s.wave = g_wave;
+    s.bpm = g_bpm;       s.swing = g_swing;
+    s.od_amt = g_od_amt; s.delay_mix = g_delay_mix; s.delay_fb = g_delay_fb;
+    s.rev_mix = g_rev_mix; s.rev_size = g_rev_size; s.rev_damp = g_rev_damp;
+    s.delay_div = g_delay_div;
+    return s;
+}
+
+static void apply_snapshot(const Snapshot& s) {
+    g_steps           = s.steps;
+    g_pattern_length  = s.pattern_length;
+    g_preset_index    = s.preset_index;
+    g_drums           = s.drums;
+    g_drum_voice_mute = s.drum_voice_mute;
+    g_drum_master     = s.drum_master;
+    g_tune = s.tune;     g_cutoff = s.cutoff; g_resonance = s.resonance;
+    g_env_mod = s.env_mod; g_decay = s.decay; g_accent = s.accent;
+    g_drive = s.drive;   g_volume = s.volume; g_wave = s.wave;
+    g_bpm = s.bpm;       g_swing = s.swing;
+    g_od_amt = s.od_amt; g_delay_mix = s.delay_mix; g_delay_fb = s.delay_fb;
+    g_rev_mix = s.rev_mix; g_rev_size = s.rev_size; g_rev_damp = s.rev_damp;
+    g_delay_div = s.delay_div;
+}
+
+// Push the current state onto the undo stack before running a destructive
+// action. Clears the redo stack — a new branch of history invalidates any
+// pending redos, matching what users expect from text editors.
+static void push_undo() {
+    g_undo_past.push_back(capture_snapshot());
+    if (g_undo_past.size() > kUndoMax) g_undo_past.pop_front();
+    g_undo_future.clear();
+}
+
+static void do_undo() {
+    if (g_undo_past.empty()) { set_toast("nothing to undo"); return; }
+    g_undo_future.push_back(capture_snapshot());
+    if (g_undo_future.size() > kUndoMax) g_undo_future.pop_front();
+    apply_snapshot(g_undo_past.back());
+    g_undo_past.pop_back();
+    set_toast("\xe2\x86\xb6 undo");
+}
+
+static void do_redo() {
+    if (g_undo_future.empty()) { set_toast("nothing to redo"); return; }
+    g_undo_past.push_back(capture_snapshot());
+    if (g_undo_past.size() > kUndoMax) g_undo_past.pop_front();
+    apply_snapshot(g_undo_future.back());
+    g_undo_future.pop_back();
+    set_toast("\xe2\x86\xb7 redo");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1504,6 +1631,23 @@ static std::filesystem::path config_dir() {
     return base / "acidflow";
 }
 
+// YYYYMMDD_HHMMSS in local time — a filename-safe timestamp so takes don't
+// collide and sort chronologically when the user lists the directory.
+static std::string timestamp_now() {
+    std::time_t now = std::time(nullptr);
+    std::tm lt{};
+#if defined(_WIN32)
+    localtime_s(&lt, &now);
+#else
+    localtime_r(&now, &lt);
+#endif
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%04d%02d%02d_%02d%02d%02d",
+                  lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday,
+                  lt.tm_hour, lt.tm_min, lt.tm_sec);
+    return buf;
+}
+
 static std::filesystem::path pattern_path(int slot) {
     char buf[32];
     std::snprintf(buf, sizeof(buf), "slot_%d.txt", slot);
@@ -1513,12 +1657,15 @@ static std::filesystem::path pattern_path(int slot) {
 // Minimal human-readable format — one step per line, fields space-separated:
 //   note rest accent slide
 // Header line carries pattern_length + bpm so we restore full state.
-static bool save_pattern_slot(int slot) {
+// Writes the current state to `path` in the v8 slot format. No toast, no
+// backup — just the raw write, so callers can reuse this for takes and
+// autosaves without surprise side effects.
+static bool save_slot_to(const std::filesystem::path& path) {
     std::error_code ec;
-    std::filesystem::create_directories(config_dir(), ec);
+    std::filesystem::create_directories(path.parent_path(), ec);
     if (ec) return false;
 
-    std::ofstream f(pattern_path(slot));
+    std::ofstream f(path);
     if (!f) return false;
 
     // v8: adds knobs + fx lines after the drum block so v4-v7 readers stop
@@ -1559,7 +1706,26 @@ static bool save_pattern_slot(int slot) {
     f << "fx " << g_od_amt   << " " << g_delay_mix << " " << g_delay_fb
       << " " << g_delay_div  << " " << g_rev_mix   << " " << g_rev_size
       << " " << g_rev_damp   << "\n";
-    bool ok = static_cast<bool>(f);
+    return static_cast<bool>(f);
+}
+
+static bool save_pattern_slot(int slot) {
+    auto path = pattern_path(slot);
+
+    // One-deep .bak so an accidental Shift-N that clobbers a good slot can
+    // still be recovered — either by hand (rename the .bak back) or via the
+    // in-app undo. We only keep the most recent previous revision; filling
+    // the config directory with historical revisions would be noise for the
+    // 99% of saves that are intentional.
+    std::error_code ec;
+    if (std::filesystem::exists(path, ec)) {
+        auto bak = path;
+        bak.replace_extension(".bak.txt");
+        std::filesystem::remove(bak, ec);
+        std::filesystem::rename(path, bak, ec);
+    }
+
+    bool ok = save_slot_to(path);
     if (ok) {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "\xe2\x9c\x93 saved slot %d", slot);
@@ -1703,6 +1869,239 @@ static int song_next_slot(int after) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Auto-arrangement — one-press (Shift+A) generates a ~10 minute song as a
+// chain of 9 slots. Picks a Vibe so every slot shares the same key/tempo/
+// palette, then derives section-specific transforms (intro / build / peak /
+// break / drop / outro) from that base. Writes each variation to its slot
+// file, sets per-slot bar counts, and boots into song mode so playback
+// cycles through the sections end-to-end. Pair with `W` before pressing
+// Shift+A to capture the whole arrangement to a timestamped take.
+// ─────────────────────────────────────────────────────────────────────────────
+enum ArrSection {
+    SEC_INTRO,      // drums-only, no bass, low cutoff
+    SEC_BASS_IN,    // sparse bass on downbeats, minimal drums
+    SEC_BUILD,      // mutated bass, rising resonance, opening filter
+    SEC_PEAK_A,     // full mix, bright filter, mild drive
+    SEC_VARIATION,  // peak-like with 3 mutations on the bass
+    SEC_BREAK,      // drums drop to kick-only, echoed bass
+    SEC_DROP,       // full mix + crash on 1
+    SEC_PEAK_B,     // another mutated peak with open hats
+    SEC_OUTRO       // sparse, fading, drums off
+};
+
+struct ArrSlot {
+    ArrSection role;
+    int        bars;
+};
+
+static void auto_arrange() {
+    push_undo();
+    stop_playback();
+
+    static std::mt19937 rng{std::random_device{}()};
+
+    // Pick a coherent vibe — all 9 slots will sit inside the same tempo /
+    // palette / drum genre, so the arrangement feels like one song rather
+    // than nine random rolls glued together.
+    int vi = std::uniform_int_distribution<int>(
+        0, static_cast<int>(Vibe::V_COUNT) - 1)(rng);
+    const VibeSpec& v = kVibes[vi];
+
+    // Pin transport once so every slot shares tempo + swing.
+    randomize_transport(v.bpm_center, v.bpm_spread, v.swing_prob,
+                        /*silent=*/true);
+    g_pattern_length = 16;
+
+    // Generate the spine — a base pattern, drum kit, knob patch, and FX
+    // chain that later sections will vary off. Capturing here means mutate_
+    // pattern() calls below each compose from the same starting line.
+    randomize_pattern(v.pattern_arch, /*silent=*/true);
+    randomize_drums  (v.drums_arch,   /*silent=*/true);
+    randomize_knobs  (v.knobs_arch,   v.square_bias, /*silent=*/true);
+    randomize_fx     (v.fx_arch,      /*silent=*/true);
+    Snapshot base = capture_snapshot();
+
+    // Section plan — bars total 32+32+32+64+32+16+64+32+16 = 320 bars.
+    // At 16 steps × (60/bpm)/4 per step, one bar ≈ 60/bpm*4 sec. 122 BPM
+    // gives ~1.97 sec/bar → 320 × 1.97 ≈ 10.5 minutes.
+    constexpr std::array<ArrSlot, 9> kPlan = {{
+        {SEC_INTRO,     32},
+        {SEC_BASS_IN,   32},
+        {SEC_BUILD,     32},
+        {SEC_PEAK_A,    64},
+        {SEC_VARIATION, 32},
+        {SEC_BREAK,     16},
+        {SEC_DROP,      64},
+        {SEC_PEAK_B,    32},
+        {SEC_OUTRO,     16},
+    }};
+
+    auto clear_voices_except = [&](std::initializer_list<int> keep) {
+        for (int vc = 0; vc < kDrumVoices; ++vc) {
+            bool kept = false;
+            for (int k : keep) if (k == vc) { kept = true; break; }
+            if (!kept)
+                for (auto& c : g_drums[static_cast<size_t>(vc)]) c = false;
+        }
+    };
+    auto silence_bass = [&]() {
+        for (auto& s : g_steps) {
+            s = StepData{};
+            s.rest = true;
+        }
+    };
+
+    for (int slot = 1; slot <= 9; ++slot) {
+        apply_snapshot(base);
+        const ArrSlot& sl = kPlan[static_cast<size_t>(slot - 1)];
+
+        switch (sl.role) {
+            case SEC_INTRO:
+                silence_bass();
+                clear_voices_except({0, 2}); // BD + CH
+                g_cutoff    = 0.20f;
+                g_resonance = 0.45f;
+                g_delay_mix = 0.00f;
+                g_rev_mix   = 0.15f;
+                g_drive     = 0.10f;
+                break;
+
+            case SEC_BASS_IN:
+                // Keep bass notes only on the four downbeats — sparse phrase
+                // that lets the filter opening carry the tension.
+                for (int i = 0; i < 16; ++i)
+                    if (i % 4 != 0) g_steps[static_cast<size_t>(i)].rest = true;
+                clear_voices_except({0, 1, 2, 4}); // BD/SD/CH/CL
+                g_cutoff    = 0.28f;
+                g_resonance = 0.58f;
+                g_env_mod   = 0.55f;
+                g_delay_mix = 0.10f;
+                break;
+
+            case SEC_BUILD:
+                // Mutate the bass a few times so repeat ears hear motion
+                // without losing the original melodic fingerprint. Rising
+                // resonance + open filter signals "about to peak".
+                for (int i = 0; i < 2; ++i) mutate_pattern();
+                g_cutoff    = 0.38f;
+                g_resonance = 0.72f;
+                g_env_mod   = 0.78f;
+                g_delay_mix = 0.15f;
+                g_rev_mix   = 0.25f;
+                break;
+
+            case SEC_PEAK_A:
+                // Full mix, bright + driven. The 64-bar hold means the peak
+                // sits in the listener's ear long enough to feel locked in.
+                g_cutoff    = 0.55f;
+                g_resonance = 0.78f;
+                g_env_mod   = 0.70f;
+                g_drive     = 0.38f;
+                g_delay_mix = 0.18f;
+                break;
+
+            case SEC_VARIATION:
+                // Peak-ish intensity but bass is reshaped — gives the
+                // listener something new without leaving the drop.
+                for (int i = 0; i < 3; ++i) mutate_pattern();
+                g_cutoff    = 0.50f;
+                g_resonance = 0.75f;
+                g_env_mod   = 0.72f;
+                g_drive     = 0.32f;
+                g_delay_mix = 0.22f;
+                break;
+
+            case SEC_BREAK:
+                // Classic breakdown: drums drop to the kick on 1/9, bass
+                // keeps going but soaked in FX. Short (16 bars) so it
+                // doesn't kill momentum.
+                clear_voices_except({0});
+                for (auto& c : g_drums[0]) c = false;
+                g_drums[0][0] = true;
+                g_drums[0][8] = true;
+                g_cutoff    = 0.30f;
+                g_resonance = 0.65f;
+                g_delay_mix = 0.35f;
+                g_rev_mix   = 0.40f;
+                break;
+
+            case SEC_DROP:
+                // Full mix returns + a crash on beat 1 for the "everything
+                // in" moment. Slightly more drive than peak-A so the drop
+                // feels bigger than the earlier peak.
+                g_cutoff    = 0.60f;
+                g_resonance = 0.80f;
+                g_env_mod   = 0.72f;
+                g_drive     = 0.48f;
+                g_delay_mix = 0.18f;
+                if (13 < kDrumVoices) g_drums[13][0] = true;   // CY on 1
+                break;
+
+            case SEC_PEAK_B:
+                // Second-wind peak. New mutations + open hats on offbeats
+                // change the top end — same drop energy, different detail.
+                for (int i = 0; i < 4; ++i) mutate_pattern();
+                for (int i = 2; i < 16; i += 4)
+                    if (3 < kDrumVoices) g_drums[3][i] = true; // OH offbeats
+                g_cutoff    = 0.58f;
+                g_resonance = 0.82f;
+                g_env_mod   = 0.74f;
+                g_drive     = 0.40f;
+                g_delay_mix = 0.25f;
+                break;
+
+            case SEC_OUTRO:
+                // Final taper: bass on downbeats, drums off, filter closes.
+                for (int i = 0; i < 16; ++i)
+                    if (i % 4 != 0) g_steps[static_cast<size_t>(i)].rest = true;
+                for (auto& row : g_drums) for (auto& c : row) c = false;
+                g_drums[0][0] = true;                          // lone BD on 1
+                g_cutoff    = 0.18f;
+                g_resonance = 0.50f;
+                g_env_mod   = 0.50f;
+                g_volume    = 0.50f;
+                g_delay_mix = 0.20f;
+                g_rev_mix   = 0.45f;
+                break;
+        }
+
+        // Rotate any existing slot file out of the way (one-deep .bak) so a
+        // prior manual save isn't silently destroyed by auto-arrange.
+        auto path = pattern_path(slot);
+        std::error_code ec;
+        if (std::filesystem::exists(path, ec)) {
+            auto bak = path;
+            bak.replace_extension(".bak.txt");
+            std::filesystem::remove(bak, ec);
+            std::filesystem::rename(path, bak, ec);
+        }
+        save_slot_to(path);
+        g_song_bars[static_cast<size_t>(slot)] = sl.bars;
+    }
+
+    // Load slot 1 so the UI mirrors what's about to play, then boot song
+    // mode + transport. User hears the intro immediately.
+    load_pattern_slot(1, /*quiet=*/true);
+    g_song_mode      = true;
+    g_song_slot      = 1;
+    g_song_bars_left = g_song_bars[1];
+    start_playback();
+
+    // Compute approx total duration so the toast tells the user how long a
+    // take would run (helps decide whether to press W for live recording).
+    int total_bars = 0;
+    for (const auto& p : kPlan) total_bars += p.bars;
+    float sec_per_bar = 60.0f / std::max(20.0f, g_bpm) * 4.0f;
+    int   minutes = static_cast<int>(total_bars * sec_per_bar / 60.0f + 0.5f);
+
+    char buf[96];
+    std::snprintf(buf, sizeof(buf),
+                  "\xe2\x99\xaa arrangement: %s  \xc2\xb7 ~%d min  \xc2\xb7 W to record",
+                  v.name, minutes);
+    set_toast(buf);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // WAV export — offline bounce the current pattern (4 loops) to
 // ~/.config/acidflow/bounce.wav via the engine's synchronous render path.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1747,20 +2146,40 @@ static bool export_wav() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Live recording — tap the running audio thread's output into
-// ~/.config/acidflow/live.wav. Unlike the offline bounce (export_wav) this
-// captures knob tweaks, jammed notes, MIDI-in hits, and pattern edits as
-// they happen. Toggle with capital `W`; max 10 minutes per take.
+// ~/.config/acidflow/live_<timestamp>.wav. Unlike the offline bounce
+// (export_wav) this captures knob tweaks, jammed notes, MIDI-in hits, and
+// pattern edits as they happen. Toggle with capital `W`; max 10 minutes per
+// take. Each take carries a timestamp in the filename so takes accumulate
+// instead of overwriting, and a companion .txt file is dropped next to the
+// wav holding the session state at stop-time (same format as slot files) so
+// the take can be reloaded later to keep tweaking from where it ended.
 // ─────────────────────────────────────────────────────────────────────────────
 static constexpr int kLiveRecordMaxSeconds = 600;
+
+// Set when recording begins — reused on stop so the paired wav + slot file
+// share the same timestamp.
+static std::string g_live_rec_stem;
+
+static bool save_slot_to(const std::filesystem::path& path);
 
 static bool toggle_live_record() {
     if (acid_is_recording()) {
         std::error_code ec;
         std::filesystem::create_directories(config_dir(), ec);
-        auto path = config_dir() / "live.wav";
-        int rc = acid_record_end(path.string().c_str());
-        set_toast(rc == 0 ? "\xe2\x9c\x93 live \xe2\x86\x92 live.wav"
-                          : "\xe2\x9c\x97 live save failed");
+        std::string stem = g_live_rec_stem.empty() ? timestamp_now() : g_live_rec_stem;
+        auto wav_path  = config_dir() / ("live_" + stem + ".wav");
+        auto slot_path = config_dir() / ("live_" + stem + ".txt");
+        int rc = acid_record_end(wav_path.string().c_str());
+        g_live_rec_stem.clear();
+        if (rc == 0) {
+            save_slot_to(slot_path);    // best-effort; failure is non-fatal
+            char toast[96];
+            std::snprintf(toast, sizeof(toast),
+                          "\xe2\x9c\x93 take \xe2\x86\x92 live_%s.wav", stem.c_str());
+            set_toast(toast);
+        } else {
+            set_toast("\xe2\x9c\x97 live save failed");
+        }
         return rc == 0;
     }
     int rc = acid_record_begin(kLiveRecordMaxSeconds);
@@ -1768,6 +2187,7 @@ static bool toggle_live_record() {
         set_toast("\xe2\x9c\x97 record begin failed");
         return false;
     }
+    g_live_rec_stem = timestamp_now();
     set_toast("\xe2\x97\x8f REC  (W again to stop)");
     return true;
 }
@@ -2302,22 +2722,57 @@ static void tick(float dt) {
     g_step_phase   = g_playing ? acid_seq_step_phase()   : 0.0f;
 
     // Song mode: on pattern wrap (step index went backwards while playing),
-    // auto-advance to the next saved slot. Detecting the wrap here avoids any
-    // audio-thread coupling — the UI tick already sees the same positions.
+    // decrement the bar counter. When the counter hits zero, advance to the
+    // next saved slot and reload its bar count. Detecting the wrap here
+    // avoids any audio-thread coupling — the UI tick already sees the same
+    // positions.
     if (g_song_mode && g_playing
         && prev_step >= 0 && g_current_step >= 0
         && g_current_step < prev_step)
     {
-        int next = song_next_slot(g_song_slot > 0 ? g_song_slot : 0);
-        if (next > 0) {
-            if (next != g_song_slot) {
-                load_pattern_slot(next, /*quiet=*/true);
-                char buf[32];
+        --g_song_bars_left;
+        if (g_song_bars_left <= 0) {
+            int next = song_next_slot(g_song_slot > 0 ? g_song_slot : 0);
+            if (next > 0) {
+                if (next != g_song_slot) {
+                    load_pattern_slot(next, /*quiet=*/true);
+                }
+                g_song_slot = next;
+                int bars = g_song_bars[static_cast<size_t>(next)];
+                if (bars <= 0) bars = kDefaultSongBars;
+                g_song_bars_left = bars;
+                char buf[48];
                 std::snprintf(buf, sizeof(buf),
-                              "\xe2\x99\xaa song \xe2\x86\x92 slot %d", next);
+                              "\xe2\x99\xaa song \xe2\x86\x92 slot %d  \xc2\xb7 %d bars",
+                              next, bars);
                 set_toast(buf);
             }
-            g_song_slot = next;
+        }
+    }
+
+    // Knob automation: while armed + playing, write the current global-knob
+    // value into the current step's p-lock slot (and set the lock bit) each
+    // tick. Continuous "write mode" — releasing the knob freezes the sweep
+    // into the pattern so the next loop plays it back without the user
+    // touching anything. Only runs inside the active pattern length so the
+    // trailing rest-padded steps (17..16) stay untouched.
+    if (g_playing && g_current_step >= 0 && g_current_step < g_pattern_length) {
+        auto& s = g_steps[static_cast<size_t>(g_current_step)];
+        if (g_auto_arm[0]) {
+            s.lock_cutoff = g_cutoff;
+            s.lock_mask  |= tb303::LOCK_CUTOFF;
+        }
+        if (g_auto_arm[1]) {
+            s.lock_res    = g_resonance;
+            s.lock_mask  |= tb303::LOCK_RES;
+        }
+        if (g_auto_arm[2]) {
+            s.lock_env    = g_env_mod;
+            s.lock_mask  |= tb303::LOCK_ENV;
+        }
+        if (g_auto_arm[3]) {
+            s.lock_accent = g_accent;
+            s.lock_mask  |= tb303::LOCK_ACCENT;
         }
     }
 }
@@ -2590,19 +3045,27 @@ static HitZone hit_test(int col, int row) {
         int drum_x      = transport_x + transport_w + 1;
 
         if (col >= drum_x && col < drum_x + drum_w) {
-            // Drum panel: border(1) + header(1) + kDrumVoices voice rows +
-            // bus(1) + border(1). Voice rows live at mid_top + 2 .. + 2+N-1.
+            // Drum panel layout: border top + padding(0,1,0,1) + widget (header
+            // + N voice rows + bus) + border bottom. Voice 0 is two rows below
+            // the panel's top border: +1 for the border, +1 for the widget's
+            // header row with step numbers. drum_panel_top is captured during
+            // render so clipping / layout changes can't desync us.
+            int panel_top = (g_drum_panel_top > 0) ? g_drum_panel_top : mid_top;
+            int voice     = row - (panel_top + 2);
+            int max_voice = (g_drum_visible_voices > 0)
+                          ? g_drum_visible_voices : kDrumVoices;
+            if (voice < 0 || voice >= max_voice) return {};
+
             int interior_x = drum_x + 1 + 1;                     // border + pad
             int interior_w = std::max(0, drum_w - 4);
             constexpr int kDrumW = 4 + 16 * 3;                    // 52
             int drum_start = interior_x + std::max(0, (interior_w - kDrumW) / 2);
             int rel = col - drum_start;
-            if (rel < 4 || rel >= kDrumW) return {};
-            int cell_rel = rel - 4;
-            int step = cell_rel / 3;
-            if (step < 0 || step >= 16) return {};
-            int voice = row - (mid_top + 2);
-            if (voice < 0 || voice >= kDrumVoices) return {};
+            if (rel < 0 || rel >= kDrumW) return {};
+            // Label area (rel < 4, e.g. "BD: ") — signal voice-only select
+            // via step = -1. Toggling cells still needs rel ≥ 4.
+            int step = (rel < 4) ? -1 : (rel - 4) / 3;
+            if (step >= 16) return {};
             return {HitZone::DrumCell, step, voice};
         }
         if (col >= transport_x) return {HitZone::TransportArea, 0, 0};
@@ -2711,14 +3174,15 @@ static void handle_mouse(const MouseEvent& m) {
                 // selects the cell under the cursor so the user immediately
                 // sees where they are in the grid.
                 g_focus = Section::Drums;
-                g_drum_step_sel  = z.idx;
                 g_drum_voice_sel = z.idx2;
+                if (z.idx >= 0) g_drum_step_sel = z.idx;
                 g_drum_master = std::clamp(g_drum_master + dir * 0.05f, 0.0f, 1.5f);
                 return;
             case HitZone::TransportArea:
                 g_focus = Section::Transport;
                 // Scroll-down feels like "next preset" — invert dir so wheel-down
                 // advances the list even though our logical "dir" is +1 for up.
+                push_undo();
                 load_preset(g_preset_index - dir);
                 return;
             case HitZone::ScopeArea:
@@ -2785,11 +3249,16 @@ static void handle_mouse(const MouseEvent& m) {
                 return;
             case HitZone::DrumCell: {
                 g_focus = Section::Drums;
-                g_drum_step_sel  = z.idx;
                 g_drum_voice_sel = z.idx2;
-                auto& cell = g_drums[static_cast<size_t>(z.idx2)]
-                                    [static_cast<size_t>(z.idx)];
-                cell = !cell;
+                // step == -1 signals a label-area click (the "BD:" column):
+                // select the voice row but don't toggle a step. Gives the
+                // expected "click a label to pick that drum" behaviour.
+                if (z.idx >= 0) {
+                    g_drum_step_sel = z.idx;
+                    auto& cell = g_drums[static_cast<size_t>(z.idx2)]
+                                        [static_cast<size_t>(z.idx)];
+                    cell = !cell;
+                }
                 return;
             }
             case HitZone::TransportArea:
@@ -2827,12 +3296,18 @@ static void handle_mouse(const MouseEvent& m) {
             }
             case HitZone::DrumCell: {
                 // Right-click clears the cell (matches the right-click-to-rest
-                // pattern on the sequencer).
+                // pattern on the sequencer). A label-area right-click
+                // (z.idx == -1) clears the whole voice row — the expected
+                // "clear this drum" action.
                 g_focus = Section::Drums;
-                g_drum_step_sel  = z.idx;
                 g_drum_voice_sel = z.idx2;
-                g_drums[static_cast<size_t>(z.idx2)]
-                       [static_cast<size_t>(z.idx)] = false;
+                if (z.idx < 0) {
+                    for (auto& c : g_drums[static_cast<size_t>(z.idx2)]) c = false;
+                } else {
+                    g_drum_step_sel = z.idx;
+                    g_drums[static_cast<size_t>(z.idx2)]
+                           [static_cast<size_t>(z.idx)] = false;
+                }
                 return;
             }
             default: return;
@@ -2926,6 +3401,7 @@ static void handle_event(const Event& ev) {
     // everything (knobs + pattern) for a full fresh patch + groove combo.
     // The sequencer's previous per-step rest toggle moved to `m` (mute).
     if (key(ev, 'r')) {
+        push_undo();
         switch (g_focus) {
             case Section::Knobs:     randomize_knobs();     break;
             case Section::FX:        randomize_fx();        break;
@@ -2935,8 +3411,15 @@ static void handle_event(const Event& ev) {
         }
         return;
     }
-    if (key(ev, 'R')) { randomize_everything(); return; }
-    if (key(ev, 'M')) { mutate_pattern(); return; }
+    if (key(ev, 'R')) { push_undo(); randomize_everything(); return; }
+    if (key(ev, 'M')) { push_undo(); mutate_pattern(); return; }
+    // Shift+A — one-press auto-arrangement. Overwrites slots 1..9 (with .bak
+    // rotation) and boots into song mode so a ~10-minute coherent track
+    // plays end-to-end. The intermediate slots are real save files so the
+    // user can tweak any section after the fact and keep listening.
+    if (key(ev, 'A')) { auto_arrange(); return; }
+    if (key(ev, 'u')) { do_undo(); return; }
+    if (key(ev, 'U')) { do_redo(); return; }
     if (key(ev, 'T')) {
         tb303::cycle_theme();
         char buf[32];
@@ -2949,7 +3432,7 @@ static void handle_event(const Event& ev) {
     if (key(ev, 'E')) { export_mid(); return; }
     if (key(ev, 'W')) { toggle_live_record(); return; }
     if (key(ev, 'p')) { export_pattern_text(); return; }
-    if (key(ev, 'P')) { import_pattern_text(); return; }
+    if (key(ev, 'P')) { push_undo(); import_pattern_text(); return; }
     // Jam mode toggle — take over the keyboard for live two-octave playing.
     // Pattern playback keeps running under jam, so the user can lay a lead
     // line over an already-running sequence.
@@ -2999,10 +3482,14 @@ static void handle_event(const Event& ev) {
             } else {
                 g_song_mode = true;
                 g_song_slot = first;
+                int bars = g_song_bars[static_cast<size_t>(first)];
+                if (bars <= 0) bars = kDefaultSongBars;
+                g_song_bars_left = bars;
                 load_pattern_slot(first, /*quiet=*/true);
-                char buf[32];
+                char buf[48];
                 std::snprintf(buf, sizeof(buf),
-                              "\xe2\x99\xaa song mode \xe2\x86\x92 slot %d", first);
+                              "\xe2\x99\xaa song \xe2\x86\x92 slot %d  \xc2\xb7 %d bars",
+                              first, bars);
                 set_toast(buf);
             }
         }
@@ -3028,11 +3515,18 @@ static void handle_event(const Event& ev) {
                 if (c >= '1' && c <= '9' && k->mods.none()
                     && g_focus != Section::Drums) {
                     int slot = c - '0';
+                    push_undo();
                     load_pattern_slot(slot);
                     // Keep song mode in sync: manual jumps should advance
                     // from the slot the user just picked, not from wherever
-                    // the chain was previously.
-                    if (g_song_mode) g_song_slot = slot;
+                    // the chain was previously, and reset the bar counter
+                    // so the new slot gets its full hold duration.
+                    if (g_song_mode) {
+                        g_song_slot = slot;
+                        int bars = g_song_bars[static_cast<size_t>(slot)];
+                        if (bars <= 0) bars = kDefaultSongBars;
+                        g_song_bars_left = bars;
+                    }
                     return;
                 }
             }
@@ -3050,6 +3544,33 @@ static void handle_event(const Event& ev) {
             if (key(ev, '['))               { adjust_knob(g_knob_sel, -0.10f); return; }
             if (key(ev, '0'))               { reset_knob(g_knob_sel); return; }
             if (key(ev, 'w'))               { g_wave = 1 - g_wave; return; }
+            // `.` toggles write-mode automation on the currently-focused
+            // knob. Only cutoff / res / env / accent have p-lock slots in
+            // the engine; other knobs emit a warning toast instead.
+            if (key(ev, '.')) {
+                int ai = -1;
+                const char* lbl = nullptr;
+                switch (g_knob_sel) {
+                    case K_CUTOFF: ai = 0; lbl = "CUTOFF"; break;
+                    case K_RES:    ai = 1; lbl = "RES";    break;
+                    case K_ENV:    ai = 2; lbl = "ENVMOD"; break;
+                    case K_ACCENT: ai = 3; lbl = "ACCENT"; break;
+                    default: break;
+                }
+                if (ai < 0) {
+                    set_toast("\xe2\x9c\x97 automation: cutoff/res/env/accent only");
+                    return;
+                }
+                g_auto_arm[static_cast<size_t>(ai)] =
+                    !g_auto_arm[static_cast<size_t>(ai)];
+                char buf[48];
+                std::snprintf(buf, sizeof(buf), "%s %s auto",
+                    lbl,
+                    g_auto_arm[static_cast<size_t>(ai)]
+                        ? "\xe2\x97\x8f rec" : "\xe2\x97\x8b off");
+                set_toast(buf);
+                return;
+            }
             if (key(ev, 'm')) {
                 g_synth_mute = !g_synth_mute;
                 set_toast(g_synth_mute ? "synth muted" : "synth live");
@@ -3082,9 +3603,14 @@ static void handle_event(const Event& ev) {
             if (key(ev, '>') || key(ev, '.')) { s.note = std::min(s.note + 12, 96); return; }
             if (key(ev, 'a')) { s.accent = !s.accent; s.rest = false; return; }
             if (key(ev, 's')) { s.slide  = !s.slide;  s.rest = false; return; }
-            // `m` for mute (rest toggle) — `r` is the global randomize key
-            // now, so per-step rest moves here. Mnemonic: muted step = rest.
-            if (key(ev, 'm')) { s.rest   = !s.rest; return; }
+            // `m` mutates the sequence in place — one small weighted change
+            // per press so the new line sits musically next to the old one
+            // (accent flip / pitch nudge / rotate / etc). push_undo() before
+            // the mutation so `u` restores the previous state; hammering `m`
+            // "walks" the pattern and `u` rewinds step-by-step up to 32
+            // presses (kUndoMax). Rest-toggle on a step is still available
+            // via `x` (which wipes the step to an explicit rest).
+            if (key(ev, 'm')) { push_undo(); mutate_pattern(); return; }
             // Probability cycles 100→75→50→25→100; ratchet cycles 1→2→3→4→1.
             // Keeps the "always/half/quarter" musical feel without an extra
             // continuous-value knob row.
@@ -3123,6 +3649,7 @@ static void handle_event(const Event& ev) {
             // whole step; `L` is the lighter-touch option that preserves the
             // note + flags but wipes p-locks.
             if (key(ev, 'L')) {
+                push_undo();
                 s.lock_mask = 0;
                 return;
             }
@@ -3144,7 +3671,7 @@ static void handle_event(const Event& ev) {
             }
             // `.` also means "clear" when the step is already at an octave boundary
             // (conflict with octave-up) — use `x` as the unambiguous clear key.
-            if (key(ev, 'x')) { s = StepData{}; s.rest = true; return; }
+            if (key(ev, 'x')) { push_undo(); s = StepData{}; s.rest = true; return; }
             break;
         }
         case Section::Drums: {
@@ -3179,10 +3706,12 @@ static void handle_event(const Event& ev) {
             // `c` clears the focused row; `C` clears the entire kit. Mirrors
             // the sequencer's `x = clear step` ergonomics at the row level.
             if (key(ev, 'c')) {
+                push_undo();
                 for (auto& c : g_drums[static_cast<size_t>(g_drum_voice_sel)]) c = false;
                 return;
             }
             if (key(ev, 'C')) {
+                push_undo();
                 for (auto& row : g_drums) for (auto& c : row) c = false;
                 set_toast("drums cleared");
                 return;
@@ -3212,8 +3741,8 @@ static void handle_event(const Event& ev) {
             break;
         }
         case Section::Transport: {
-            if (key(ev, SpecialKey::Up))   { load_preset(g_preset_index - 1); return; }
-            if (key(ev, SpecialKey::Down)) { load_preset(g_preset_index + 1); return; }
+            if (key(ev, SpecialKey::Up))   { push_undo(); load_preset(g_preset_index - 1); return; }
+            if (key(ev, SpecialKey::Down)) { push_undo(); load_preset(g_preset_index + 1); return; }
             if (key(ev, '[')) { g_bpm = std::max(40.0f,  g_bpm - 2.0f); return; }
             if (key(ev, ']')) { g_bpm = std::min(220.0f, g_bpm + 2.0f); return; }
             if (key(ev, '{')) { g_pattern_length = std::max(4, g_pattern_length - 1); return; }
@@ -3222,8 +3751,38 @@ static void handle_event(const Event& ev) {
             // taps from centre lands on the canonical MPC-56/58/60/62 feels.
             if (key(ev, '-')) { g_swing = std::max(0.50f, g_swing - 0.02f); return; }
             if (key(ev, '=')) { g_swing = std::min(0.75f, g_swing + 0.02f); return; }
-            if (key(ev, ',')) { load_preset(g_preset_index - 1); return; }
-            if (key(ev, '.')) { load_preset(g_preset_index + 1); return; }
+            if (key(ev, ',')) { push_undo(); load_preset(g_preset_index - 1); return; }
+            if (key(ev, '.')) { push_undo(); load_preset(g_preset_index + 1); return; }
+            // ( / ) — shrink/grow how long the current song-mode slot
+            // holds before the chain advances. Cycle: 1 → 2 → 4 → 8 → 16
+            // → 32 → 64 (bars). No-op when song mode is off or no slot
+            // has been picked yet (the toast nudges the user there).
+            if (key(ev, '(') || key(ev, ')')) {
+                if (g_song_slot <= 0) {
+                    set_toast("bars: turn on song mode (n) first");
+                    return;
+                }
+                static constexpr int kBarCycle[] = {1, 2, 4, 8, 16, 32, 64};
+                constexpr int kBarCycleN =
+                    static_cast<int>(sizeof(kBarCycle) / sizeof(kBarCycle[0]));
+                int cur = g_song_bars[static_cast<size_t>(g_song_slot)];
+                int idx = 0;
+                for (int i = 0; i < kBarCycleN; ++i)
+                    if (kBarCycle[i] == cur) { idx = i; break; }
+                idx = std::clamp(
+                    idx + (key(ev, ')') ? +1 : -1), 0, kBarCycleN - 1);
+                int bars = kBarCycle[idx];
+                g_song_bars[static_cast<size_t>(g_song_slot)] = bars;
+                // Reset the live counter so the change takes effect on the
+                // next bar boundary instead of stretching the current hold.
+                g_song_bars_left = std::min(g_song_bars_left, bars);
+                if (g_song_bars_left <= 0) g_song_bars_left = bars;
+                char buf[48];
+                std::snprintf(buf, sizeof(buf),
+                    "slot %d  \xc2\xb7 %d bars", g_song_slot, bars);
+                set_toast(buf);
+                return;
+            }
             if (key(ev, 'm')) {
                 // Master mute: if either bus is live, silence both; otherwise unmute both.
                 bool any_live = !g_synth_mute || !g_drums_mute;
@@ -3645,11 +4204,35 @@ static Element render_frame() {
             std::move(scope_box)  | dsl::grow(2)
         );
 
-    auto drums = tb303::build_drums(g_drums, g_drum_voice_mute,
-                                    g_drum_voice_sel, g_drum_step_sel,
-                                    g_playing ? g_current_step : -1,
-                                    g_drum_master,
-                                    g_focus == Section::Drums);
+    // Wrap the drum widget in a ComponentElement so we learn its allocated
+    // pixel height at paint time. The hit-test uses this to map a click row
+    // to a voice index without guessing at layout math — click mapping then
+    // works whether the panel got its full 20 rows or is clipped on a short
+    // terminal.
+    auto drums_component = dsl::component([=](int, int h) -> Element {
+        // h = interior height of the drum panel (inside its border + padding).
+        // The widget lays out as: 1 header row, N voice rows, 1 bus row.
+        // When clipped, the bottom is cut first (header + early voices stay
+        // visible). Record how many voice rows we actually displayed and
+        // stash the panel's rendered height so hit_test can invert the map.
+        int visible = std::max(0, h - 1 - 1);     // minus header + bus row
+        if (visible > kDrumVoices) visible = kDrumVoices;
+        g_drum_visible_voices = visible;
+        g_drum_panel_rows     = h + 2;            // +2 for top/bottom borders
+        // drum_panel_top = 1-indexed terminal row of the panel's top border.
+        // Anchor to the bottom of middle_row (which in the current layout
+        // ends one row above step_row's top border at g_term_h - 12) minus
+        // the panel's outer height, plus 1 to convert bottom-inclusive to
+        // top-inclusive.
+        //   bottom = g_term_h - 12   outer = h + 2   top = bottom - outer + 1
+        g_drum_panel_top = (g_term_h - 12) - (h + 2) + 1;
+        return tb303::build_drums(g_drums, g_drum_voice_mute,
+                                  g_drum_voice_sel, g_drum_step_sel,
+                                  g_playing ? g_current_step : -1,
+                                  g_drum_master,
+                                  g_focus == Section::Drums);
+    }).grow(1);
+
     auto drum_panel = dsl::vstack()
         .border(BorderStyle::Round)
         .border_color(g_drums_mute ? tb303::clr_dim()
@@ -3658,7 +4241,7 @@ static Element render_frame() {
         .basis(Dimension::fixed(0))
         .min_width(Dimension::fixed(0))
         .overflow(Overflow::Hidden)
-        .padding(0, 1, 0, 1)(std::move(drums));
+        .padding(0, 1, 0, 1)(std::move(drums_component));
 
     // Middle row hosts three stacked panels side by side: scope/filter (left),
     // transport (centre), drums (right). voice_row (below) is given shrink(1)
