@@ -1215,7 +1215,8 @@ static void randomize_drums(int arch_hint = -1, bool silent = false) {
         ACID, CHICAGO, TECHNO, MINIMAL, ELECTRO,
         BREAKS, DUB, LATIN, JAM, G_COUNT
     };
-    static_assert(G_COUNT == DA_COUNT, "drum genre count mismatch");
+    static_assert(static_cast<int>(G_COUNT) == static_cast<int>(DA_COUNT),
+                  "drum genre count mismatch");
     Groove gen = (arch_hint >= 0)
         ? static_cast<Groove>(std::clamp(arch_hint, 0, G_COUNT - 1))
         : static_cast<Groove>(pick(0, G_COUNT - 1));
