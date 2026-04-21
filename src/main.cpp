@@ -181,6 +181,14 @@ static int     g_fx_sel     = 0;   // currently-focused FX knob
 static int     g_step_sel   = 0;
 static bool    g_help_open  = false;
 
+// Take picker modal — `Y` opens it, Up/Down move the cursor, Enter loads the
+// selected live_<timestamp>.txt into the live pattern state, Esc cancels.
+// Populated by refresh_takes() at open time; sorted newest-first so the take
+// the user just recorded is at the top.
+static bool                              g_takes_open = false;
+static int                               g_takes_sel  = 0;
+static std::vector<std::filesystem::path> g_takes_entries;
+
 // Beat-sync animation state. g_step_phase ramps 0..1 within the current step
 // (wraps each trigger) so the UI can fade flashes smoothly. g_toast is a
 // transient banner — whenever an action fires (randomize / save / load /
@@ -1734,8 +1742,15 @@ static bool save_pattern_slot(int slot) {
     return ok;
 }
 
-static bool load_pattern_slot(int slot, bool quiet = false) {
-    std::ifstream f(pattern_path(slot));
+// Core slot-file reader. Shared between numbered-slot loading (digit keys)
+// and take picker loading (live_<timestamp>.txt files alongside wavs).
+// `label` appears in the "loaded X" toast when quiet is false — e.g. "slot 3"
+// or "take 20260421_153900".
+static bool load_slot_from_path(const std::filesystem::path& path,
+                                const std::string& label,
+                                bool quiet)
+{
+    std::ifstream f(path);
     if (!f) return false;
 
     std::string header;
@@ -1850,11 +1865,61 @@ static bool load_pattern_slot(int slot, bool quiet = false) {
     g_preset_index = -1;
     g_step_sel = 0;
     if (!quiet) {
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "\xe2\x86\xba loaded slot %d", slot);
-        set_toast(buf);
+        std::string msg = "\xe2\x86\xba loaded ";
+        msg += label;
+        set_toast(msg);
     }
     return true;
+}
+
+// Numbered-slot wrapper around `load_slot_from_path`. Used by digit keys and
+// song mode; the take picker calls `load_slot_from_path` directly with the
+// live-recording .txt path.
+static bool load_pattern_slot(int slot, bool quiet = false) {
+    char lbl[24];
+    std::snprintf(lbl, sizeof(lbl), "slot %d", slot);
+    return load_slot_from_path(pattern_path(slot), lbl, quiet);
+}
+
+// Scan the config dir for live_*.txt take files and sort newest-first so the
+// most recent recording sits at the top of the picker. Silent on I/O errors —
+// we treat a missing / unreadable dir as "no takes".
+static void refresh_takes() {
+    g_takes_entries.clear();
+    std::error_code ec;
+    auto dir = config_dir();
+    if (!std::filesystem::exists(dir, ec)) return;
+
+    for (auto& de : std::filesystem::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (!de.is_regular_file(ec)) continue;
+        auto name = de.path().filename().string();
+        if (name.rfind("live_", 0) != 0) continue;
+        if (de.path().extension() != ".txt") continue;
+        g_takes_entries.push_back(de.path());
+    }
+
+    std::sort(g_takes_entries.begin(), g_takes_entries.end(),
+        [](const std::filesystem::path& a, const std::filesystem::path& b) {
+            std::error_code e1, e2;
+            auto ta = std::filesystem::last_write_time(a, e1);
+            auto tb = std::filesystem::last_write_time(b, e2);
+            return ta > tb;                             // newest first
+        });
+
+    if (g_takes_sel >= static_cast<int>(g_takes_entries.size())) {
+        g_takes_sel = 0;
+    }
+}
+
+static void open_take_picker() {
+    refresh_takes();
+    g_takes_sel = 0;
+    if (g_takes_entries.empty()) {
+        set_toast("no takes found (press W during playback to record)");
+        return;
+    }
+    g_takes_open = true;
 }
 
 // Song-mode helper — find the next saved slot after `after` (cyclic, 1..9).
@@ -3079,6 +3144,10 @@ static void handle_mouse(const MouseEvent& m) {
     int col = m.x.raw();
     int row = m.y.raw();
 
+    // Take picker is modal — swallow mouse so clicks don't leak through to
+    // the hidden workspace. The user dismisses it with Esc or Enter.
+    if (g_takes_open) return;
+
     // ── Drag continuation ──────────────────────────────────────────────────
     // Once a knob drag starts, we keep tracking motion until the button is
     // released — even if the cursor leaves the original knob column. This is
@@ -3321,6 +3390,39 @@ static void handle_event(const Event& ev) {
     if (resized(ev, &rw, &rh)) { g_term_w = rw; g_term_h = rh; return; }
     if (const MouseEvent* m = as_mouse(ev)) { handle_mouse(*m); return; }
 
+    // ── Take picker modal ────────────────────────────────────────────────────
+    // Handled before any other keys so Up/Down/Enter/Esc are scoped to the
+    // modal while it is open — the workspace underneath sees nothing.
+    if (g_takes_open) {
+        if (key(ev, SpecialKey::Escape) || key(ev, 'q') || key(ev, 'Q')) {
+            g_takes_open = false;
+            return;
+        }
+        if (key(ev, SpecialKey::Up)) {
+            if (!g_takes_entries.empty())
+                g_takes_sel = (g_takes_sel - 1 + static_cast<int>(g_takes_entries.size()))
+                            % static_cast<int>(g_takes_entries.size());
+            return;
+        }
+        if (key(ev, SpecialKey::Down)) {
+            if (!g_takes_entries.empty())
+                g_takes_sel = (g_takes_sel + 1) % static_cast<int>(g_takes_entries.size());
+            return;
+        }
+        if (key(ev, SpecialKey::Enter)) {
+            if (!g_takes_entries.empty()) {
+                push_undo();
+                auto& p = g_takes_entries[static_cast<size_t>(g_takes_sel)];
+                std::string stem = p.stem().string();           // "live_<ts>"
+                std::string lbl  = "take " + stem;
+                load_slot_from_path(p, lbl, /*quiet=*/false);
+            }
+            g_takes_open = false;
+            return;
+        }
+        return;                                                  // swallow all other keys
+    }
+
     // ── Global keys ──────────────────────────────────────────────────────────
     if (key(ev, 'q') || key(ev, 'Q') || key(ev, SpecialKey::Escape)) {
         if (g_help_open) { g_help_open = false; g_help_ov_scroll = 0; return; }
@@ -3340,6 +3442,7 @@ static void handle_event(const Event& ev) {
     if (key(ev, '?')) { g_help_open = !g_help_open; g_help_ov_scroll = 0; return; }
     // While help is open we only accept Esc/? to close — everything else is no-op.
     if (g_help_open) return;
+    if (key(ev, 'Y')) { open_take_picker(); return; }
 
     // ── Jam mode ────────────────────────────────────────────────────────────
     // When active, swallow almost every keystroke and route letters through
@@ -4361,6 +4464,18 @@ static Element render_frame() {
         return (dsl::v(
             std::move(title_bar),
             tb303::build_help_overlay(g_help_ov_scroll) | dsl::grow(1),
+            std::move(help_bar)
+        ) | dsl::gap(0)).build();
+    }
+
+    // Take picker modal — same frame skeleton as help, just a different body.
+    if (g_takes_open) {
+        std::vector<std::string> names;
+        names.reserve(g_takes_entries.size());
+        for (auto& p : g_takes_entries) names.push_back(p.stem().string());
+        return (dsl::v(
+            std::move(title_bar),
+            tb303::build_take_picker(names, g_takes_sel) | dsl::grow(1),
             std::move(help_bar)
         ) | dsl::gap(0)).build();
     }

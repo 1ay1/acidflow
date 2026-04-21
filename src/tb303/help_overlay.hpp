@@ -37,6 +37,7 @@ using namespace maya;
     children.push_back(row("M  (S-m)",     "evolve pattern — one small mutation per press"));
     children.push_back(row("u / U",        "undo / redo last destructive action (32-deep)"));
     children.push_back(row("W  (S-w)",     "start/stop live recording (take \xe2\x86\x92 live_<ts>.wav+.txt)"));
+    children.push_back(row("Y  (S-y)",     "open take picker (load any live_<ts>.txt recording)"));
     children.push_back(row("T  (S-t)",     "cycle colour theme (classic / cyber / moss / ice / mono)"));
     children.push_back(row("e",            "export pattern as WAV (4 loops)"));
     children.push_back(row("E  (S-e)",     "export pattern as MIDI file (.mid)"));

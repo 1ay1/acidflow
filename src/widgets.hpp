@@ -22,3 +22,4 @@
 #include "tb303/transport.hpp"
 #include "tb303/help_bar.hpp"
 #include "tb303/help_overlay.hpp"
+#include "tb303/take_picker.hpp"

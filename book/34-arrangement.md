@@ -260,12 +260,13 @@ Transitions are the 2-4 bars that connect one section to the next. They're criti
 
 ## Arrangement and song mode
 
-Chapter 30's song mode automates part of this. The chain moves from slot to slot automatically. But:
+Chapter 30's song mode automates most of this. The chain moves from slot to slot automatically, and:
 
-- Song mode's one-cycle-per-slot rule means each slot is 1 bar. Arrangement needs 16+ bar sections, requiring duplicates.
-- Knob moves AREN'T automated by song mode. Filter sweeps must be performed manually.
+- **Per-slot bar holds** (`(` / `)`, cycling 1/2/4/8/16/32/64) let each slot run for its natural section length. No need to clone "main pattern" across five slots anymore — give slot 2 a 32-bar hold and it holds for 32 bars.
+- **Knob values are saved per slot.** CUTOFF, RES, ENVMOD, DECAY, DRIVE, VOL, and all FX knobs snap to their slot values at each wrap boundary. A "bright driven slot" and a "dark wet slot" can live side by side and the transition does itself.
+- **`Shift+A` auto-arranges** all 9 slots as a coherent 10-minute song with section bar counts already dialled to the roles (intro 32, build 32, peak 64, drop 64, outro 16, etc.). Fastest way to audition a full arrangement.
 
-So song mode is useful for pattern changes in an arrangement but not for knob motion. The knob motion must be performed live.
+Live knob moves are still yours to perform between wraps — use them as decoration on top of the programmed slot values. When the chain crosses the boundary, the new slot's saved knobs take over.
 
 ## Writing down an arrangement
 
