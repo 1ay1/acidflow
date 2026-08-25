@@ -46,7 +46,7 @@ using namespace maya;
         .wrap    = TextWrap::NoWrap,
     }};
 
-    auto chart = dsl::component([cutoff01, res01, live_fc](int w, int h) -> Element {
+    auto chart = dsl::fill([cutoff01, res01, live_fc](int w, int h) -> Element {
         // 8-level vertical block chars (empty..full). blocks[0] is a space so
         // the background in empty cells renders as pure background colour.
         static constexpr const char* blocks[] = {
@@ -299,7 +299,7 @@ using namespace maya;
         }});
 
         return (dsl::v(std::move(rows)) | dsl::gap(0)).build();
-    }).grow(1).min_height(Dimension::fixed(5));
+    }, /*min_w=*/0, /*min_h=*/5);
 
     return dsl::vstack()
         .border(BorderStyle::Round)

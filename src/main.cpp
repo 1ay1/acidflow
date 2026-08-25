@@ -1264,12 +1264,13 @@ static void randomize_drums(int arch_hint = -1, bool silent = false) {
             hit(0, 0); hit(0, 4); hit(0, 8); hit(0, 12);
             hit(4, 4); hit(4, 12);
             Hat h = chance_hat(0.60f, 0.10f, 0.15f);
-            if (h == HAT_CH)
+            if (h == HAT_CH) {
                 for (int i = 2; i < 16; i += 4) if (chance(0.85f * density)) hit(2, i);
-            else if (h == HAT_OH)
+            } else if (h == HAT_OH) {
                 for (int i = 2; i < 16; i += 4) if (chance(0.70f * density)) hit(3, i);
-            else if (h == HAT_RD)
+            } else if (h == HAT_RD) {
                 for (int i = 0; i < 16; i += 2) if (chance(0.65f * density)) hit(14, i);
+            }
             if (chance(0.35f * density)) hit(8, 10);                   // lonely cowbell
             if (chance(0.35f * density))                               // rim ghosts
                 for (int i : { 3, 11 }) if (chance(0.6f)) hit(7, i);
@@ -3213,7 +3214,7 @@ static void handle_mouse(const MouseEvent& m) {
         return;
     }
 
-    HitZone z = hit_test(col, row);
+    HitZone z = ::hit_test(col, row);
 
     // ── Scroll wheel ───────────────────────────────────────────────────────
     if (m.button == MouseButton::ScrollUp || m.button == MouseButton::ScrollDown) {
@@ -4313,7 +4314,7 @@ static Element render_frame() {
     // to a voice index without guessing at layout math — click mapping then
     // works whether the panel got its full 20 rows or is clipped on a short
     // terminal.
-    auto drums_component = dsl::component([=](int, int h) -> Element {
+    auto drums_component = dsl::fill([=](int, int h) -> Element {
         // h = interior height of the drum panel (inside its border + padding).
         // The widget lays out as: 1 header row, N voice rows, 1 bus row.
         // When clipped, the bottom is cut first (header + early voices stay
@@ -4335,7 +4336,7 @@ static Element render_frame() {
                                   g_playing ? g_current_step : -1,
                                   g_drum_master,
                                   g_focus == Section::Drums);
-    }).grow(1);
+    }, /*min_w=*/0, /*min_h=*/kDrumVoices + 2);
 
     auto drum_panel = dsl::vstack()
         .border(BorderStyle::Round)
@@ -4544,11 +4545,17 @@ int main() {
             // pass captures the current terminal (w, h) into globals. We need
             // these for mouse hit-testing — maya doesn't otherwise expose
             // widget positions to user code.
-            return Element{dsl::component([](int w, int h) -> Element {
+            // Use dsl::fill (not component().grow(1)): fill installs a
+            // measure so grow actually expands it to the whole terminal and
+            // hands the REAL allocated (w, h) to the callback. A bare
+            // component().grow(1) is content-measured by maya's layout and
+            // collapses to ~0x0 at the root, so g_term_w/h came back zero and
+            // render_frame() produced an empty frame every tick (frozen UI).
+            return Element{dsl::fill([](int w, int h) -> Element {
                 g_term_w = w;
                 g_term_h = h;
                 return render_frame();
-            }).grow(1)};
+            })};
         }
     );
 

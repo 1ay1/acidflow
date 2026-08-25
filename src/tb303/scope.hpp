@@ -39,7 +39,7 @@ inline constexpr uint8_t kBrailleColBits[2][4] = {
 };
 
 [[nodiscard]] inline Element build_scope() {
-    auto scope = dsl::component([](int w, int h) -> Element {
+    auto scope = dsl::fill([](int w, int h) -> Element {
         int chart_h = std::max(2, h - 1);          // reserve 1 row for meter
         int chart_w = std::max(8, w);
 
@@ -258,7 +258,7 @@ inline constexpr uint8_t kBrailleColBits[2][4] = {
         }});
 
         return (dsl::v(std::move(rows)) | dsl::gap(0)).build();
-    }).grow(1).min_height(Dimension::fixed(4));
+    }, /*min_w=*/0, /*min_h=*/4);
 
     return dsl::vstack()
         .border(BorderStyle::Round)
