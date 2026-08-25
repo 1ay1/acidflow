@@ -63,8 +63,32 @@
 #include <thread>
 #include <vector>
 
+// Denormal (subnormal) floats cost 10-100x to process on x86, and the
+// reverb/delay/filter feedback paths in this engine ring out toward zero
+// every time playback stops — decaying tails are a denormal factory. Without
+// flush-to-zero the audio thread can spike hard the moment the synth goes
+// quiet. Enable FTZ+DAZ on x86; on other ISAs the loops below still clamp
+// tiny values explicitly where it matters.
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#include <pmmintrin.h>
+#include <xmmintrin.h>
+#define ACID_HAS_SSE_DENORMAL 1
+#endif
+
 namespace acid {
 namespace {
+
+#ifdef ACID_HAS_SSE_DENORMAL
+// Set flush-to-zero + denormals-are-zero for the calling (audio) thread.
+// Cheap enough to re-arm at the top of every render block, which also
+// guarantees it's active on whatever thread the backend actually runs on.
+inline void enable_denormal_flush() {
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+}
+#else
+inline void enable_denormal_flush() {}
+#endif
 
 // ── Parameters (UI-thread writes, audio-thread reads per block) ─────────────
 struct Params {
@@ -764,7 +788,12 @@ void set_sample_rate(int sr) {
 int  sample_rate()           { return g_sample_rate; }
 
 void render(float* out, int frames) {
-    const float sr    = static_cast<float>(g_sample_rate);
+    enable_denormal_flush();
+    // Guard the reciprocal below: a backend that reports a bogus 0 rate (or a
+    // set_sample_rate(0)) must not turn every per-sample dt into inf/NaN and
+    // poison the whole graph.
+    const int   sr_i  = g_sample_rate > 0 ? g_sample_rate : kDefaultSampleRate;
+    const float sr    = static_cast<float>(sr_i);
     const float dt_s  = 1.0f / sr;
 
     // ── External note command ring (legacy path; used by nothing now, but

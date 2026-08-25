@@ -69,22 +69,21 @@ public:
             // Core: glyph(1) + space(1) + name(3) = 5 cells; centered in 8.
             std::string core;
             core += " ";
-            size_t g_off = 1;
+            size_t g_off = core.size();
             core += glyph;  // 3 bytes, 1 display col
             core += " ";
             size_t n_off = core.size();
             core += name;
             core += " ";
-            (void)g_off;
 
             auto [txt, off] = centered(core, WIDTH);
             std::vector<StyledRun> runs;
             Color c = selected ? sel_col : unsel_col;
-            // glyph run: core position 1, length 3 bytes
-            runs.push_back(StyledRun{off + 1, 3,
+            // glyph run: byte offset g_off, length 3 bytes (1 display col)
+            runs.push_back(StyledRun{off + g_off, 3,
                 Style{}.with_fg(c).with_bold()});
-            // name run: byte offset in `core` = 1 + 3 + 1 = 5; length = strlen(name)
-            runs.push_back(StyledRun{off + 5, std::string_view(name).size(),
+            // name run: byte offset n_off, length = strlen(name)
+            runs.push_back(StyledRun{off + n_off, std::string_view(name).size(),
                 Style{}.with_fg(c).with_bold()});
             rows.push_back(Element{TextElement{
                 .content = std::move(txt),
