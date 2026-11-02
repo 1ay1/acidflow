@@ -70,12 +70,9 @@ jobs:
         working-directory: acidflow
         run: |
           # libstdc++ is linked in so users don't need gcc 16's runtime.
-          flags="-static-libstdc++ -static-libgcc"
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DACIDFLOW_NATIVE=OFF -DACIDFLOW_BUILD_CLAP=ON \
-            -DCMAKE_EXE_LINKER_FLAGS="$flags" \
-            -DCMAKE_MODULE_LINKER_FLAGS="$flags" \
-            -DCMAKE_SHARED_LINKER_FLAGS="$flags"
+            -DACIDFLOW_STATIC_RUNTIME=ON
           cmake --build build -j
 
       - name: Test
@@ -98,9 +95,11 @@ jobs:
           cp -R build/plugin/acidflow.clap dist/$name/
           strip dist/$name/acidflow dist/$name/acid_render || true
           if [ "$RUNNER_OS" = "Linux" ]; then
-            echo "--- dynamic deps"; ldd dist/$name/acidflow
+            ldd dist/$name/acidflow | tee /tmp/deps
+            if grep -q libstdc++ /tmp/deps; then echo "libstdc++ not static"; exit 1; fi
           else
-            echo "--- dynamic deps"; otool -L dist/$name/acidflow
+            otool -L dist/$name/acidflow dist/$name/acidflow.clap/Contents/MacOS/* | tee /tmp/deps
+            if grep -q /opt/homebrew /tmp/deps; then echo "links homebrew gcc runtime"; exit 1; fi
             codesign --force -s - dist/$name/acidflow dist/$name/acid_render
             codesign --force --deep -s - dist/$name/acidflow.clap
           fi

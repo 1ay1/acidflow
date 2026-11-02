@@ -17,6 +17,12 @@ option(ACIDFLOW_BUILD_APP    "Build the terminal app (needs ../maya)"       ON)
 option(ACIDFLOW_BUILD_TESTS  "Build the test suite"                         ON)
 option(ACIDFLOW_BUILD_CLAP   "Build the CLAP plugin (fetches the CLAP SDK)" OFF)
 option(ACIDFLOW_NATIVE       "Tune for this CPU (-march=native)"            ON)
+option(ACIDFLOW_STATIC_RUNTIME "Link libstdc++/libgcc statically (gcc, for release builds)" OFF)
+
+# Only on gcc links, so Apple clang's C compiler checks don't see the flags.
+if(ACIDFLOW_STATIC_RUNTIME)
+    add_link_options($<$<CXX_COMPILER_ID:GNU>:-static-libstdc++$<SEMICOLON>-static-libgcc>)
+endif()
 
 # Shared compile options for everything that runs DSP.
 add_library(acid_flags INTERFACE)
