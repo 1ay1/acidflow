@@ -28,13 +28,15 @@ acidflow is a self-contained instrument. You can make a full track without MIDI.
 - **Driving other synths** — use acidflow's sequencer to send notes to external hardware (a Moog, an analog bass synth, anything MIDI).
 - **Receiving from a DAW's sequencer** — let Ableton, Logic, or FL drive acidflow while you just use acidflow as a sound source.
 
-## Platform caveat
+## Platforms
 
-MIDI in acidflow is currently **Linux-only** (ALSA). On macOS and Windows, the MIDI keys still work in the UI, but the backend is a stub — nothing actually gets sent or received. The ALSA backend creates one sequencer client with an input and output port.
+MIDI in acidflow works on **Linux** (ALSA sequencer), **macOS** (CoreMIDI) and **Windows** (WinMM). On Linux, the ALSA backend creates one sequencer client with an input and output port.
 
-To connect: use `aconnect` from the command line, or configure your DAW to use the acidflow ALSA port.
+To connect on Linux: use `aconnect` from the command line, or configure your DAW to use the acidflow ALSA port. On macOS and Windows, pick acidflow's ports (or your device) in your DAW's / system's MIDI setup.
 
-If you're on macOS or Windows, skip this chapter or treat it as reference for when the platform support arrives.
+The examples below use the Linux tools; the ideas are the same everywhere.
+
+**MIDI learn**: focus a knob (or FX knob), press `l`, then move a controller. The mapping is saved to `midi_map.txt`.
 
 ## The two toggles
 

@@ -200,7 +200,7 @@ For a longer full track, you need to re-arrange during the set — save new vari
 
 ## Song mode and knob moves
 
-Slots save their knob positions. The full list: 303 TUNE, CUTOFF, RES, ENVMOD, DECAY, ACCENT, DRIVE, VOL, WAVE; FX OVERDRIVE, DLY MIX/FB/DIV, REV MIX/SIZE/DAMP. When the chain advances from slot 1 to slot 2, the notes change *and* every saved knob snaps to its slot-2 value at the wrap boundary.
+Slots save their knob positions. The full list: 303 TUNE, CUTOFF, RES, ENVMOD, DECAY, ACCENT, DRIVE, VOL, WAVE; FX OVERDRIVE, delay MIX/FB/DIV, reverb MIX/SIZE/DAMP. When the chain advances from slot 1 to slot 2, the notes change *and* every saved knob snaps to its slot-2 value at the wrap boundary.
 
 This changes how you arrange:
 

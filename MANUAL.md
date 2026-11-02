@@ -43,9 +43,9 @@ It's a set of pieces that fit together:
 
 - A **DSP engine** that models the 303's signal chain from circuit analysis (oscillator → diode-ladder filter → VCA → output saturation) — not from sample playback.
 - A **16-step sequencer** with the real-303 per-step controls (pitch, accent, slide, rest) plus extras the original never had: **probability**, **ratchet**, and **per-step parameter locks** on cutoff / resonance / env-mod / accent.
-- A **5-voice synthesized drum machine** (BD / SD / CH / OH / CL) with its own 16-step grid and a master send that routes drums through the same FX as the bass.
-- An **FX rack** — pre-filter overdrive, tempo-synced delay, plate reverb — on the master bus.
-- **MIDI I/O** on Linux (ALSA sequencer): note and drum output on channel 10, clock out, external clock/start/stop sync, and note-in routing to the bass voice. Other platforms get the UI toggles but the backend is a stub.
+- A **16-voice synthesized drum machine** (BD SD CH OH CL LT HT RS CB SH TB CG MT CY RD BG) with its own 16-step grid and a master send that routes drums through the same FX as the bass.
+- An **FX rack**: a pre-filter overdrive on the 303 voice, then a tempo-synced stereo tape delay and a plate reverb on the whole mix.
+- **MIDI I/O** on Linux (ALSA sequencer), macOS (CoreMIDI) and Windows (WinMM): note and drum output on channel 10, clock out, external clock/start/stop sync, and note-in routing to the bass voice.
 - **Song mode** (chain saved slots on pattern wrap) and **jam mode** (two-octave live keyboard into the 303 voice).
 - A **TUI** built on the [`maya`](https://github.com/1ay1/maya) C++26 framework — keyboard-first, mouse-aware, full-screen, five switchable colour themes.
 
@@ -86,7 +86,7 @@ The build is `Release` by default (`-O3 -march=native -funroll-loops` on GCC/Cla
 It opens in **fullscreen** terminal mode. Your terminal needs to support:
 
 - True-color / 24-bit color (any modern emulator does)
-- UTF-8 box-drawing and Braille glyphs (any modern font does)
+- UTF-8 box-drawing and block glyphs (any modern font does)
 - SGR mouse mode (every mainstream emulator since 2015 does)
 
 There are **no command-line flags**. Everything is configured inside the app.
@@ -330,7 +330,7 @@ When the **FX** section is focused (orange border):
 | Key | What it does |
 |---|---|
 | `←` / `→` | Move selection between FX knobs |
-| `↑` / `↓` | Adjust by 5% (DLY TIME steps through the four divisions) |
+| `↑` / `↓` | Adjust by 5% (delay TIME steps through the four divisions) |
 | `[` / `]` | Coarse adjust by 10% |
 | `0` | Reset to default |
 | `m` | Mute the FX bus (see [§9 transport](#9-transport-bpm-swing-length-presets) — the mute keys apply per-section) |
@@ -406,7 +406,7 @@ Notes don't play when **playback is stopped** — editing is silent. To audition
 
 ## 8. The drum machine
 
-Nine synthesized drum voices that run alongside the 303, each with its own 16-step lane. The voices are **generated**, not sampled — the engine cost per voice is a handful of envelopes plus a noise LFSR or a small oscillator bank. No samples on disk.
+Sixteen synthesized drum voices that run alongside the 303, each with its own 16-step lane. The voices are **generated**, not sampled — the engine cost per voice is a handful of envelopes plus a noise LFSR or a small oscillator bank. No samples on disk.
 
 | Row | Voice | What it is |
 |---|---|---|
@@ -420,7 +420,7 @@ Nine synthesized drum voices that run alongside the 303, each with its own 16-st
 | 8 | **RS** | Rimshot — 1.65 kHz + 2.2 kHz sines plus a bandpassed noise burst, 18 ms decay. Sharp transient click. |
 | 9 | **CB** | 808 cowbell — two detuned squares (540 + 800 Hz) through a bandpass, 180 ms decay. Classic metallic "clonk". |
 
-All nine voices sum into a **master drum bus** that feeds the FX chain (delay + reverb) alongside the 303 voice. Per-voice gains are baked to sit right when the bass is at defaults; a global drum-bus knob `[ / ]` scales everything.
+All sixteen voices sum into a **master drum bus** that feeds the FX chain (delay + reverb) alongside the 303 voice. Per-voice gains are baked to sit right when the bass is at defaults; a global drum-bus knob `[ / ]` scales everything.
 
 ### Editing the grid
 
@@ -534,7 +534,7 @@ Terminals don't reliably deliver key-*release* events, so each press arms a shor
 
 ## 12. MIDI I/O
 
-MIDI is currently **Linux-only** (ALSA sequencer). On macOS and Windows the UI keys still work, but the backend is a stub and nothing gets forwarded. The ALSA backend creates one sequencer client with a single input and single output port — connect them with `aconnect` or your DAW.
+MIDI works on **Linux** (ALSA sequencer), **macOS** (CoreMIDI) and **Windows** (WinMM). On Linux the ALSA backend creates one sequencer client with a single input and single output port — connect them with `aconnect` or your DAW.
 
 | Key | What it does |
 |---|---|
@@ -789,7 +789,7 @@ This is the full canonical list, also accessible inside the app via `?`.
 
 | Key | Action |
 |---|---|
-| `Tab` | Cycle focus forward (Knobs → FX → Sequencer → Drums → Transport → Knobs …) |
+| `Tab` | Cycle focus forward (Knobs → FX → Transport → Drums → Sequencer → Knobs …) |
 | `Shift+Tab` | Cycle focus backward |
 | `Space` | Play / pause |
 | `r` | Randomize current section |
@@ -806,8 +806,10 @@ This is the full canonical list, also accessible inside the app via `?`.
 | `P` (Shift+P) | Import pattern from `pattern.txt` |
 | `Shift+1` … `Shift+9` | Save pattern to slot 1–9 |
 | `1` … `9` | Load pattern from slot 1–9 (Sequencer / Drums consume these for their own uses, so load from any other section) |
-| `?` | Toggle keyboard reference overlay |
-| `q` / `Q` / `Esc` | Quit (closes help overlay first if open) |
+| `?` | Open help (on the current panel; type to search) |
+| `:` / `Ctrl+K` | Command palette |
+| `Esc` | Close help / palette / menus / jam mode (never quits) |
+| `q` / `Q` | Quit (session is saved) |
 
 ### When **Knobs** is focused
 
@@ -825,7 +827,7 @@ This is the full canonical list, also accessible inside the app via `?`.
 | Key | Action |
 |---|---|
 | `←` / `→` | Select previous / next FX knob |
-| `↑` / `↓` | Adjust (DLY TIME steps through the four divisions) |
+| `↑` / `↓` | Adjust (delay TIME steps through the four divisions) |
 | `[` / `]` | Coarse adjust |
 | `0` | Reset FX knob |
 | `m` | Mute the FX bus |
@@ -881,7 +883,7 @@ See [§11](#11-jam-mode) for the full layout. While jam mode is on, the tracker 
 
 ### Help overlay
 
-When open, **only** `?` and `Esc` close it. Everything else is a no-op until you close it. The overlay **scrolls** — use the mouse wheel over the modal to read entries that fall off the bottom on short terminals.
+Typing filters it and `Tab` flips panels; `Esc` clears the search, then closes (`?` also closes). The overlay **scrolls** — use the mouse wheel over the modal to read entries that fall off the bottom on short terminals.
 
 ---
 
@@ -1049,7 +1051,7 @@ The shared interface is the C-style API in `src/audio.hpp` — `acid_start()`, `
 - `transport.hpp` — playback status, BPM / swing / length displays, preset browser.
 - `waveform_toggle.hpp` — saw / square button.
 - `help_bar.hpp` — context-sensitive footer.
-- `help_overlay.hpp` — full keyboard reference (modal).
+- `help_overlay.hpp` — help overlay (modal).
 - `theme.hpp` — shared color palette (orange-accent on near-black).
 
 Every widget is a function returning a `maya::Element`. Per-frame, `render_frame()` builds the entire tree from scratch and hands it to `maya` — no manual diffing or redraw logic.
@@ -1182,7 +1184,7 @@ WASAPI and CoreAudio sometimes resample to 48 kHz; ALSA usually delivers 44.1 kH
 
 ### "exporting a WAV produced silence / glitches"
 
-Make sure the pattern actually has notes (not all rests). The export pauses live audio while it runs, so you won't hear it producing — wait for the toast. If the file is corrupt, check that `~/.config/acidflow/` is writable.
+Make sure the pattern actually has notes (not all rests). Playback keeps going while the export renders — wait for the toast. If the file is corrupt, check that `~/.config/acidflow/` is writable.
 
 ---
 

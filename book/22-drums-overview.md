@@ -1,8 +1,8 @@
-# 22 · The 5-voice drum machine
+# 22 · The 16-voice drum machine
 
-acidflow ships a built-in 5-voice drum machine. Not a sample player — a synthesis-based drum machine, closer in architecture to the TR-808 / TR-909 than to a modern sampler. Each of the five voices is generated from scratch: waveforms, noise, envelopes, and filters, with zero samples on disk.
+acidflow ships a built-in 16-voice drum machine. Not a sample player — a synthesis-based drum machine, closer in architecture to the TR-808 / TR-909 than to a modern sampler. Each of the sixteen voices is generated from scratch: waveforms, noise, envelopes, and filters, with zero samples on disk.
 
-This chapter introduces the five voices. Subsequent chapters dig into each one.
+This chapter introduces the voices, focusing on the five core ones. Subsequent chapters dig into each of those.
 
 ## Why synthesized drums
 
@@ -15,9 +15,9 @@ The choice to synthesize rather than sample was deliberate:
 
 The trade-off: acidflow's drums are less realistic than samples. A real kick drum, recorded, has subtle microtransients and body resonance that a synth can't fully replicate. But for dance music — where drums serve rhythmic function more than realistic body — synthesis wins.
 
-## The five voices
+## The five core voices
 
-acidflow has exactly five drum voices. This is a common count — the 909 has 11, the 808 has 16, the LinnDrum has 18 — but for acid, five is plenty. The voices are:
+acidflow has sixteen drum voices: BD SD CH OH CL LT HT RS CB SH TB CG MT CY RD BG (kick, snare, closed and open hat, clap, low and high tom, rimshot, cowbell, shaker, tambourine, conga, mid tom, crash, ride, bongo). For acid, though, five of them carry almost every pattern:
 
 1. **BD** (Bass Drum / Kick)
 2. **SD** (Snare Drum)
@@ -33,7 +33,7 @@ Each occupies a specific frequency range and rhythmic function:
 - **OH**: 4-8 kHz (longer noise tail). The "chick" of offbeats.
 - **CL**: 800-3000 Hz (noise bursts). Additional backbeat emphasis.
 
-These five together cover the standard dance drum skeleton. Other percussion (toms, cowbells, rides) are not present — acid doesn't use them much.
+These five together cover the standard dance drum skeleton. The other eleven (toms, rimshot, cowbell, shakers, congas, cymbals) are there for fills and texture — acid doesn't lean on them much.
 
 ## The 16-step drum grid
 
@@ -56,7 +56,7 @@ Per-voice gain is separate (each voice has its own volume). The whole drum kit g
 Drums don't need per-step modifiers because:
 
 - Accent on drums is less useful than on synth — a drum is already percussive. You can make a drum hit "heavier" by stacking multiple voices rather than accenting one.
-- Slide doesn't apply — drums don't glide (well, toms can, but acidflow doesn't have toms).
+- Slide doesn't apply — drums don't glide (well, toms can, but acidflow's toms don't).
 - Probability could apply, but the UI complexity wasn't worth it for this program's scope. Use p-lock style patterns instead.
 - Ratchet could apply (machine-gun snares), but again, complexity trade-off.
 
@@ -137,7 +137,7 @@ This is the half-time feel — common in drum 'n' bass crossover acid, electro, 
 
 ## The drum bus
 
-All five drum voices sum into a single **drum bus**. The bus has:
+All sixteen drum voices sum into a single **drum bus**. The bus has:
 
 - A **drum bus master gain** (adjustable via `[`/`]` when drums are focused).
 - A **drum bus mute** (context-dependent; via `m` in drums section).

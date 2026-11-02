@@ -152,6 +152,34 @@ TEST("plate reverb: decays, stays finite, is stereo") {
     CHECK_LT(std::fabs(num / std::sqrt(dl * dr)), 0.5);
 }
 
+TEST("plate reverb: SIZE sweeps RT60 from under 1 s to about 5 s") {
+    auto rt60 = [](float size) {
+        static DattorroPlate p;
+        p.set_sample_rate(48000);
+        const int n = 48000 * 20;
+        std::vector<double> sch(static_cast<size_t>(n));
+        std::vector<float> e(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            float l, r;
+            p.process(i < 48 ? 1.0f : 0.0f, size, 0.35f, l, r);
+            e[static_cast<size_t>(i)] = l * l + r * r;
+        }
+        double acc = 0;
+        for (int i = n - 1; i >= 0; --i) { acc += e[static_cast<size_t>(i)]; sch[static_cast<size_t>(i)] = acc; }
+        auto db = [&](int i) { return 10 * std::log10(sch[static_cast<size_t>(i)] / sch[0] + 1e-30); };
+        int a = 0;
+        while (a < n && db(a) > -5) ++a;
+        int b = a;
+        while (b < n && db(b) > -35) ++b;
+        return b < n ? (b - a) / 48000.0 * 2.0 : 99.0;   // T30 × 2
+    };
+    const double lo = rt60(0.0f), mid = rt60(0.5f), hi = rt60(1.0f);
+    std::printf("      RT60: size 0 %.1f s, 0.5 %.1f s, 1 %.1f s\n", lo, mid, hi);
+    CHECK(lo > 0.5 && lo < 1.2);
+    CHECK(mid > 1.4 && mid < 2.6);
+    CHECK(hi > 4.0 && hi < 6.5);
+}
+
 TEST("plate reverb: bounded at max size") {
     static DattorroPlate p;
     p.set_sample_rate(44100);

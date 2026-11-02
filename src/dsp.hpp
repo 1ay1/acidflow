@@ -276,7 +276,11 @@ inline void DattorroPlate::process(float in, float decay, float damp,
     x = allpass(in_ap_[2], len_in_[2], 0.625f, x);
     x = allpass(in_ap_[3], len_in_[3], 0.625f, x);
 
-    const float dec  = 0.2f + 0.78f * std::clamp(decay, 0.0f, 1.0f);
+    // SIZE → tank decay, fitted so RT60 sweeps evenly (exponentially) from
+    // about 0.8 s to 5 s. A linear map spent the top third of the knob on
+    // 10–60 s tails that never stop ringing.
+    const float sz   = std::clamp(decay, 0.0f, 1.0f);
+    const float dec  = ((-0.3993f * sz + 0.4896f) * sz + 0.4775f) * sz + 0.1874f;
     const float dmp  = 0.0005f + 0.7f * std::clamp(damp, 0.0f, 1.0f);
     const float dd2  = std::clamp(dec + 0.15f, 0.25f, 0.50f);
 

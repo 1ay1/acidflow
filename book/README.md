@@ -56,7 +56,7 @@ If you don't have a second monitor, read a chapter, close the book, spend ten mi
 
 ### Part IV — Drums and Rhythm
 
-22. [The 5-voice drum machine](22-drums-overview.md)
+22. [The 16-voice drum machine](22-drums-overview.md)
 23. [The kick (BD) — programming and theory](23-kick.md)
 24. [Snare, hats, clap](24-snare-hats-clap.md)
 25. [Programming acid drums](25-drum-programming.md)

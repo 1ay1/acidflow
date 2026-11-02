@@ -45,7 +45,7 @@ This is intentional. acidflow is a synth + drum machine + basic FX, not a mixing
 - **Sidechain**: can't duck 303 under kick.
 - **Per-element FX**: drive/delay/reverb are on the master bus only.
 - **Stereo processing**: can't adjust stereo width or position per element.
-- **Limiter**: no brickwall limiting on the master.
+- **Limiter control**: the master has a fixed look-ahead safety limiter at −1 dBFS, but no adjustable mastering limiter.
 
 All of these are DAW territory.
 
@@ -85,7 +85,7 @@ If the track is muddy (too much low-mid), try raising CUTOFF or TUNE. If it's ha
 
 Without compression, your dynamics are whatever the pattern produces. Accents produce louder notes; non-accents are quieter.
 
-The FX DRIVE acts as a mild compression — soft-clipping peaks makes the track feel more "even."
+The OD DRIVE acts as a mild compression — soft-clipping peaks makes the track feel more "even."
 
 Heavy accents without drive = wide dynamic range (loud-quiet-loud). Heavy accents WITH drive = narrower range (everything clipped toward average).
 
@@ -96,11 +96,11 @@ If your track feels too dynamic (listener adjusts volume constantly), add some F
 The FX rack is your space/depth tool. Too little = flat, clinical mix. Too much = washed, muddy mix.
 
 Guidelines:
-- FX DRIVE: 15-30% for most tracks.
-- DLY MIX: 10-30%.
-- DLY FB: 0.3-0.6.
-- REV MIX: 10-25%.
-- REV SIZE: 0.3-0.5 for tight rooms; 0.5-0.7 for dubby.
+- OD DRIVE: 15-30% for most tracks.
+- delay MIX: 10-30%.
+- delay FDBK: 0.3-0.6.
+- reverb MIX: 10-25%.
+- reverb SIZE: 0.3-0.5 for tight rooms; 0.5-0.7 for dubby.
 
 These are starting points. Adjust by ear.
 
@@ -173,7 +173,7 @@ Add whatever processing you want: EQ per stem, compression per stem, stereo wide
 
 This loses some cohesion (the FX rack applied to both at once, baked-in; you can't remove it in the stems). But it gives you per-element control.
 
-Better: export 303_only with no FX (turn FX off). Drums_only with no FX. Add FX in the DAW per stem. More flexible.
+Better: you don't have to do this by hand. Every `e` export also writes dry stems next to `bounce.wav` — `bounce_synth.wav` and `bounce_drums.wav`, with no FX. Add FX in the DAW per stem. More flexible.
 
 ## Reference tracks
 

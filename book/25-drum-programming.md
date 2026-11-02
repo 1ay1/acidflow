@@ -1,6 +1,6 @@
 # 25 · Programming acid drums
 
-You have five voices and 16 steps. That's 80 possible hit-positions per pattern. Most will be empty. The art of drum programming is in which ones aren't — and why.
+You have sixteen voices and 16 steps. That's 256 possible hit-positions per pattern. Most will be empty. The art of drum programming is in which ones aren't — and why.
 
 This chapter is about compositional principles for acid drum patterns specifically. Not generic "dance music drums" — acid drums, with their particular conventions.
 
@@ -42,7 +42,7 @@ Program the kick first, alone. Make sure it grooves (usually 4-on-the-floor). Th
 
 If you add a voice and the pattern loses groove, that voice is wrong. Remove it and try somewhere else.
 
-Common mistake: adding all five voices at once and then trying to "fix" them. You end up with a pattern that's kind of OK but not great. Starting from the kick and building out produces stronger patterns.
+Common mistake: adding all five core voices at once and then trying to "fix" them. You end up with a pattern that's kind of OK but not great. Starting from the kick and building out produces stronger patterns.
 
 ## Filling the subdivisions
 

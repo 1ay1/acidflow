@@ -14,7 +14,7 @@ The 303's filter is a 4-pole lowpass. So is the Moog's. So is the ARP 2600's. Bu
 
 These two non-linearities — per-stage and global — are why the 303 doesn't get ugly when you push the resonance. A linear high-Q filter driven hard will squeal, clip, and sound harsh. A tanh-limited filter does the *same thing* but wraps it in a soft saturation that turns the squeal into a sung note rather than a digital screech. This is why acid basses sound **expressive** at high resonance rather than **broken**.
 
-acidflow models the tanh non-linearities precisely — each ladder stage and the global feedback all pass through soft-clipping. Without this, self-oscillation would be a buzzsaw. With this, it's a voice.
+acidflow models the diode ladder's coupled stages and puts a tanh on the input node, where the resonance feedback re-enters, solving the loop exactly (zero-delay feedback, with Newton steps) at 2× oversampling. Without that soft clip, self-oscillation would be a buzzsaw. With it, it's a voice.
 
 ## 2. The filter resonance can self-oscillate, and the threshold is musical
 

@@ -10,7 +10,7 @@ These work regardless of focus:
 
 | Key | Action |
 |---|---|
-| `Tab` | Cycle focus forward (Knobs → FX → Sequencer → Drums → Transport → Knobs …) |
+| `Tab` | Cycle focus forward (Knobs → FX → Transport → Drums → Sequencer → Knobs …) |
 | `Shift+Tab` | Cycle focus backward |
 | `Space` | Play / pause |
 | `r` | Randomize current section |
@@ -22,13 +22,17 @@ These work regardless of focus:
 | `O` (Shift+O) | Toggle MIDI out |
 | `I` (Shift+I) | Toggle MIDI sync in |
 | `e` | Export pattern as WAV (4 loops) |
+| `W` (Shift+W) | Start / stop live recording (24-bit stereo WAV) |
+| `K` (Shift+K) | Toggle Ableton Link (builds with `-DACIDFLOW_LINK=ON`) |
 | `E` (Shift+E) | Export pattern as MIDI (.mid) |
 | `p` | Export pattern as shareable text |
 | `P` (Shift+P) | Import pattern from text |
 | `Shift+1` … `Shift+9` | Save pattern to slot 1-9 |
 | `1` … `9` | Load pattern from slot 1-9 (from non-Sequencer/Drums focus) |
-| `?` | Toggle keyboard reference overlay |
-| `q` / `Q` / `Esc` | Quit (closes help overlay first if open) |
+| `?` | Open help (opens on the current panel; type to search, `Tab` flips panels) |
+| `:` or `Ctrl+K` | Command palette — search and run any action |
+| `Esc` | Close help / palette / menus / jam mode (never quits) |
+| `q` / `Q` | Quit (session is saved) |
 
 ## When Knobs is focused
 
@@ -40,6 +44,7 @@ These work regardless of focus:
 | `0` | Reset selected knob to default |
 | `w` | Toggle WAVE (saw ↔ square) |
 | `m` | Mute the 303 voice (toggle) |
+| `l` | MIDI learn: then move a controller (saved to `midi_map.txt`; also works on FX knobs) |
 
 Knob order (left to right):
 1. TUNE
@@ -57,19 +62,19 @@ Knob order (left to right):
 | Key | Action |
 |---|---|
 | `←` / `→` | Select previous / next FX knob |
-| `↑` / `↓` | Adjust (DLY DIV steps through the four divisions) |
+| `↑` / `↓` | Adjust (delay TIME steps through the four divisions) |
 | `[` / `]` | Coarse adjust |
 | `0` | Reset FX knob |
 | `m` | Mute the FX bus |
 
-FX knobs (left to right):
-1. FX DRIVE
-2. DLY MIX
-3. DLY FB
-4. DLY DIV (1/16, 1/16 dotted, 1/8, 1/8 dotted)
-5. REV MIX
-6. REV SIZE
-7. REV DAMP
+FX knobs (left to right, grouped OD / DELAY / REVERB):
+1. DRIVE (overdrive)
+2. MIX (delay)
+3. FDBK (delay feedback)
+4. TIME (delay division: 1/16, 1/16 dotted, 1/8, 1/8 dotted)
+5. MIX (reverb)
+6. SIZE (reverb)
+7. DAMP (reverb)
 
 ## When Sequencer is focused
 
@@ -99,7 +104,7 @@ Note: `1` through `9` normally load pattern slots, but in Sequencer focus these 
 | Key | Action |
 |---|---|
 | `←` / `→` | Select step |
-| `↑` / `↓` | Select voice (BD / SD / CH / OH / CL) |
+| `↑` / `↓` | Select voice (BD / SD / CH / OH / CL / … / BG) |
 | `Space` / `x` | Toggle hit on selected cell |
 | `1` … `9`, `0` | Quick-toggle step 1..10 on current voice |
 | `[` / `]` | Drum-bus master gain −/+ |
@@ -113,6 +118,17 @@ Voice order:
 3. CH (closed hat)
 4. OH (open hat)
 5. CL (clap)
+6. LT (low tom)
+7. HT (high tom)
+8. RS (rimshot)
+9. CB (cowbell)
+10. SH (shaker)
+11. TB (tambourine)
+12. CG (conga)
+13. MT (mid tom)
+14. CY (crash)
+15. RD (ride)
+16. BG (bongo)
 
 ## When Transport is focused
 
@@ -163,7 +179,7 @@ Plus:
 | Left click | Focus the knob |
 | Left drag (vertical) | Adjust the value (up = increase, down = decrease) |
 | Scroll wheel | Adjust ±5% |
-| Right click | Reset to default |
+| Right click | Menu of the knob's actions (each shows its key) |
 
 WAVE knob is special: any click or scroll toggles saw/square (no drag).
 
@@ -173,7 +189,7 @@ WAVE knob is special: any click or scroll toggles saw/square (no drag).
 |---|---|
 | Left click | Select the step |
 | Scroll wheel | Transpose ±1 semitone |
-| Right click | Toggle rest |
+| Right click | Menu of the step's actions (each shows its key) |
 
 No drag-to-paint — click selects, keyboard edits.
 
@@ -195,7 +211,7 @@ When the help overlay (`?`) is open, mouse is ignored. Close first.
 Pressing `Tab` cycles through sections in this order:
 
 ```
-Knobs → FX → Sequencer → Drums → Transport → Knobs → ...
+Knobs → FX → Transport → Drums → Sequencer → Knobs → ...
 ```
 
 `Shift+Tab` reverses.
@@ -257,7 +273,7 @@ Personal favorites — you'll develop your own:
 - `r` — randomize current section.
 - `R` — randomize everything.
 - `M` — one mutation.
-- `?` — show full keybind list on-screen.
+- `?` — open help (every action, searchable).
 - `Shift+1` — save to slot 1 (muscle memory: always save to slot 1 first).
 - `1` — load slot 1 (when not in Sequencer/Drums).
 - `e` — export WAV.
@@ -282,8 +298,8 @@ Most users learn the 20 most-used keys in a week and never need the reference. B
 
 1. Start acidflow.
 2. Press `?`. The help overlay appears.
-3. Use the mouse wheel to scroll through the reference.
-4. Close with `?` or `Esc`.
+3. Use the mouse wheel to scroll through it, or type to search.
+4. Close with `?` or `Esc` (`Esc` clears a search first).
 5. Open again. Try each key listed for Knobs section.
 6. Open again. Try each key listed for Sequencer section.
 

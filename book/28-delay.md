@@ -20,10 +20,10 @@ To get multiple echoes, you feed a portion of the delayed signal back into the i
 
 acidflow's delay is:
 
-- **Mono tape-style**. Sums stereo input to mono before the buffer. Tape machines were mono or dual-mono; acidflow respects that convention.
+- **Stereo ping-pong, tape-style**. The input goes into the left side; repeats alternate left and right, bouncing across the stereo field.
 - **Tempo-synced**. The delay time is locked to the sequencer BPM. You pick a beat division (1/16, 1/16 dotted, 1/8, 1/8 dotted), not a time in milliseconds.
 - **~2 seconds maximum buffer** (96,000 samples at 48 kHz). More than enough for any musical division at any reasonable tempo.
-- **Feedback with a tape-darkening lowpass** at ~3.5 kHz inside the feedback path. Each repeat is duller than the last, mimicking analog tape's high-frequency rolloff.
+- **Tape colour in the feedback path**: saturation, a band-pass (highpass ~120 Hz, plus a lowpass that darkens as feedback rises) and slow wow + flutter. Each repeat is duller and a little wobblier than the last, mimicking analog tape.
 - **Feedback clamped below 1.0** (maximum 0.92) to prevent runaway self-oscillation. You can't make it scream.
 
 ### The signal flow
@@ -31,20 +31,20 @@ acidflow's delay is:
 ```
 Input ──┬──────────────────────────────┬──→ Output (dry)
         │                              │
-        └──→ [write buffer] ──→ [read buffer delayed by N samples]
+        └──→ [left buffer] ⇄ [right buffer]   (repeats ping-pong L ↔ R)
                                           │
-                                          ├──→ × wet → output
+                                          ├──→ × wet → L/R output
                                           │
-                                          └──→ × feedback → [lowpass 3.5 kHz] → back to input
+                                          └──→ × feedback → [tape sat → HP 120 Hz → LP → wow/flutter] → back in
 ```
 
 ## Controls
 
 acidflow exposes three delay parameters:
 
-- **DLY MIX** — wet send amount (0 to 1). 0 = bypass (no audible delay). 1 = full wet (but the dry still passes through; delay is additive, not a replacement).
-- **DLY FB** — feedback amount (0 to 0.92 internal cap). 0 = one echo only. 0.92 = many echoes that take a long time to decay.
-- **DLY DIV** — division, one of: 1/16, 1/16 dotted, 1/8, 1/8 dotted.
+- **delay MIX** — wet send amount (0 to 1). 0 = bypass (no audible delay). 1 = full wet (but the dry still passes through; delay is additive, not a replacement).
+- **delay FDBK** — feedback amount (0 to 0.92 internal cap). 0 = one echo only. 0.92 = many echoes that take a long time to decay.
+- **delay TIME** — division, one of: 1/16, 1/16 dotted, 1/8, 1/8 dotted.
 
 ### Division explained
 
@@ -83,9 +83,9 @@ For "dub" echoes that trail off gradually: 0.5-0.7. Five-to-ten echoes.
 
 For long tails approaching infinity: 0.8+. Use sparingly — every repeat builds up in the buffer.
 
-## The tape lowpass
+## The tape filter
 
-Inside the feedback loop is a one-pole lowpass at ~3.5 kHz. This means each pass through the feedback loop attenuates highs slightly.
+Inside the feedback loop is a band-pass: a highpass at ~120 Hz and a lowpass that gets darker as you raise feedback. This means each pass through the feedback loop attenuates highs (and the lowest lows) slightly.
 
 After 10 passes, the high end is significantly rolled off. The echo becomes a dark, boomy whisper of its original self.
 
@@ -154,7 +154,7 @@ If you have a programmed hit on step 2, the delay (step 3) will sound between pr
 - The original + echo pattern goes: hit (step 1), echo (step 4 — 3 sixteenths later), which in step terms: 1, 4, 7, 10, 13, 16 (the pattern of "every 3 sixteenths").
 - This is a hemiola (3 against 4) — a polyrhythm that feels like the music is "falling forward" into the next bar.
 
-This is the "Sandstorm" / "Children" delay. It's cliché but effective. If you want that driving, pulsing, pulling-forward feel, set DLY DIV to 1/8 dotted.
+This is the "Sandstorm" / "Children" delay. It's cliché but effective. If you want that driving, pulsing, pulling-forward feel, set delay TIME to 1/8 dotted.
 
 ## Straight eighth for dub acid
 
@@ -184,7 +184,7 @@ This means you can't turn on delay only on one note. If you want that, you'd sav
 
 You CAN adjust delay parameters live during playback. Changes take effect immediately (with a 60 ms smoothing ramp to avoid clicks).
 
-Common live technique: start with DLY MIX at 0. Build up the track. At the breakdown, sweep DLY MIX from 0 to 60%, add feedback from 0.3 to 0.85, let the echoes fill the space. At the drop, sweep back to 0.
+Common live technique: start with delay MIX at 0. Build up the track. At the breakdown, sweep delay MIX from 0 to 60%, add feedback from 0.3 to 0.85, let the echoes fill the space. At the drop, sweep back to 0.
 
 This kind of live manipulation is where delay earns its keep.
 
@@ -221,13 +221,13 @@ For hard techno, use delay sparingly (mix < 20%, feedback < 0.3). For melodic ac
 
 ## Try this
 
-1. Set up a 303 line with hits on steps 1, 4, 8, 11 (sparse). Set DLY MIX to 0. Play. Sparse.
-2. Raise DLY MIX to 40%. Set DLY DIV to 1/8. Set DLY FB to 0.4. Play. Now you hear echoes filling the rests. The line feels denser.
-3. Change DLY DIV to 1/8 dotted. Play. The echoes land in syncopated positions, creating polyrhythm.
+1. Set up a 303 line with hits on steps 1, 4, 8, 11 (sparse). Set delay MIX to 0. Play. Sparse.
+2. Raise delay MIX to 40%. Set delay TIME to 1/8. Set delay FDBK to 0.4. Play. Now you hear echoes filling the rests. The line feels denser.
+3. Change delay TIME to 1/8 dotted. Play. The echoes land in syncopated positions, creating polyrhythm.
 4. Change to 1/16. Play. Tight slapback, harder to distinguish echoes from original hits.
 5. Change to 1/16 dotted. Play. Chattering, complex polyrhythm.
-6. Set DLY DIV back to 1/8 dotted. Raise DLY FB to 0.8. Play. Long echo trail.
-7. Raise DLY FB to 0.92 (maximum). Play. Endless echoes — the sound sustains far beyond the original hits. Breakdown material.
-8. Lower DLY FB to 0.3, DLY MIX to 20%. Play. Subtle, supportive delay. This is how delay often sits in final mixes — adding space without demanding attention.
+6. Set delay TIME back to 1/8 dotted. Raise delay FDBK to 0.8. Play. Long echo trail.
+7. Raise delay FDBK to 0.92 (maximum). Play. Endless echoes — the sound sustains far beyond the original hits. Breakdown material.
+8. Lower delay FDBK to 0.3, delay MIX to 20%. Play. Subtle, supportive delay. This is how delay often sits in final mixes — adding space without demanding attention.
 
 Next: reverb.

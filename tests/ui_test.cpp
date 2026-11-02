@@ -394,6 +394,36 @@ TEST("right-click menu: clicking an item runs it, clicking outside closes") {
     CHECK(ap.g_playing == playing);
 }
 
+// The scope's auto-gain should make a playing pattern fill most of the
+// panel, without clipping most of the time.
+TEST("scope trace uses most of the height during playback") {
+    acid::Engine e(44100);
+    acid::Engine::Bind b(e);
+    acid_set_cutoff(0.3f); acid_set_resonance(0.85f); acid_set_env_mod(0.7f);
+    acid_set_decay(0.35f); acid_set_volume(0.65f);
+    const int notes[16] = {36, 36, 48, 36, 39, 36, 43, 46, 36, 36, 48, 51, 36, 34, 36, 41};
+    for (int i = 0; i < 16; ++i) acid_seq_set_step(i, notes[i], i % 4 == 0 ? 2 : 0, 100, 1);
+    acid_seq_set_pattern_length(16);
+    acid_seq_set_bpm(122.0f);
+    acid_seq_play();
+    tb303::ScopeState st;
+    std::vector<float> buf(2 * 1470);           // one 30 Hz UI tick of audio
+    for (int t = 0; t < 60; ++t) { e.render(buf.data(), 1470); st.advance(); }   // settle
+    double used = 0;
+    int clipped = 0, n = 0;
+    for (int t = 0; t < 200; ++t, ++n) {
+        e.render(buf.data(), 1470);
+        st.advance();
+        float mx = 0;
+        for (float v : st.traces[static_cast<size_t>(st.newest)]) mx = std::max(mx, std::fabs(v));
+        used += std::min(1.0f, mx * st.gain);
+        clipped += mx * st.gain > 1.0f;
+    }
+    std::printf("      mean span %.0f%%, clipped %d/%d\n", 100 * used / n, clipped, n);
+    CHECK(used / n > 0.6);
+    CHECK(clipped < n / 10);
+}
+
 // The layout at common terminal sizes: every panel is there, labels aren't
 // cut, and the way to help is on screen.
 TEST("layout holds at 80x24, 100x30, 120x40 and 160x50") {

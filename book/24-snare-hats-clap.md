@@ -1,6 +1,6 @@
 # 24 · Snare, hats, clap
 
-Four of acidflow's five drum voices: SD (snare), CH (closed hi-hat), OH (open hi-hat), CL (clap). Together with the kick (Chapter 23), these five voices cover the rhythmic skeleton of every dance subgenre acid intersects.
+Four of acidflow's five core drum voices: SD (snare), CH (closed hi-hat), OH (open hi-hat), CL (clap). Together with the kick (Chapter 23), these five voices cover the rhythmic skeleton of every dance subgenre acid intersects.
 
 This chapter describes each voice, its synthesis, its role, and its typical programming.
 
@@ -267,6 +267,6 @@ You can see: BD lives in the low end, SD occupies mid-low plus mid-high, CL is m
 5. Remove all hats. Play. Feels empty.
 6. Try a 909-style gospel fill: SD on steps 5, 13, 14, 15, 16 as a rolling snare fill at end of bar. Play.
 
-Each drum is a small decision. Five drums times 16 steps = 80 decisions per bar. Most of them stay default; the few you change define the pattern's character.
+Each drum is a small decision. Five core drums times 16 steps = 80 decisions per bar. Most of them stay default; the few you change define the pattern's character.
 
 Next: programming principles for acid drum patterns.

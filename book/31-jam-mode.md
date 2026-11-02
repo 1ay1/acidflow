@@ -187,7 +187,7 @@ These are acceptable for the instrument. A 303 doesn't have polyphony or velocit
 4. Toggle slide off (`;`). Toggle accent on (`'`). Press `n` (A3). You hear a loud accented A.
 5. Shift octave up (`→`). Press `z`. You hear C4, an octave higher.
 6. Play a pentatonic phrase: `z x v n z` (C, D, F, A, C — A minor pentatonic fragment, but starting on C, which is C major pentatonic... try `n y z r n` for A3, D4, C4, F4, A3 which is A minor pentatonic).
-7. Turn up delay (DLY MIX 40%, 1/8 dotted, FB 0.6). Jam a sparse sequence. Hear the echoes fill.
+7. Turn up delay (delay MIX 40%, 1/8 dotted, FB 0.6). Jam a sparse sequence. Hear the echoes fill.
 8. Exit jam mode (`k`). The step sequencer returns.
 9. Program the phrase you just jammed into step 1-5 of the sequencer. Play. The programmed version should sound like what you jammed.
 

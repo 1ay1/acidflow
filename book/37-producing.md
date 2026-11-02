@@ -156,28 +156,28 @@ Load slot 2 (intro). Make sure knobs are set as per Step 4.
 
 Press `e` (WAV export) to start recording... actually, acidflow's WAV export records a fixed 4 loops of the current pattern. For live arrangement, you may need to export live.
 
-Alternative: use an external recorder (OBS, system audio capture) to capture the arrangement as you perform it.
+Alternative: press `W` to record acidflow's live output (a 24-bit stereo WAV) while you perform the arrangement, or use an external recorder (OBS, system audio capture).
 
 For this walkthrough, let's use the WAV export approach:
 
 1. Load slot 2. Press `e`. Wait for it to finish. This is your intro section.
 2. Load slot 1. Close the filter (CUTOFF at 25%). Press `e`. This is the start of the main, filter still partially closed.
 3. Load slot 1 again. Open CUTOFF to 70%. Press `e`. This is the main at full strength.
-4. Load slot 3. CUTOFF at 35%. REV MIX up to 50%. Press `e`. This is the breakdown.
+4. Load slot 3. CUTOFF at 35%. reverb MIX up to 50%. Press `e`. This is the breakdown.
 5. Load slot 1. CUTOFF at 75%. REV back to 15%. Press `e`. This is the final main.
 
 You now have 5 WAV files. In a DAW (or ffmpeg), concatenate them in order. You have a rough track.
 
 ## Step 12: Live-perform the arrangement
 
-For a more natural performance, you can run acidflow in real-time and record its audio output with an external tool:
+For a more natural performance, you can run acidflow in real-time and record its audio output — with `W`, or with an external tool:
 
 1. Start your system audio recording tool. Point it at acidflow's output.
 2. In acidflow, load slot 2. Press Space.
 3. After 8 bars (about 15 seconds), load slot 1.
 4. Over the next 8 bars, slowly raise CUTOFF from 25% to 70%. This is the build.
-5. After another 8 bars, load slot 3. Raise REV MIX to 50%.
-6. After 8 bars, load slot 1 again. Drop REV MIX back to 15%. Open CUTOFF to 80%.
+5. After another 8 bars, load slot 3. Raise reverb MIX to 50%.
+6. After 8 bars, load slot 1 again. Drop reverb MIX back to 15%. Open CUTOFF to 80%.
 7. After 16 more bars, press Space to stop.
 8. Stop your audio recording.
 

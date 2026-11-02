@@ -204,7 +204,7 @@ Terms used throughout this book, defined.
 
 **Sawtooth / Saw** — A waveform that ramps up and snaps down. Rich in harmonics. The 303's main waveform.
 
-**Schroeder reverb** — A reverb algorithm using comb filters and allpass filters. acidflow's reverb is Schroeder-style.
+**Schroeder reverb** — A classic reverb algorithm using comb filters and allpass filters. acidflow's reverb is not Schroeder-style; it's a Dattorro plate (allpass input diffusion feeding a figure-eight tank of modulated allpass + delay lines, with stereo output taps).
 
 **SD** — Snare Drum. acidflow's second drum voice.
 
@@ -256,7 +256,7 @@ Terms used throughout this book, defined.
 
 **VCO** — Voltage-Controlled Oscillator. An oscillator whose pitch is controlled by a CV. acidflow's oscillator is digital but emulates VCO behavior.
 
-**Voice** — An independent sound-generating element. The 303 voice is monophonic; there are 5 drum voices.
+**Voice** — An independent sound-generating element. The 303 voice is monophonic; there are 16 drum voices.
 
 **Voltage-per-octave** — A tuning convention where 1 volt = 1 octave change. acidflow emulates this for oscillator pitch.
 

@@ -45,18 +45,18 @@ Use Windows Terminal, WezTerm, or Alacritty — `cmd.exe` won't render the UI co
 
 ## First boot
 
-When acidflow starts, you see the full-screen TUI. From top to bottom:
+When acidflow starts, you see the full-screen TUI. (The very first time, a welcome card appears first — press Enter to start playing.) From top to bottom:
 
 - **Title bar** with the current preset name, BPM, pattern length, swing, and status badges (SONG mode, JAM mode, MIDI OUT, MIDI SYNC).
 - **Knobs panel** — nine knobs: TUNE, WAVE, CUTOFF, RES, ENVMOD, DECAY, ACCENT, DRIVE, VOL.
-- **FX rack** — seven knobs: FX DRIVE, DLY TIME, DLY FB, DLY MIX, REV SIZE, REV DAMP, REV MIX.
+- **FX rack** — seven knobs in three groups: OD (DRIVE), DELAY (MIX, FDBK, TIME), REVERB (MIX, SIZE, DAMP).
 - **Sequencer** — the 16-step grid for the 303 voice.
-- **Drum grid** — 5 voices × 16 steps.
+- **Drum grid** — 16 voices × 16 steps.
 - **Transport strip** — preset selector, tempo, swing, length.
 - **Scope / filter heatmap** — live audio visualization.
-- **Help bar** — scrolling hints at the bottom.
+- **Help bar** — the few keys for the focused panel at the bottom, ending with `: commands  ? help`.
 
-The currently-focused panel has a highlighted border. Press **Tab** to cycle focus (Knobs → FX → Sequencer → Drums → Transport). Each section's keyboard shortcuts apply only when it's focused.
+The currently-focused panel has a highlighted border. Press **Tab** to cycle focus (Knobs → FX → Transport → Drums → Sequencer). Each section's keyboard shortcuts apply only when it's focused.
 
 ## Make sure sound is working
 
@@ -64,7 +64,7 @@ Press `Space`. The sequencer starts running. If you hear audio, you're done.
 
 If you don't hear audio:
 
-- **Linux**: ALSA may be routing to the wrong device. Try `aplay -L` to list devices. acidflow uses the default device (`hw:0` or similar). If your output is somewhere else, you'll need to reconfigure ALSA at the system level (this is a Linux issue, not acidflow's).
+- **Linux**: acidflow uses JACK if a JACK server is running (including PipeWire-JACK), otherwise ALSA; set `ACIDFLOW_AUDIO=alsa` or `ACIDFLOW_AUDIO=jack` to force one. On ALSA it may be routing to the wrong device. Try `aplay -L` to list devices. acidflow uses the default device (`hw:0` or similar). If your output is somewhere else, you'll need to reconfigure ALSA at the system level (this is a Linux issue, not acidflow's).
 - **macOS**: CoreAudio should pick your current default output. If you've changed outputs since launching acidflow, restart the program.
 - **Windows**: WASAPI picks the system default. Check your volume mixer and make sure acidflow isn't muted.
 
@@ -72,7 +72,7 @@ If the sequencer is running but silent, check that VOL is above 0. Seriously. It
 
 ## The help overlay
 
-Press `?` at any time for a scrollable keyboard reference inside the program. Every keybind is listed. Use `↑`/`↓` or Page Up / Page Down to scroll. Press `?` or `Esc` to close.
+Press `?` at any time for help inside the program. It opens on the panel you're in and lists every action, with a "what the words mean" glossary. Type to search; `Tab` flips between panels. `Esc` clears the search, then closes. You can also press `:` (or Ctrl-K) to search for any action and run it directly.
 
 The overlay is the canonical source of truth for keybindings. If anything in this book ever drifts from what the overlay says, believe the overlay.
 
@@ -95,7 +95,7 @@ If you press `Shift-1` while on a preset, your customized version is saved to sl
 
 ## Exports
 
-- `e` — export the current loop as a 4-bar WAV file.
+- `e` — export the current loop as a 4-bar 24-bit stereo WAV (plus dry synth and drum stems). Playback keeps going while it renders.
 - `E` — export the pattern as a standard MIDI file (.mid). Drums are NOT included in the MIDI export (a deliberate choice; see Chapter 32).
 - `p` — export a shareable text representation of the pattern.
 - `P` — import a text representation. Paste or load one from a friend.
@@ -104,7 +104,7 @@ All exports write to the current working directory unless you're running acidflo
 
 ## Quit
 
-`q`. You lose any unsaved changes (hence the save slots).
+`q`. Your session (knobs, FX, pattern, drums, theme, focus) is saved to `~/.config/acidflow/session.txt` and restored on the next launch; use the save slots to keep more than one.
 
 ## What to do next
 

@@ -118,10 +118,8 @@ Articles:
 acidflow is a personal project. It will evolve. Features I'm considering for future versions:
 
 - **Per-element FX sends** (so drums and 303 can have different delay/reverb amounts).
-- **More drum voices** (toms, cymbals, percussion).
 - **LFO modulation** of knobs.
 - **Sidechain compression**.
-- **Cross-platform MIDI** (macOS, Windows).
 - **Multiple 303 voices** (or polyphonic 303).
 - **Per-slot knob saves**.
 - **Undo / history**.

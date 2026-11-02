@@ -244,7 +244,7 @@ Breakdowns are negative space. Techniques:
 2. **303 sustain**: play a single sustained 303 note during the breakdown.
 3. **Reverb wash**: crank reverb mix to 60%+.
 4. **Filter close**: close CUTOFF to 10-20%. Everything gets muffled.
-5. **Delay feedback up**: DLY FB to 0.85 during breakdown. Echoes pile up.
+5. **Delay feedback up**: delay FDBK to 0.85 during breakdown. Echoes pile up.
 6. **Silence**: literal silence. 2 bars of nothing. Dramatic but risky — dancers may stop dancing.
 
 ## Transitions between sections

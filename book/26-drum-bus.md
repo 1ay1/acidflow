@@ -1,10 +1,10 @@
 # 26 · The drum bus and sends
 
-The five drum voices don't each go to the output individually — they all sum into a single **drum bus** before reaching the FX rack and master output. This chapter is about the drum bus: what it does, how to use it, and why the bus architecture matters for acid.
+The sixteen drum voices don't each go to the output individually — they all sum into a single **drum bus** before reaching the FX rack and master output. This chapter is about the drum bus: what it does, how to use it, and why the bus architecture matters for acid.
 
 ## What a "bus" is
 
-In audio mixing terminology, a **bus** is an aggregate output that combines multiple source signals. All five drum voices feed into the drum bus; the drum bus's output is a single summed stereo signal that then gets processed and routed further.
+In audio mixing terminology, a **bus** is an aggregate output that combines multiple source signals. All sixteen drum voices feed into the drum bus; the drum bus's output is a single summed stereo signal that then gets processed and routed further.
 
 Think of the drum bus like a subgroup fader on a mixing console. You can adjust the whole drum section's level with one control, rather than adjusting each voice individually.
 
@@ -62,7 +62,7 @@ The FX rack (drive, delay, reverb) processes the summed drum-bus-plus-303 signal
 
 This has implications:
 
-- **Delay on drums**. If DLY MIX is up, the delay applies to both drums and 303. Drums can sound weird with delay — kicks especially get duplicated and muddy. Usually you want delay on the 303, not drums.
+- **Delay on drums**. If delay MIX is up, the delay applies to both drums and 303. Drums can sound weird with delay — kicks especially get duplicated and muddy. Usually you want delay on the 303, not drums.
 - **Reverb on drums**. Same issue. Reverb on drums adds wash; reverb on 303 adds space. Shared FX means you have to choose.
 - **FX drive on drums**. Drive makes the drums crunch. This CAN be desirable for aggressive acid techno, but usually overwhelms the mix.
 
@@ -101,7 +101,7 @@ This is hacky but works.
 
 ## Bus compression (simulated)
 
-acidflow doesn't have bus compression. But you can simulate its effect via drive on the drums — crank the FX DRIVE while drums are playing, and the saturation will glue everything together in a quasi-compression way.
+acidflow doesn't have bus compression. But you can simulate its effect via drive on the drums — crank the OD DRIVE while drums are playing, and the saturation will glue everything together in a quasi-compression way.
 
 It's not real compression — drive adds harmonics; compression tightens dynamics. But the audible effect of "everything sounds more together" is similar.
 
@@ -136,14 +136,14 @@ This mental model helps when you're balancing and applying FX: the drum bus is o
 2. Listen to the drum bus alone. This is the backbone.
 3. Unmute 303. Now you hear both. The drum bus is still the same; you've added the 303 on top.
 4. Adjust drum bus gain via `[` `]`. Listen to the balance change.
-5. Add some delay (DLY MIX up to 30%). Hear it on both drums and 303.
-6. Reduce delay. Raise reverb (REV MIX to 30%). Same thing.
+5. Add some delay (delay MIX up to 30%). Hear it on both drums and 303.
+6. Reduce delay. Raise reverb (reverb MIX to 30%). Same thing.
 
 The drum bus is a simple piece of architecture but it determines how drums sit in the mix. Master it, and your tracks will have better balance.
 
 Part IV is done. Five chapters on drums and rhythm:
 
-- Chapter 22: overview of the 5 voices.
+- Chapter 22: overview of the 16 voices.
 - Chapter 23: the kick.
 - Chapter 24: snare, hats, clap.
 - Chapter 25: programming principles.

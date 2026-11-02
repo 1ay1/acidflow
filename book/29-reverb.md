@@ -14,50 +14,48 @@ The pattern of reflections is what your ear interprets as "the room." A long, de
 
 Real acoustic reverb is incredibly complex — thousands of reflection paths, each with its own delay, attenuation, and filtering. Synthesizing it perfectly requires convolution with an impulse response of an actual space.
 
-But we can approximate it cheaply with **Schroeder reverb**: a network of comb filters and allpass filters that produces enough diffuse echoes to *feel* like a room, even though it doesn't perfectly match any specific space.
+But we can approximate it cheaply with a network of delay lines and allpass filters that produces enough diffuse echoes to *feel* like a space, even though it doesn't perfectly match any specific one.
 
-acidflow uses this approach. The implementation:
+acidflow uses this approach, in the form of a **Dattorro plate** (Jon Dattorro, 1997). The implementation:
 
-- **4 parallel comb filters**. Each comb delays the input and adds feedback, producing a series of echoes at a specific rate. Four combs at different delays produce a denser texture.
-- **2 serial allpass filters**. Allpass filters don't change the frequency response but "smear" the phase, turning the discrete comb echoes into a continuous wash.
-- **Lowpass filter inside each comb's feedback** (damp control) — long tails progressively lose high frequencies, mimicking air absorption and plate damping.
+- **Input diffusion**: four serial allpass filters. Allpass filters don't change the frequency response but "smear" the phase, turning the input into a dense cloud of tiny echoes before it reaches the tank.
+- **A figure-eight tank**: two cross-coupled branches of modulated allpass + delay lines, each feeding the other. The slow modulation keeps the tail from ringing metallically.
+- **Lowpass filter inside the tank** (damp control) — long tails progressively lose high frequencies, mimicking plate damping and air absorption.
+- **Stereo output taps**: left and right are read from different points in the tank, so the tail is naturally wide.
 
-This is the classic Freeverb / Schroeder topology used in most low-cost reverbs since the 1960s. It's not pristine but it sounds musical.
+This is the classic plate topology behind a great many studio reverbs. It's cheap, dense and very musical.
 
 ## Controls
 
 acidflow has three reverb parameters:
 
-- **REV MIX** — wet send amount (0 to 1). 0 = bypass. Higher = more audible reverb.
-- **REV SIZE** — effectively the reverb's decay time. Higher = longer tail.
-- **REV DAMP** — how quickly high frequencies die in the decay. Higher = duller, warmer tail.
+- **reverb MIX** — wet send amount (0 to 1). 0 = bypass. Higher = more audible reverb.
+- **reverb SIZE** — effectively the reverb's decay time. Higher = longer tail.
+- **reverb DAMP** — how quickly high frequencies die in the decay. Higher = duller, warmer tail.
 
 ### Size: the room scale
 
-Under the hood, size controls the comb feedback coefficient:
-
-```
-comb_g = 0.70 + 0.28 × size_parameter
-```
-
-So size = 0 → comb_g = 0.70 (short feedback, ~0.6 second RT60).
-Size = 1 → comb_g = 0.98 (long feedback, ~4 seconds RT60).
+Under the hood, size controls how much of the signal goes round the tank again (its decay coefficient). The mapping is tuned so the tail length grows evenly across the knob instead of jumping at the top.
 
 RT60 is the time for the reverb tail to drop by 60 dB (practically inaudible).
 
-- **Small room** (0-0.25 size): 0.6-1.2 second RT60. Feels like a bathroom or bedroom.
+Measured at the default DAMP:
+
+- **Small room** (0-0.25 size): about 0.8-1.2 seconds RT60. Feels like a bathroom or bedroom.
 - **Medium room** (0.25-0.5): 1.2-2 seconds. A club's main room.
-- **Hall** (0.5-0.75): 2-3 seconds. A concert hall.
-- **Cathedral** (0.75-1.0): 3-4+ seconds. An actual cathedral or abandoned warehouse.
+- **Hall** (0.5-0.75): 2-3.2 seconds. A concert hall.
+- **Cathedral** (0.75-1.0): 3.2-5 seconds. An actual cathedral or abandoned warehouse.
+
+More DAMP makes tails a little shorter as well as darker, since the highs die first.
 
 Acid tracks typically use small to medium (0-0.5 size). Larger tails are for ambient/dub.
 
 ### Damp: high-frequency rolloff
 
-Damp controls a lowpass filter inside each comb's feedback loop. The filter coefficient is:
+Damp controls a lowpass filter inside each branch of the tank. The filter coefficient is:
 
 ```
-damp_coef = 0.05 + 0.45 × damp_parameter
+damp_coef = 0.0005 + 0.7 × damp_parameter
 ```
 
 A higher coefficient means a lower cutoff — more high-frequency attenuation per pass.
@@ -80,7 +78,7 @@ Acid tracks usually sit at 5-20% reverb mix. Dub acid might push to 30-40%. Anyt
 
 ## Reverb types acidflow approximates
 
-acidflow's Schroeder topology naturally produces a sound close to a **plate reverb** or a **small-to-medium room**. It doesn't cleanly simulate:
+acidflow's plate topology naturally produces a sound close to a **plate reverb** or a **small-to-medium room**. It doesn't cleanly simulate:
 
 - **Hall reverbs**: would require longer pre-delay and more complex late-reflection networks.
 - **Convolution / impulse response reverbs**: require large FFTs.
@@ -104,7 +102,7 @@ Good for adding warmth to staccato 303 programs.
 
 ### For space on specific elements
 
-Shared-FX architecture means you can't reverb-only one voice. But you can use the FX DRIVE + delay settings to make certain elements dominate the reverb wash.
+Shared-FX architecture means you can't reverb-only one voice. But you can use the OD DRIVE + delay settings to make certain elements dominate the reverb wash.
 
 Example: 303 loud, drums low. Reverb hits both, but the 303 dominates. The track feels "303 in a room, drums up close." Subtle but effective.
 
@@ -147,7 +145,7 @@ A "cathedral" sound isn't just long decay. It's long decay with specific early r
 From chapter 27:
 
 ```
-Master → FX DRIVE → Delay → Reverb → Output
+Master → OD DRIVE → Delay → Reverb → Output
 ```
 
 Reverb is last. This means:
@@ -159,11 +157,11 @@ If you want drier delay, reduce reverb mix. If you want wetter delay, raise it.
 
 ## Reverb and mono vs stereo
 
-acidflow's reverb output is stereo — the four parallel combs produce slightly different delay times that decorrelate between left and right, giving a sense of width.
+acidflow's reverb output is stereo — the plate's left and right outputs are tapped from different points in the tank, so they decorrelate and give a sense of width.
 
-A dry signal with no reverb sounds centered / mono. Adding reverb widens it. This is partly why reverb makes tracks feel "bigger" — not just depth but width too.
+A dry 303 with no reverb sounds centered / mono. Adding reverb widens it. This is partly why reverb makes tracks feel "bigger" — not just depth but width too.
 
-If you want maximum stereo width, reverb is your primary tool. Delay doesn't stereo-widen (it's mono tape-style in acidflow).
+If you want maximum stereo width, reverb is your primary tool. The ping-pong delay adds width too, but as discrete left/right bounces rather than a wash.
 
 ## Reverb and loudness
 
@@ -223,8 +221,8 @@ Faster tempos → shorter reverb tails work better. At 160 BPM, a 4-second tail 
 Rough guide:
 
 - 120 BPM → size up to 0.5 is safe (tails up to ~2 seconds).
-- 130 BPM → size up to 0.4 (tails ~1.5 seconds).
-- 140+ BPM → size 0.3 or less (tails under 1 second).
+- 130 BPM → size up to 0.4 (tails ~1.6 seconds).
+- 140+ BPM → size 0.2 or less (tails under 1.4 seconds).
 
 Faster tracks want tighter reverb. Or accept wash as aesthetic (gabber-acid).
 
@@ -244,22 +242,22 @@ If you're using the heatmap to guide filter settings, remember: the actual outpu
 
 ## Try this
 
-1. Set up a simple 303 pattern with 6 hits. REV MIX at 0. Play. Dry.
-2. Raise REV MIX to 15%. SIZE 0.3. DAMP 0.4. Play. Subtle depth added.
-3. Raise REV MIX to 30%. Play. Clearly audible reverb.
+1. Set up a simple 303 pattern with 6 hits. reverb MIX at 0. Play. Dry.
+2. Raise reverb MIX to 15%. SIZE 0.3. DAMP 0.4. Play. Subtle depth added.
+3. Raise reverb MIX to 30%. Play. Clearly audible reverb.
 4. Raise SIZE to 0.7. Play. Long trail; pattern feels spacious.
 5. Raise DAMP to 0.8. Play. Same trail but darker.
 6. Lower DAMP to 0.1. Play. Bright shimmery trail.
 7. Now raise MIX to 60%. Play. Very wet.
 8. Drop to 10% MIX, 0.3 SIZE, 0.4 DAMP. Play. Return to subtle production reverb.
-9. Add delay: DLY MIX 30%, 1/8 dotted, FB 0.5. Play. Both delay and reverb on the same line. Spacious, echoing.
+9. Add delay: delay MIX 30%, 1/8 dotted, FB 0.5. Play. Both delay and reverb on the same line. Spacious, echoing.
 10. Mute drums (drums section, `m`). Only 303 in FX. Play. This is close to ambient acid.
 
-You've explored the full reverb parameter space. The Schroeder algorithm doesn't simulate every imaginable space, but within its range, it's versatile enough for most acid production.
+You've explored the full reverb parameter space. The Dattorro plate doesn't simulate every imaginable space, but within its range, it's versatile enough for most acid production.
 
 Part V is complete. Five chapters on FX:
 
-- Chapter 27: FX DRIVE (overdrive on the bus).
+- Chapter 27: OD DRIVE (overdrive on the bus).
 - Chapter 28: Delay (tempo-synced tape echo).
 - Chapter 29: Reverb (plate/room).
 
