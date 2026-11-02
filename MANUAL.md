@@ -116,7 +116,7 @@ Everything else in this manual is detail.
 
 ### Finding things without the manual
 
-- **The bottom line** always shows the keys for the panel you're in, and ends with `: commands  ? help`. Hover the mouse over a knob, step or drum and the line changes to say what that thing is and how to use it.
+- **The bottom line** always shows the keys for the panel you're in, and ends with `: commands  ? help`. Hover the mouse over a knob, step or drum and the line changes to say what that thing is and how to use it. **Right-click** it for a menu of everything you can do there (accent, slide, octave, chance, fill a drum row, reset, MIDI learn…); each item shows its key, so the menu teaches the shortcuts too.
 - **The command palette (`:` or `Ctrl-K`)** searches every action by name and description. Actions that need a cursor position (like accent or slide) are listed too: picking one moves focus to the right panel and tells you the key.
 - **Help (`?`)** opens on the panel you came from, then lists everything else, plus a short "what the words mean" section for CUTOFF, RES, slide, p-lock and the rest. Type to filter it, `Tab` to jump to another panel's keys, `Esc` to clear the search or close.
 - **Toasts** after anything destructive say what changed and (the first few times) that `u` undoes it.

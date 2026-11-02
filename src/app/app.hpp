@@ -28,6 +28,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <random>
@@ -863,6 +864,23 @@ struct App {
     bool        g_theme_chosen = false;   // saved to prefs only once picked
 
     void toast_undoable(const std::string& what);
+    // Right-click menu: what you can do with the thing under the mouse.
+    struct MenuItem {
+        std::string label, key;
+        std::function<void(App&)> run;
+        bool checked = false;
+    };
+    struct Menu {
+        bool open = false;
+        int  x = 0, y = 0, sel = 0;
+        std::string title;
+        std::vector<MenuItem> items;
+    } g_menu;
+    void open_menu_at(int col, int row);
+    void run_menu_item(int i);
+    bool handle_menu_key(const Event& ev);
+    bool handle_menu_mouse(const MouseEvent& m);
+    void arm_midi_learn(int param);
     Element build_knob_strip() const;
     std::string describe_at(int col, int row) const;
     // Palette / help helpers.

@@ -158,12 +158,12 @@ std::string App::describe_at(int col, int row) const {
         case tb303::kHitKnob:
             if (idx >= 0 && idx < K_COUNT)
                 return std::string(g_knob_table[idx].label) + " " + format_knob(idx) + "  \xe2\x80\x94  "
-                     + g_knob_table[idx].caption + "   \xc2\xb7 drag or scroll to turn, right-click resets";
+                     + g_knob_table[idx].caption + "   \xc2\xb7 drag or scroll to turn, right-click for more";
             break;
         case tb303::kHitFx:
             if (idx >= 0 && idx < FX_COUNT)
                 return std::string(kFxLongName[idx]) + " " + format_fx(idx) + "  \xe2\x80\x94  "
-                     + g_fx_table[idx].caption + "   \xc2\xb7 scroll to turn, right-click resets";
+                     + g_fx_table[idx].caption + "   \xc2\xb7 scroll to turn, right-click for more";
             break;
         case tb303::kHitSeqRow: {
             const HitZone z = const_cast<App*>(this)->hit_test(col, row);   // reads only
@@ -174,7 +174,7 @@ std::string App::describe_at(int col, int row) const {
                 if (!s.rest && s.accent) d += ", accent";
                 if (!s.rest && s.slide)  d += ", slide";
                 if (s.prob < 100) d += ", " + std::to_string(s.prob) + "% chance";
-                return d + "   \xc2\xb7 click to select, scroll for pitch, right-click for rest";
+                return d + "   \xc2\xb7 click to select, scroll for pitch, right-click for more";
             }
             break;
         }
@@ -184,7 +184,7 @@ std::string App::describe_at(int col, int row) const {
                 "rimshot", "cowbell", "shaker", "tambourine", "conga", "mid tom",
                 "crash", "ride", "bongo"};
             if (idx >= 0 && idx < kDrumVoices)
-                return std::string(kNames[idx]) + "   \xc2\xb7 click a cell to add or remove a hit";
+                return std::string(kNames[idx]) + "   \xc2\xb7 click a cell to add or remove a hit, right-click for patterns";
             break;
         }
         case tb303::kHitTransport:
@@ -214,6 +214,7 @@ std::optional<Section> App::hover_section(int col, int row) {
 
 
 void App::handle_mouse(const MouseEvent& m) {
+    if (handle_menu_mouse(m)) return;
     int col = m.x.raw();
     int row = m.y.raw();
 
@@ -380,45 +381,26 @@ void App::handle_mouse(const MouseEvent& m) {
         }
     }
 
-    // ── Right click ────────────────────────────────────────────────────────
+    // ── Right click: a menu of what you can do with the thing under the mouse.
     if (m.kind == MouseEventKind::Press && m.button == MouseButton::Right) {
-        switch (z.kind) {
-            case HitZone::Knob:
-                g_focus = Section::Knobs;
-                g_knob_sel = z.idx;
-                reset_knob(z.idx);
-                return;
-            case HitZone::FxKnob:
-                g_focus = Section::FX;
-                g_fx_sel = z.idx;
-                reset_fx(z.idx);
-                return;
-            case HitZone::Step: {
-                g_focus = Section::Sequencer;
-                g_step_sel = z.idx;
-                auto& s = g_steps[static_cast<size_t>(z.idx)];
-                s.rest = !s.rest;
-                return;
-            }
-            case HitZone::DrumCell: {
-                // Right-click clears the cell (matches the right-click-to-rest
-                // pattern on the sequencer). A label-area right-click
-                // (z.idx == -1) clears the whole voice row — the expected
-                // "clear this drum" action.
-                g_focus = Section::Drums;
-                g_drum_voice_sel = z.idx2;
-                if (z.idx < 0) {
-                    for (auto& c : g_drums[static_cast<size_t>(z.idx2)]) c = false;
-                } else {
-                    g_drum_step_sel = z.idx;
-                    g_drums[static_cast<size_t>(z.idx2)]
-                           [static_cast<size_t>(z.idx)] = false;
-                }
-                return;
-            }
-            default: return;
-        }
+        open_menu_at(col, row);
+        return;
     }
+}
+
+// MIDI learn on a knob (0..K_COUNT-1) or FX (kMidiFxBase + i). Arming the
+// same one again cancels.
+void App::arm_midi_learn(int param) {
+    auto& cc = acid::midi::cc();
+    if (cc.learn_param.load() == param) {
+        cc.learn_param.store(-1);
+        set_toast("MIDI learn cancelled");
+        return;
+    }
+    cc.last_learned_cc.store(-1);
+    cc.learn_param.store(param);
+    g_midi_learn_wait = param;
+    set_toast("\xe2\x99\xaa MIDI learn: move a controller\xe2\x80\xa6  (l again cancels)");
 }
 
 
@@ -463,6 +445,7 @@ void App::handle_event(const Event& ev) {
 
     // ── Global keys ──────────────────────────────────────────────────────────────────────────
     // Overlays own the keyboard while open.
+    if (handle_menu_key(ev)) return;
     if (handle_palette_key(ev)) return;
     if (handle_help_key(ev)) return;
     if (as_key(ev)) g_hover_text.clear();
@@ -587,17 +570,7 @@ void App::handle_event(const Event& ev) {
     // MIDI learn: `l` arms the focused knob or FX; the next CC binds to it.
     // `l` again while armed cancels.
     if (key(ev, 'l') && (g_focus == Section::Knobs || g_focus == Section::FX)) {
-        auto& cc = acid::midi::cc();
-        const int param = g_focus == Section::Knobs ? g_knob_sel : kMidiFxBase + g_fx_sel;
-        if (cc.learn_param.load() == param) {
-            cc.learn_param.store(-1);
-            set_toast("MIDI learn cancelled");
-        } else {
-            cc.last_learned_cc.store(-1);
-            cc.learn_param.store(param);
-            g_midi_learn_wait = param;
-            set_toast("\xe2\x99\xaa MIDI learn: move a controller\xe2\x80\xa6");
-        }
+        arm_midi_learn(g_focus == Section::Knobs ? g_knob_sel : kMidiFxBase + g_fx_sel);
         return;
     }
     // Song mode chain: step through saved slots 1..9 on each pattern wrap.

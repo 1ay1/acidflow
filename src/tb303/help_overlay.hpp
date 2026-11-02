@@ -130,7 +130,7 @@ inline bool contains(std::string_view hay, const std::string& q) {
     if (q.empty()) {
         body.push_back(heading("Mouse", clr_text()));
         body.push_back(dsl::text("  Click a step or drum cell to edit it \xc2\xb7 drag a knob up/down \xc2\xb7 "
-                                 "scroll to fine-tune \xc2\xb7 right-click to reset or clear \xc2\xb7 "
+                                 "scroll to fine-tune \xc2\xb7 right-click for a menu of what you can do there \xc2\xb7 "
                                  "hover anything to see what it does") | dsl::fgc(clr_muted()));
         body.push_back(blank());
         body.push_back(dsl::text("  Your session is saved when you quit. Files live in ~/.config/acidflow/.")

@@ -102,6 +102,9 @@ inline int u8cols(std::string_view s) {
         .padding(0, 1, 0, 1)
         .justify(Justify::SpaceBetween)
         .min_width(Dimension::fixed(0))
+        .height(Dimension::fixed(1))
+        .min_height(Dimension::fixed(1))
+        .shrink(0)
         .overflow(Overflow::Hidden)(
             Element{TextElement{.content = std::move(txt), .style = {},
                                 .wrap = TextWrap::NoWrap, .runs = std::move(runs)}},

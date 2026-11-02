@@ -314,6 +314,86 @@ TEST("palette and welcome card keep the full screen height") {
     }
 }
 
+// Right-click a step: a menu opens with what you can do there; choosing an
+// item does it, Esc closes without doing anything.
+TEST("right-click menu on a step edits that step") {
+    Clean c;
+    H h;
+    auto& ap = const_cast<App&>(app(h));
+    screen(h, 120, 40);                       // paint once so hit targets exist
+    ap.open_menu_at(0, 0);                    // nothing there: no menu
+    CHECK(!ap.g_menu.open);
+    // Find step 5 on screen through the hit registry.
+    int sx = -1, sy = -1;
+    for (int y = 0; y < 40 && sx < 0; ++y)
+        for (int x = 0; x < 120; ++x) {
+            const HitZone z = ap.hit_test(x + 1, y + 1);
+            if (z.kind == HitZone::Step && z.idx == 4) { sx = x + 1; sy = y + 1; break; }
+        }
+    REQUIRE(sx > 0);
+    ap.g_steps[4].slide = false;
+    ap.open_menu_at(sx, sy);
+    REQUIRE(ap.g_menu.open);
+    CHECK(has(ap.g_menu.title, "step 5"));
+    CHECK(has(screen(h, 120, 40), "Slide into next"));
+    // Pick "Slide into next" with the keyboard.
+    int i = 0;
+    while (i < static_cast<int>(ap.g_menu.items.size()) && ap.g_menu.items[static_cast<size_t>(i)].label != "Slide into next") ++i;
+    REQUIRE(i < static_cast<int>(ap.g_menu.items.size()));
+    while (ap.g_menu.sel != i) key(h, SpecialKey::Down);
+    key(h, SpecialKey::Enter);
+    CHECK(!ap.g_menu.open);
+    CHECK(ap.g_steps[4].slide);
+    CHECK(has(ap.g_toast, "(key s)"));       // the menu teaches the key
+    key(h, U'u');                             // and it's undoable
+    CHECK(!ap.g_steps[4].slide);
+    // Esc closes without changing anything.
+    ap.open_menu_at(sx, sy);
+    key(h, SpecialKey::Escape);
+    CHECK(!ap.g_menu.open);
+    CHECK(!h.quit());
+}
+
+TEST("right-click menu: clicking an item runs it, clicking outside closes") {
+    Clean c;
+    H h;
+    auto& ap = const_cast<App&>(app(h));
+    screen(h, 120, 40);
+    int sx = -1, sy = -1;
+    for (int y = 0; y < 40 && sx < 0; ++y)
+        for (int x = 0; x < 120; ++x) {
+            const HitZone z = ap.hit_test(x + 1, y + 1);
+            if (z.kind == HitZone::Step && z.idx == 4) { sx = x + 1; sy = y + 1; break; }
+        }
+    REQUIRE(sx > 0);
+    ap.g_steps[4].accent = false;
+    auto mouse = [&](MouseButton b, MouseEventKind k, int x, int y) {
+        h.event(Acidflow::Event{MouseEvent{.button = b, .kind = k, .x = Columns{x}, .y = Rows{y}, .mods = {}}});
+        h.kernel().step(h.record());
+    };
+    mouse(MouseButton::Right, MouseEventKind::Press, sx, sy);
+    mouse(MouseButton::Right, MouseEventKind::Release, sx, sy);
+    REQUIRE(ap.g_menu.open);
+    screen(h, 120, 40);                       // paint the menu so its rows are targets
+    // Find the "Accent" row on screen and click it.
+    int ax = -1, ay = -1;
+    for (int y = 0; y < 40 && ax < 0; ++y)
+        for (int x = 0; x < 120; ++x)
+            if (auto id = maya::hit_test(x, y); id && maya::hit_kind(*id) == tb303::kHitMenuItem
+                && ap.g_menu.items[maya::hit_index(*id)].label == "Accent") { ax = x + 1; ay = y + 1; break; }
+    REQUIRE(ax > 0);
+    mouse(MouseButton::Left, MouseEventKind::Press, ax, ay);
+    CHECK(!ap.g_menu.open);
+    CHECK(ap.g_steps[4].accent);
+    // Open again and click far away: closes, nothing underneath fires.
+    mouse(MouseButton::Right, MouseEventKind::Press, sx, sy);
+    REQUIRE(ap.g_menu.open);
+    const bool playing = ap.g_playing;
+    mouse(MouseButton::Left, MouseEventKind::Press, 2, 2);
+    CHECK(!ap.g_menu.open);
+    CHECK(ap.g_playing == playing);
+}
+
 // The layout at common terminal sizes: every panel is there, labels aren't
 // cut, and the way to help is on screen.
 TEST("layout holds at 80x24, 100x30, 120x40 and 160x50") {

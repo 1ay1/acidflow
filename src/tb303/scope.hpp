@@ -112,11 +112,23 @@ inline void rasterise(Image& img, const std::vector<std::vector<float>>& traces,
 
     // Rasterised at paint time at the panel's real size (w × 2h pixels), so
     // the trace stays one pixel thick and fills the panel at any height.
-    auto trace = detail::paint([traces = std::move(traces), gain = st.gain](Canvas& c, int x, int y, int w, int h) {
+    // With no signal it says how to get one, instead of showing a flat line.
+    const bool silent = st.peak < 1e-3f;
+    auto trace = detail::paint([traces = std::move(traces), gain = st.gain, silent](Canvas& c, int x, int y, int w, int h) {
         if (w <= 0 || h <= 0) return;
         Image img(w, h * 2);
-        scope_detail::rasterise(img, traces, gain);
+        scope_detail::rasterise(img, traces, silent ? 0.0f : gain);
         detail::paint_pixels(c, img, x, y, w, h);
+        if (silent && h >= 3) {
+            const std::u32string msg = U"silent \u00b7 press Space to play";
+            const int mx = x + std::max(0, (w - static_cast<int>(msg.size())) / 2);
+            const int my = y + h / 2 - 1;
+            auto& pool = *c.style_pool();
+            const auto sid = pool.intern(Style{}.with_fg(clr_muted()).with_bg(Color::rgb(
+                scope_detail::dark_bed().r, scope_detail::dark_bed().g, scope_detail::dark_bed().b)));
+            for (int i = 0; i < static_cast<int>(msg.size()) && mx + i < x + w; ++i)
+                c.set(mx + i, my, msg[static_cast<size_t>(i)], sid);
+        }
     }, /*min_w=*/0, /*min_h=*/2);
 
     // Peak meter: exactly one cell row under the trace.

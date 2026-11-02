@@ -18,6 +18,7 @@ enum HitKind : std::uint32_t {
     kHitTransport,
     kHitScope,
     kHitPanel,       // index = Section, for hover focus over borders/padding
+    kHitMenuItem,    // index = row in the open right-click menu
 };
 
 // Column layout inside the tagged rows, used to turn an x offset into a step.

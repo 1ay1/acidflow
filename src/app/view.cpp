@@ -3,6 +3,8 @@
 #include "app.hpp"
 #include "tb303/palette.hpp"
 
+#include <maya/device/floating.hpp>
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Render
 // ─────────────────────────────────────────────────────────────────────────────
@@ -366,7 +368,7 @@ Element App::build_knob_strip() const {
         const Color lc = focused ? tb303::clr_accent() : tb303::clr_muted();
         const Color vc = focused ? tb303::clr_accent() : tb303::clr_text();
         std::string lbl = std::string(focused ? "\xe2\x96\xb8" : " ") + label + " ";
-        std::string txt = lbl + val + "  ";
+        std::string txt = lbl + val + " ";
         std::vector<StyledRun> runs{
             StyledRun{0, lbl.size(), Style{}.with_fg(lc)},
             StyledRun{lbl.size(), txt.size() - lbl.size(), Style{}.with_fg(vc).with_bold()},
@@ -375,37 +377,68 @@ Element App::build_knob_strip() const {
                                     .wrap = TextWrap::NoWrap, .runs = std::move(runs)}}
                 | hit(id) | dsl::shrink(0)).build();
     };
-    std::vector<Element> voice, fx;
     // Short names so more fit on one line; the full name is in the hover text.
     static constexpr const char* kKnobShort[] = {"TUNE", "WAVE", "CUT", "RES", "ENV", "DEC", "ACC", "DRV", "VOL"};
     static constexpr const char* kFxShort[]   = {"OD", "DLY", "FB", "TIME", "REV", "SIZE", "DAMP"};
     static_assert(sizeof(kKnobShort) / sizeof(*kKnobShort) == K_COUNT);
     static_assert(sizeof(kFxShort) / sizeof(*kFxShort) == FX_COUNT);
-    // Start each strip at a knob that keeps the focused one in view.
-    const int k0 = g_focus == Section::Knobs ? std::max(0, g_knob_sel - 4) : 0;
-    const int f0 = g_focus == Section::FX    ? std::max(0, g_fx_sel - 3)   : 0;
-    for (int i = k0; i < K_COUNT; ++i)
-        voice.push_back(entry(kKnobShort[i], format_knob(i),
-                              g_focus == Section::Knobs && g_knob_sel == i,
-                              hit_id(tb303::kHitKnob, static_cast<std::uint32_t>(i))));
-    for (int i = f0; i < FX_COUNT; ++i)
-        fx.push_back(entry(kFxShort[i], format_fx(i),
-                           g_focus == Section::FX && g_fx_sel == i,
-                           hit_id(tb303::kHitFx, static_cast<std::uint32_t>(i))));
-    auto panel = [](const char* title, std::vector<Element> items, bool focused, Section s) {
-        return (dsl::hstack()
+    // Every knob, wrapped over as many rows as it needs (two or three at 80
+    // columns), so nothing is hidden behind a scroll. Wrapped by hand into
+    // fixed rows: a flex-wrap box measures as one line and then lays out
+    // several, which overflows the column and pushes the hint bar away.
+    std::vector<std::pair<std::string, Element>> voice_items, fx_items;
+    for (int i = 0; i < K_COUNT; ++i) {
+        const std::string v = format_knob(i);
+        voice_items.push_back({std::string(kKnobShort[i]) + v,
+            entry(kKnobShort[i], v, g_focus == Section::Knobs && g_knob_sel == i,
+                  hit_id(tb303::kHitKnob, static_cast<std::uint32_t>(i)))});
+    }
+    for (int i = 0; i < FX_COUNT; ++i) {
+        const std::string v = format_fx(i);
+        fx_items.push_back({std::string(kFxShort[i]) + v,
+            entry(kFxShort[i], v, g_focus == Section::FX && g_fx_sel == i,
+                  hit_id(tb303::kHitFx, static_cast<std::uint32_t>(i)))});
+    }
+    // Inner width of each panel: the row is split 5:4, minus gap and borders.
+    const int total = std::max(40, g_term_w > 0 ? g_term_w : 80) - 1;
+    const int voice_w = total * 5 / 9 - 2, fx_w = total - total * 5 / 9 - 2;
+    auto pack = [](std::vector<std::pair<std::string, Element>> items, int w) {
+        std::vector<Element> lines, cur;
+        int used = 0;
+        for (auto& [txt, el] : items) {
+            int cols = 0;
+            for (unsigned char c : txt) if ((c & 0xC0) != 0x80) ++cols;
+            cols += 3;   // marker, space between label and value, trailing space
+            if (!cur.empty() && used + cols > w) {
+                lines.push_back((dsl::h(std::move(cur))).build());
+                cur.clear();
+                used = 0;
+            }
+            cur.push_back(std::move(el));
+            used += cols;
+        }
+        if (!cur.empty()) lines.push_back((dsl::h(std::move(cur))).build());
+        return lines;
+    };
+    std::vector<Element> voice = pack(std::move(voice_items), voice_w);
+    std::vector<Element> fx    = pack(std::move(fx_items), fx_w);
+    // Both panels get the same number of rows so their borders line up.
+    const size_t rows = std::max(voice.size(), fx.size());
+    while (voice.size() < rows) voice.push_back(Element{TextElement{.content = ""}});
+    while (fx.size() < rows)    fx.push_back(Element{TextElement{.content = ""}});
+    auto panel = [rows](const char* title, std::vector<Element> items, bool focused, Section s) {
+        return (dsl::vstack()
             .border(BorderStyle::Round)
             .border_color(focused ? tb303::clr_accent() : tb303::clr_panel_hi())
             .border_text(title, BorderTextPos::Top)
-            .padding(0, 1, 0, 1)
+            .height(Dimension::fixed(static_cast<int>(rows) + 2))
             .overflow(Overflow::Hidden)
-            .height(Dimension::fixed(3))
             .min_width(Dimension::fixed(0))(std::move(items))
             | hit(hit_id(tb303::kHitPanel, static_cast<std::uint32_t>(s)))).build();
     };
     return (dsl::h(
-        panel(" SYNTH ", std::move(voice), g_focus == Section::Knobs, Section::Knobs) | dsl::grow(3),
-        panel(" FX ", std::move(fx), g_focus == Section::FX, Section::FX) | dsl::grow(2)
+        panel(" SYNTH ", std::move(voice), g_focus == Section::Knobs, Section::Knobs) | dsl::grow(5),
+        panel(" FX ", std::move(fx), g_focus == Section::FX, Section::FX) | dsl::grow(4)
     ) | dsl::gap(1) | dsl::shrink(0)).build();
 }
 
@@ -472,13 +505,18 @@ Element App::render_frame() const {
                                   g_playing ? g_current_step : -1,
                                   g_drum_master,
                                   g_focus == Section::Drums, w);
-    }, /*min_w=*/0, /*min_h=*/kDrumVoices + 2);
+    }, /*min_w=*/0, /*min_h=*/3);
 
+    bool drums_empty = true;
+    for (const auto& r : g_drums) for (bool c : r) drums_empty = drums_empty && !c;
+    const char* drum_title = g_drums_mute ? " DRUMS \xc2\xb7 MUTED (m) "
+                           : drums_empty ? " DRUMS \xc2\xb7 empty, r to roll "
+                                         : " DRUMS ";
     auto drum_panel = dsl::vstack()
         .border(BorderStyle::Round)
         .border_color(g_drums_mute ? tb303::clr_dim()
                       : g_focus == Section::Drums ? tb303::clr_accent() : tb303::clr_panel_hi())
-        .border_text(g_drums_mute ? " DRUMS \xc2\xb7 MUTED (m) " : " DRUMS ", BorderTextPos::Top)
+        .border_text(drum_title, BorderTextPos::Top)
         .basis(Dimension::fixed(0))
         .min_width(Dimension::fixed(0))
         .overflow(Overflow::Hidden)
@@ -500,7 +538,8 @@ Element App::render_frame() const {
           ) | dsl::gap(1) | dsl::grow(1)).build();
 
     auto seq = tb303::build_sequencer(g_steps, g_pattern_length, g_step_sel,
-                                      g_playing ? g_current_step : -1);
+                                      g_playing ? g_current_step : -1,
+                                      g_term_h > 0 && g_term_h < kCompactRows);
     auto seq_panel = dsl::vstack()
         .border(BorderStyle::Round)
         .border_color(g_synth_mute ? tb303::clr_dim()
@@ -653,12 +692,15 @@ Element App::render_frame() const {
 
     // grow(1): as a zstack's base layer the column must still fill the
     // screen, or an open overlay shrinks the whole app to its content height.
+    // Only the middle row gives up height on a short terminal. The title,
+    // the voice strip, the sequencer and the hint bar keep their rows, so
+    // the way to help is always on screen.
     Element main = (dsl::v(
-        std::move(title_bar),
-        std::move(voice_row),
-        std::move(middle_row),
-        std::move(step_row),
-        std::move(help_bar)
+        std::move(title_bar) | dsl::shrink(0),
+        std::move(voice_row) | dsl::shrink(0),
+        std::move(middle_row) | dsl::shrink(1),
+        std::move(step_row)  | dsl::shrink(0),
+        std::move(help_bar)  | dsl::shrink(0)
     ) | dsl::gap(0) | dsl::grow(1)).build();
 
     // Overlays float over the workspace, which stays visible around them.
@@ -670,5 +712,38 @@ Element App::render_frame() const {
     }
     if (g_first_run)
         return dsl::zstack({std::move(main), dsl::center()(tb303::build_welcome())});
+    if (g_menu.open) {
+        // Rows: title, items, footer. Width fits the longest label.
+        int w = static_cast<int>(g_menu.title.size()) + 4;
+        for (const auto& it : g_menu.items)
+            w = std::max(w, static_cast<int>(it.label.size() + it.key.size()) + 9);
+        w = std::min(w + 2, std::max(20, g_term_w - 2));
+        const int h = static_cast<int>(g_menu.items.size()) + 4;
+        const int sw = g_term_w > 0 ? g_term_w : 120, sh = g_term_h > 0 ? g_term_h : 40;
+        // Open right/down from the click, flipping when it would leave the screen.
+        int x = g_menu.x + 1, y = g_menu.y + 1;
+        if (x + w > sw) x = std::max(0, g_menu.x - w);
+        if (y + h > sh) y = std::max(0, sh - h);
+        std::vector<Element> rows;
+        rows.push_back(dsl::text(g_menu.title) | dsl::Bold | dsl::fgc(tb303::clr_accent()));
+        for (int i = 0; i < static_cast<int>(g_menu.items.size()); ++i) {
+            const auto& it = g_menu.items[static_cast<size_t>(i)];
+            const bool on = i == g_menu.sel;
+            std::string left = std::string(it.checked ? "\xe2\x9c\x93 " : "  ") + it.label;
+            rows.push_back((dsl::h(
+                dsl::text(std::move(left)) | dsl::fgc(on ? tb303::clr_accent() : tb303::clr_text())
+                    | dsl::grow(1),
+                dsl::text(it.key) | dsl::fgc(on ? tb303::clr_accent() : tb303::clr_muted())
+            ) | (on ? dsl::bgc(tb303::clr_grid()) : dsl::bgc(tb303::card_bg()))
+              | hit(hit_id(tb303::kHitMenuItem, static_cast<std::uint32_t>(i)))).build());
+        }
+        rows.push_back(dsl::text("Esc closes") | dsl::fgc(tb303::clr_dim()));
+        Element card = dsl::vstack()
+            .border(BorderStyle::Round)
+            .border_color(tb303::clr_accent())
+            .bg(tb303::card_bg())
+            .padding(0, 1, 0, 1)(std::move(rows));
+        return dsl::zstack({std::move(main), maya::detail::place_at(std::move(card), x, y, w, h)});
+    }
     return main;
 }

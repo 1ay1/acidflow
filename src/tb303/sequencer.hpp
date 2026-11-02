@@ -41,7 +41,8 @@ using namespace maya;
     const std::array<StepData, 16>& steps,
     int pattern_length,
     int selected,
-    int playing)
+    int playing,
+    bool compact = false)
 {
     // Pitch range for the sparkline — only notes actually in the pattern
     // (rests don't contribute). If everything is identical or the pattern
@@ -315,19 +316,22 @@ using namespace maya;
     // align_items(Center) on the vstack itself centers each row on the
     // cross-axis (horizontal), so the whole block floats to the middle of
     // the SEQUENCER panel on wide terminals and stays intrinsic-width on
-    // narrow ones.
+    // narrow ones. Compact (short terminals): no rules, and the lock row
+    // only when a step has locks. Hit rows keep their indices either way.
+    bool any_lock = false;
+    for (int i = 0; i < pattern_length; ++i) any_lock = any_lock || steps[static_cast<size_t>(i)].lock_mask;
+    std::vector<Element> rows;
+    if (!compact) rows.push_back(std::move(top));
+    rows.push_back(tag(std::move(nums), 0));
+    rows.push_back(tag(std::move(sparkline), 1));
+    rows.push_back(tag(std::move(leds), 2));
+    rows.push_back(tag(std::move(probs), 3));
+    if (!compact || any_lock) rows.push_back(tag(std::move(locks), 4));
+    rows.push_back(tag(std::move(notes), 5));
+    if (!compact) rows.push_back(std::move(bottom));
     return dsl::vstack()
         .gap(0)
-        .align_items(Align::Center)(
-            std::move(top),
-            tag(std::move(nums), 0),
-            tag(std::move(sparkline), 1),
-            tag(std::move(leds), 2),
-            tag(std::move(probs), 3),
-            tag(std::move(locks), 4),
-            tag(std::move(notes), 5),
-            std::move(bottom)
-        );
+        .align_items(Align::Center)(std::move(rows));
 }
 
 } // namespace tb303
