@@ -41,7 +41,7 @@ acidflow is a software recreation of the **Roland TB-303 Bass Line** (1981–198
 
 It's a set of pieces that fit together:
 
-- A **DSP engine** that models the 303's signal chain from circuit analysis (oscillator → ZDF ladder filter → VCA → output saturation) — not from sample playback.
+- A **DSP engine** that models the 303's signal chain from circuit analysis (oscillator → diode-ladder filter → VCA → output saturation) — not from sample playback.
 - A **16-step sequencer** with the real-303 per-step controls (pitch, accent, slide, rest) plus extras the original never had: **probability**, **ratchet**, and **per-step parameter locks** on cutoff / resonance / env-mod / accent.
 - A **5-voice synthesized drum machine** (BD / SD / CH / OH / CL) with its own 16-step grid and a master send that routes drums through the same FX as the bass.
 - An **FX rack** — pre-filter overdrive, tempo-synced delay, plate reverb — on the master bus.
@@ -650,16 +650,17 @@ The keybinds use the **shifted top-row digits** (`! @ # $ % ^ & * (` on a US key
 
 Slot operations save **pattern + drums + BPM + length + swing + p-locks**. They don't save knob positions or FX — knobs are part of your live state, not the pattern.
 
-### WAV export (`e`)
+### WAV export and stems (`e`)
 
-Press `e` from anywhere. acidflow:
+Press `e` from anywhere. acidflow renders 4 loops of the current pattern at the current BPM into `~/.config/acidflow/`:
 
-1. Pauses the live audio engine (it'd race the offline render otherwise).
-2. Renders 4 loops of the current pattern at the current BPM into `~/.config/acidflow/bounce.wav` — 44.1 kHz, 16-bit PCM, **mono**.
-3. Restarts the live audio engine.
-4. Resumes playback if you were playing.
+- `bounce.wav` — the full stereo mix with FX, plus 3 s of tail so the delay and reverb ring out
+- `bounce_synth.wav` — the 303 voice alone, dry
+- `bounce_drums.wav` — the drum bus alone, dry, with its panning
 
-You'll see a `✓ wav → bounce.wav` toast on success or `✗ wav failed` on disk error. The export uses the **same DSP** as live playback — same filter, same envelope, same saturation — but runs synchronously so it can't drop frames.
+All three are 24-bit stereo at the engine's sample rate and line up sample for sample, so you can drop them on DAW tracks and rebuild the mix. The bounce runs on its own copy of the engine with your current knobs, so **playback doesn't stop** and every bounce of the same pattern is identical.
+
+You'll see a `✓ wav → bounce.wav + stems` toast on success or `✗ wav failed` on disk error.
 
 The 4-loop count is fixed. If you need more, run the export multiple times into different files (rename between exports) or concatenate after the fact.
 
@@ -874,15 +875,18 @@ This section describes what's actually happening inside `src/engine.cpp` when yo
 
 ```
 PolyBLEP osc (saw/sq, drift ±3¢)
-  └─► [2× oversample]
-      └─► ZDF/TPT 4-pole ladder filter (per-stage tanh, fb tanh)
-          └─► VCA (VEG × accent × master)
-              └─► tanh saturator (DRIVE)
-                  └─► 16 Hz HPF
-                      └─► out
+  └─► overdrive (tanh, ADAA)
+      └─► [2× up, 59-tap half-band]
+          └─► diode-ladder filter (coupled stages, tanh input node)
+              └─► VCA (VEG × accent × master)
+                  └─► drive saturator (tanh, ADAA)
+          └─► [2× down]
+              └─► 16 Hz HPF ──┐
+drums (16 voices, panned) ────┤
+                              └─► ping-pong tape delay ─► Dattorro plate ─► DC block ─► limiter ─► L/R out
 ```
 
-Mono float32 at the platform's mix rate (44.1 kHz on ALSA / CoreAudio, usually 48 kHz on WASAPI).
+Stereo float32 at the device's rate (JACK uses the server's rate, ALSA / CoreAudio run at 44.1 kHz, WASAPI usually 48 kHz). The 303 voice itself is mono and sits in the center; the drums and FX make the stereo image.
 
 ### Oscillator
 
@@ -895,15 +899,17 @@ A single anti-aliased oscillator. Two waveforms:
 
 ### Filter
 
-A **4-pole low-pass diode ladder**, modelled with the **Zero-Delay Feedback / Topology-Preserving Transform** technique (Zavalishin's *Art of VA Filter Design*). The integrators use the trapezoidal rule (TPT). Pre-warped integrator gain `g = tan(π·fc/sr)`.
+A **4-pole diode ladder**. That's the important part: the 303 is not a Moog ladder. In a Moog ladder the four stages are buffered from each other and act as four identical one-poles in a row. In the 303's diode ladder neighbouring stages share diodes, so each capacitor sees its neighbours on both sides. The result is a softer knee (about 12 dB/oct near cutoff, steepening to 24) and a different resonance: the linear filter's characteristic polynomial is `s⁴ + 7s³ + 15s² + 10s + 1`, it self-oscillates at feedback `k ≈ 18.4`, and the peak sits at `√(10/7) ≈ 1.195×` the stage frequency (the engine scales for that, so the CUTOFF readout is where the peak actually lands).
 
-Each stage has a gentle `tanh(y · 1.05) × 0.95` after the integration — this models the diode-junction compression of the real ladder and is what gives 303s their *creamy* (not brittle) high-resonance squelch.
+It's discretised with **Topology-Preserving Transform** integrators (Zavalishin, *The Art of VA Filter Design*), pre-warped with `g = tan(π·fc/fs)`. The coupled linear system is tri-diagonal, so it's solved **exactly** each sample by back-substitution — true zero-delay feedback, no one-sample lag in the loop. The non-linearity is a `tanh` on the input summing node, `u = tanh(x − k·y₄)`, solved with three Newton steps from the linear solution.
 
-The **global feedback** path is `tanh(input − k·output)`. Resonance maps the user's RES knob to `k = 0..12`. A diode ladder self-oscillates around `k ≈ 10–12` (vs `k = 4` for a Moog ladder), which means the top of the RES knob hits actual self-oscillation rather than just being a tall-but-stable peak.
+RES maps to `k = 0 … 1.04 × 18.4`, so the very top of the knob just tips into self-oscillation and the rest of the travel is squelch. Resonance thins the passband (that's real), so a little make-up gain keeps RES from acting like a volume knob.
 
-The implicit feedback equation is solved with a **2-iteration fixed-point** seeded by the previous output. Two iterations is enough to be indistinguishable from Newton-Raphson at the mild non-linearity of `tanh` — and stable through self-oscillation.
+### Oversampling and aliasing
 
-**No passband gain compensation.** The volume drop at high resonance is intentional and is part of the sound.
+The filter and both saturators run at **2×** between 59-tap half-band FIRs (0.002 dB ripple to 0.205·fs, −80 dB from 0.295·fs). The saturators also use **first-order antiderivative anti-aliasing (ADAA)**: instead of `tanh(x[n])` they output the mean of `tanh` over the segment from `x[n−1]` to `x[n]`, computed from its antiderivative `log cosh`. On a 5 kHz sine driven hard, 2× + ADAA puts aliasing 36 dB lower than a plain `tanh`.
+
+**Partial passband compensation.** Some of the volume drop at high resonance is kept on purpose (it is part of the sound); about +8 dB of make-up at full RES stops the knob from reading as a volume control.
 
 ### Oversampling
 
@@ -957,11 +963,11 @@ The audio thread renders in 256-frame blocks (~5–6 ms at 44.1 kHz). This is th
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                       UI THREAD (main.cpp)                      │
+│                       UI THREAD (jaal loop, src/app)            │
 │                                                                 │
 │  Event handler ──► writes std::atomic params (relaxed)          │
 │                                                                 │
-│  Render @ 30 FPS ──► snapshots scope ring, peak, live fc        │
+│  Tick @ 30 Hz (4 Hz idle) ──► snapshots scope ring, peak, fc    │
 │                  ──► fires note triggers (atomic seq counter)   │
 │                                                                 │
 └──────────────────┬──────────────────────────────────────────────┘
@@ -970,14 +976,14 @@ The audio thread renders in 256-frame blocks (~5–6 ms at 44.1 kHz). This is th
                    │
 ┌──────────────────▼──────────────────────────────────────────────┐
 │                       AUDIO THREAD                              │
-│                       (audio_alsa / coreaudio / wasapi.cpp)     │
+│               (audio_jack / alsa / coreaudio / wasapi.cpp)      │
 │                                                                 │
-│  acid::render(buf, 256) ──► writes 256 mono float32 samples     │
+│  acid::render_live(buf, 256) ──► 256 stereo float32 frames      │
 │                                                                 │
 │  Block-rate: snapshot atomic params; one-pole smooth per-sample │
-│  Per-sample: osc → 2× → ladder → VCA → saturator → HPF → out    │
+│  Per-sample: osc → 2× → ladder → VCA → drive → ↓2 → FX → L/R    │
 │                                                                 │
-│  Write to ALSA / CoreAudio / WASAPI (blocking)                  │
+│  Write to the device (JACK pulls; the others block)             │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -1020,8 +1026,8 @@ The shared interface is the C-style API in `src/audio.hpp` — `acid_start()`, `
 
 - `knob.hpp` — vertical 8-row × 5-cell meter with label, value, tech symbol, default marker.
 - `sequencer.hpp` — 16-column grid with box borders, pitch sparkline, flag glyphs.
-- `scope.hpp` — Braille-cell oscilloscope with zero-crossing trigger and peak meter.
-- `filter_response.hpp` — log-frequency heatmap of the live filter response with a moving cutoff bar.
+- `scope.hpp` — pixel oscilloscope (half-block, 24-bit colour) with phosphor afterglow, zero-crossing trigger and peak meter.
+- `filter_response.hpp` — the diode ladder's real response on a log axis, the live spectrum behind it, and a moving cutoff bar.
 - `transport.hpp` — playback status, BPM / swing / length displays, preset browser.
 - `waveform_toggle.hpp` — saw / square button.
 - `help_bar.hpp` — context-sensitive footer.

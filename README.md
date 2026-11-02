@@ -6,7 +6,7 @@
 
 <p align="center">
   A <b>Roland TB-303</b> acid bass simulator that lives in your terminal.<br>
-  ZDF ladder. 16-step sequencer with p-locks. 16-voice drum machine. FX rack. MIDI I/O. Live scope. No GUI toolkit.
+  Diode-ladder filter. 16-step sequencer with p-locks. 16-voice drum machine. Stereo FX. MIDI, JACK, Link, CLAP. No GUI toolkit.
 </p>
 
 <p align="center">
@@ -16,7 +16,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/C%2B%2B-26-blue?style=flat-square" alt="C++26">
   <img src="https://img.shields.io/badge/build-CMake-064F8C?style=flat-square&logo=cmake&logoColor=white" alt="CMake">
-  <img src="https://img.shields.io/badge/audio-ALSA%20%7C%20CoreAudio%20%7C%20WASAPI-orange?style=flat-square" alt="audio backends">
+  <img src="https://img.shields.io/badge/audio-JACK%20%7C%20ALSA%20%7C%20CoreAudio%20%7C%20WASAPI-orange?style=flat-square" alt="audio backends">
   <img src="https://img.shields.io/badge/UI-TUI%20%2B%20mouse-ff8a28?style=flat-square" alt="TUI">
   <img src="https://img.shields.io/badge/dependencies-zero%20DSP%20libs-success?style=flat-square" alt="zero DSP deps">
 </p>
@@ -29,20 +29,23 @@ Type `space` to play. Press `r` to randomize. Drag a knob. Export a WAV. Quit be
 
 ## Features
 
-- **Authentic 303 DSP.** ZDF/TPT 4-pole ladder with per-stage tanh and global feedback tanh — the diode-junction non-linearity that makes a 303 *squelch* instead of *whine*. 2× oversampling kills high-Q aliasing. Exponential V/oct envelope modulation, persistent accent capacitor that stacks across notes, exponential slide RC with τ ≈ 88 ms, ±3 cent VCO drift.
+- **Authentic 303 DSP.** A real diode-ladder filter, not a Moog ladder: the four stages are coupled like the 303's, solved exactly with zero-delay feedback and a tanh on the input node. The filter and drive run at 2× between 59-tap half-band FIRs, and the saturators use antiderivative anti-aliasing, so hard drive stays clean. Exponential V/oct envelope modulation, persistent accent capacitor that stacks across notes, exponential slide RC with τ ≈ 88 ms, ±3 cent VCO drift.
 - **9 knobs that mean what their pots mean.** TUNE · WAVE · CUTOFF · RES · ENVMOD · DECAY · ACCENT · DRIVE · VOL. Cutoff: 13 Hz – 5 kHz log. Decay: 0.2–2 s. Envmod: 0–4 octaves. Tuning: ±12 st. Resonance self-oscillates around 90% — same as the real circuit.
 - **Sample-accurate 16-step sequencer** (runs on the audio thread) with per-step accent / slide / rest, **probability** (100/75/50/25), **ratchet** (1–4 hits per step), and **per-step parameter locks** on cutoff / resonance / env-mod / accent. Swing 50% straight → 75% hard shuffle. Variable pattern length 4–16. **16 hardcoded presets** inspired by *Acid Tracks*, *Higher State*, *Energy Flash*, *Voodoo Ray*, *Acperience*, Hardfloor, Plastikman, and friends.
 - **16-voice drum machine.** Synthesized (not sampled) BD / SD / CH / OH / CL / LT / HT / RS / CB / SH / TB / CG / MT / CY / RD / BG with their own 16-step grid, per-voice gain, per-voice mute, and a master drum-bus send that feeds the same FX chain as the 303 voice.
-- **FX rack.** Pre-filter overdrive, tempo-synced delay (1/16, 1/16d, 1/8, 1/8d), and plate reverb (size + HF damping). One focusable panel, live — the whole rack sits on the master bus after the VCA.
-- **MIDI I/O** (Linux/ALSA — stubbed on other platforms). Forward notes + drum hits (ch 10) + clock, or slave transport / BPM to external clock. Keyboard input drives the bass voice too.
-- **Live oscilloscope** (Braille-cell, zero-crossing triggered) and **filter response heatmap** that *moves with the envelope* so you can see the squelch.
+- **Stereo FX rack.** Pre-filter overdrive, a tempo-synced ping-pong tape delay (1/16, 1/16d, 1/8, 1/8d) with saturation, tone and wow/flutter in the loop, and a Dattorro plate reverb. Drums are panned across the field and a look-ahead limiter holds the master at −1 dBFS.
+- **MIDI everywhere.** ALSA on Linux, CoreMIDI on macOS, WinMM on Windows. Forward notes + drum hits (ch 10) + clock, or slave transport / BPM to external clock. `l` on any knob arms **MIDI learn**: move a controller and it's bound (saved to `midi_map.txt`).
+- **Live oscilloscope** in 24-bit colour pixels with phosphor afterglow, and a **filter response** chart that plots the ladder's real response and *moves with the envelope* so you can see the squelch.
 - **Song mode** — chain saved pattern slots on every wrap — and **jam mode** — turn the computer keyboard into a two-octave tracker piano.
 - **Full mouse support.** Click + drag knobs vertically. Scroll to fine-tune. Right-click to reset. Click a step to edit it. Hover onto a panel to focus it. Scroll on the title to nudge BPM.
 - **Smart randomizer.** Four character archetypes for knobs, four groove archetypes for patterns, plus `M` for one-at-a-time evolving mutations that "walk" a pattern without obliterating it.
 - **9 save slots** (`Shift-1`…`Shift-9` to save, `1`…`9` to load) — each slot stores the full session state (sequence, drums, all knobs, FX) in a plain-text file (`slot_1.txt`…`slot_9.txt`). Drop an AI-generated file here to load it instantly.
 - **Shareable pattern export** (`p` to export, `P` to import) — writes the current session to a single compact base64 file (`pattern.txt`) you can paste into a message or forum post. Same full state as a slot, just a different format for sharing.
 - **5 UI themes** — classic / cyber / moss / ice / mono — cycled with `T`.
-- **Cross-platform.** Linux (ALSA), macOS (CoreAudio), Windows (WASAPI). One DSP engine, three backends.
+- **Cross-platform.** Linux (JACK or ALSA), macOS (CoreAudio), Windows (WASAPI). JACK is used when a server is running (PipeWire's included) and patches straight into a DAW; set `ACIDFLOW_AUDIO=alsa` to force ALSA.
+- **Ableton Link** (optional build, `K` to toggle) — share tempo and bar phase with Live, Bitwig and anything else on the network.
+- **CLAP plugin** — the same engine as an instrument in your DAW: notes in (legato = slide, velocity ≥ 100 = accent), 16 automatable parameters, stereo out.
+- **Stems.** `e` bounces a 24-bit stereo mix plus the dry synth and drum buses, without stopping playback.
 - **Lock-free audio.** UI ↔ audio thread communication is atomic-only. Per-sample 15 ms parameter smoothing kills knob zipper. ~5–6 ms output latency.
 
 ## Install
@@ -94,13 +97,14 @@ W        start/stop live recording — take is saved to live_<timestamp>.wav
 T        cycle colour theme
 n / k    song mode / jam mode
 O / I    toggle MIDI out / MIDI sync
-e / E    export pattern as WAV / MIDI (.mid)
+K        toggle Ableton Link (when built with it)
+e / E    bounce WAV + stems / export MIDI (.mid)
 p / P    export / import pattern.txt  (compact base64 for sharing)
 q        quit
 ```
 
-In the **Knobs** section: `← →` selects, `↑ ↓` adjusts by 5%, `[ ]` by 10%, `0` resets, `w` toggles waveform, `m` mutes the synth voice.
-In the **FX** section: `← →` selects, `↑ ↓` adjusts (DLY TIME steps through the divisions), `0` resets, `m` mutes the bus.
+In the **Knobs** section: `← →` selects, `↑ ↓` adjusts by 5%, `[ ]` by 10%, `0` resets, `w` toggles waveform, `l` MIDI learn, `m` mutes the synth voice.
+In the **FX** section: `← →` selects, `↑ ↓` adjusts (DLY TIME steps through the divisions), `0` resets, `l` MIDI learn, `m` mutes the bus.
 In the **Sequencer**: `← →` selects step, `↑ ↓` semitone, `< >` octave, `a` accent, `s` slide, `m` rest, `v` cycle probability, `j` cycle ratchet, `F/G/H/J` p-lock cutoff/res/env/accent, `L` clear locks, `x` clear step, `c d e f g a b` set root pitch.
 In the **Drums**: `← →` step, `↑ ↓` voice (16 voices, BD → BG), `Space`/`x` toggle hit, `s` mute current voice, `1..9 0` quick-toggle step 1..10 on the selected voice, `[ ]` drum-bus master, `c` clear row, `C` clear kit. You can also click a voice label on the left edge to select it, or right-click a label to clear that row.
 In **Transport**: `↑ ↓` browse presets, `[ ]` BPM ±2, `{ }` pattern length, `- =` swing.
@@ -125,16 +129,32 @@ Hit `R` (capital) repeatedly until something grabs you. The randomizer is intent
 
 ## Under the hood
 
-Three concerns, cleanly separated:
-
 ```
-src/main.cpp       ── TUI, sequencer, input handling, preset/slot I/O, WAV export
-src/engine.cpp     ── Platform-agnostic DSP (oscillator, filter, envelopes, VCA)
-src/audio_*.cpp    ── One per platform (ALSA / CoreAudio / WASAPI), spawns audio thread
-src/tb303/*.hpp    ── Custom widgets (knob, sequencer, scope, filter response, ...)
+src/dsp.hpp        ── DSP blocks: diode ladder, ADAA tanh, half-band 2× OS, plate, tape delay, limiter
+src/engine.cpp     ── The voice, sequencer, drums and FX bus as an acid::Engine instance
+src/audio_*.cpp    ── Device drivers (JACK / ALSA / CoreAudio / WASAPI)
+src/midi_*.cpp     ── MIDI drivers on a shared parser + clock core (midi_core.hpp)
+src/app/           ── The app: state, input, randomizers, persistence, export, view
+src/app/program.hpp── The jaal Program around it (maya's runtime)
+src/tb303/*.hpp    ── Widgets (knob, sequencer, scope, filter response, ...)
+plugin/            ── CLAP instrument
+tests/             ── DSP, engine, headless UI and plugin tests
 ```
 
-The audio thread runs `acid::render(buf, 256)` and blocks on the OS device. The UI thread updates `std::atomic` parameters with relaxed ordering; the audio thread snapshots them per block and one-pole smooths at 15 ms. Note triggers go through a single `seq` counter (acquire / release) — no mutexes, no allocations on the audio path, ever.
+The audio thread renders 256-frame stereo blocks and blocks on the OS device. The UI updates `std::atomic` parameters with relaxed ordering; the audio thread snapshots them per block and one-pole smooths at 15 ms. Note triggers go through a single `seq` counter (acquire / release) — no mutexes, no allocations on the audio path. The engine is an object, so offline bounces, tests and the plugin each run their own copy without touching the live one.
+
+The UI is a [jaal](https://github.com/agentty-org/jaal) program: on input or a timer tick it updates the model, and `view()` builds the frame from it without side effects. While nothing moves it ticks at 4 Hz and skips redraws, so an idle acidflow uses no UI CPU.
+
+### Building the extras
+
+```bash
+cmake -B build -DACIDFLOW_BUILD_CLAP=ON   # also build acidflow.clap
+cmake -B build -DACIDFLOW_LINK=ON         # Ableton Link (GPLv2+, fetched at configure)
+ctest --test-dir build -LE perf           # run the tests
+./build/acid_render out.wav 4             # offline render of a reference line
+```
+
+Windows can be cross-compiled from Linux with [llvm-mingw](https://github.com/mstorsjo/llvm-mingw): `-DCMAKE_TOOLCHAIN_FILE=cmake/llvm-mingw.cmake -DLLVM_MINGW=/path/to/llvm-mingw`.
 
 If you want the deep version of all of that, plus every keystroke documented and every knob explained — that's in **[MANUAL.md](MANUAL.md)**.
 
