@@ -40,13 +40,16 @@ void App::reset_fx(int idx) {
     *g_fx_table[idx].value = g_fx_table[idx].default_v;
 }
 
-// cycle focus forward (or backward)
+// Cycle focus in the order the panels read on screen: synth voice, FX (top
+// row), transport, drums (middle), sequencer (bottom).
 void App::cycle_focus(int dir) {
-    // Section count follows Section enum — Knobs, FX, Sequencer, Drums, Transport.
-    int n = 5;
-    int cur = static_cast<int>(g_focus);
+    static constexpr Section kOrder[] = {Section::Knobs, Section::FX, Section::Transport,
+                                         Section::Drums, Section::Sequencer};
+    constexpr int n = 5;
+    int cur = 0;
+    while (cur < n && kOrder[cur] != g_focus) ++cur;
     cur = ((cur + dir) % n + n) % n;
-    g_focus = static_cast<Section>(cur);
+    g_focus = kOrder[cur];
 }
 
 // Jam-mode piano layout — classic tracker / FL "piano keys" mapping across
@@ -597,8 +600,11 @@ void App::handle_event(const Event& ev) {
                 if (c >= '1' && c <= '9' && k->mods.none()
                     && g_focus != Section::Drums) {
                     int slot = c - '0';
-                    push_undo("slot load");
-                    load_pattern_slot(slot);
+                    // Only a real load becomes an undo step; an empty slot just
+                    // says how to fill it.
+                    std::error_code ec;
+                    if (std::filesystem::exists(pattern_path(slot), ec)) push_undo("slot load");
+                    if (!load_pattern_slot(slot)) return;
                     // Keep song mode in sync: manual jumps should advance
                     // from the slot the user just picked, not from wherever
                     // the chain was previously, and reset the bar counter
@@ -908,7 +914,7 @@ void App::toggle_song_mode() {
     } else {
         int first = song_next_slot(0);
         if (first == 0) {
-            set_toast("\xe2\x9c\x97 no saved slots");
+            set_toast("no saved slots for song mode  \xc2\xb7  Shift+1\xe2\x80\xa6" "9 saves, A writes a song");
         } else {
             g_song_mode = true;
             g_song_slot = first;

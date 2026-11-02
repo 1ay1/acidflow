@@ -579,6 +579,7 @@ Element App::render_frame() const {
     std::string sub = std::string("  acid bass simulator  \xc2\xb7  ") + acid_audio_driver();
     if (acid_link_enabled())
         sub += "  \xc2\xb7  link " + std::to_string(acid_link_peers());
+    const std::string sub_text = sub;
     auto brand_sub = Element{TextElement{
         .content = std::move(sub),
         .style   = Style{}.with_fg(tb303::clr_muted()),
@@ -596,8 +597,21 @@ Element App::render_frame() const {
         uint8_t r = static_cast<uint8_t>(120 + (255 - 120) * t);
         uint8_t g = static_cast<uint8_t>(120 + ( 70 - 120) * t);
         uint8_t b = static_cast<uint8_t>(120 + ( 70 - 120) * t);
+        // Fit what's left after the "◆ TB-303" brand (the subtitle gives
+        // way to a long toast below); trim with … rather than run into it.
+        const int room = std::max(10, (g_term_w > 0 ? g_term_w : 120) - 14);
+        std::string msg = g_toast;
+        // Cut at a character boundary so the last glyph is never half a byte.
+        size_t cut = 0;
+        int n = 0;
+        for (size_t i = 0; i < msg.size(); ++i) {
+            if ((static_cast<unsigned char>(msg[i]) & 0xC0) == 0x80) continue;
+            if (n == room - 1) cut = i;
+            ++n;
+        }
+        if (n > room) { msg.resize(cut); msg += "\xe2\x80\xa6"; }
         status_el = Element{TextElement{
-            .content = g_toast,
+            .content = std::move(msg),
             .style   = Style{}.with_fg(maya::Color::rgb(r, g, b)).with_bold(),
             .wrap    = TextWrap::NoWrap,
         }};
@@ -635,10 +649,17 @@ Element App::render_frame() const {
     // toast text lingered visually until the next full repaint. Using
     // SpaceBetween puts each group at a fixed edge, so the status swap happens
     // in-place at the right margin and old glyphs are always overwritten.
-    auto brand_group = dsl::hstack().gap(0)(
-        std::move(brand),
-        std::move(brand_sub)
-    );
+    // The subtitle steps aside while a toast needs the width.
+    int toast_cols = 0;
+    if (g_toast_t > 0.0f)
+        for (unsigned char c : g_toast) if ((c & 0xC0) != 0x80) ++toast_cols;
+    int sub_cols = 0;
+    for (unsigned char c : sub_text) if ((c & 0xC0) != 0x80) ++sub_cols;
+    const bool sub_fits = toast_cols == 0
+        || 12 + sub_cols + 2 + toast_cols < (g_term_w > 0 ? g_term_w : 120);
+    auto brand_group = sub_fits
+        ? dsl::hstack().gap(0)(std::move(brand), std::move(brand_sub))
+        : dsl::hstack().gap(0)(std::move(brand));
     auto title_bar = dsl::hstack()
         .padding(0, 1, 0, 1)
         .justify(Justify::SpaceBetween)

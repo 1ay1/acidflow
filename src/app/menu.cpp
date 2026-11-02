@@ -54,7 +54,7 @@ void App::open_menu_at(int col, int row) {
             g_focus = Section::Sequencer;
             g_step_sel = i;
             const auto& s = g_steps[static_cast<size_t>(i)];
-            g_menu.title = step_label(i) + (s.rest ? ": rest" : ": " + midi_note_name(s.note));
+            g_menu.title = step_label(i) + (s.rest ? " (rest)" : " (" + midi_note_name(s.note) + ")");
             auto edit = [i](const char* what, auto fn) {
                 return [i, what, fn](App& a) {
                     a.push_undo(what);
@@ -119,7 +119,7 @@ void App::run_menu_item(int i) {
     auto item = g_menu.items[static_cast<size_t>(i)];
     g_menu.open = false;
     item.run(*this);
-    set_toast(g_menu.title + ": " + item.label
+    set_toast(g_menu.title + " \xc2\xb7 " + item.label
               + (item.key.empty() ? "" : "   (key " + item.key + ")"));
 }
 

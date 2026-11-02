@@ -491,7 +491,7 @@ bool App::export_pattern_text() {
 bool App::import_pattern_text() {
     auto path = config_dir() / "pattern.txt";
     std::ifstream f(path);
-    if (!f) { set_toast("\xe2\x9c\x97 no pattern.txt"); return false; }
+    if (!f) { set_toast("nothing to import: no pattern.txt yet  \xc2\xb7  p writes one"); return false; }
 
     std::string code, line;
     while (std::getline(f, line)) code += line;

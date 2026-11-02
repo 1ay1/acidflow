@@ -223,8 +223,32 @@ int fuzzy_score(std::string_view q, const Action& a) {
         for (auto& c : ql) c = lower(c);
         return 10000 + n + (nm.rfind(ql, 0) == 0 ? 5000 : 0);
     }
-    const int h = score_in(a.help, 1);
-    if (h >= 0) return 500 + h;
-    const int k = score_in(a.keys, 2);
-    return k >= 0 ? k : -1;
+    // Descriptions are long, so scattered letters match almost anything.
+    // There every query word must start a word in the text ("tem" finds
+    // "tempo", not "the ... mute").
+    auto words_in = [&](std::string_view hay) {
+        std::string h(hay);
+        for (auto& c : h) c = lower(c);
+        size_t start = 0;
+        int hits = 0;
+        while (start < q.size()) {
+            while (start < q.size() && q[start] == ' ') ++start;
+            size_t end = q.find(' ', start);
+            if (end == std::string_view::npos) end = q.size();
+            if (end == start) break;
+            std::string w(q.substr(start, end - start));
+            for (auto& c : w) c = lower(c);
+            bool found = false;
+            for (size_t p = h.find(w); p != std::string::npos; p = h.find(w, p + 1))
+                if (p == 0 || !std::isalnum(static_cast<unsigned char>(h[p - 1]))) { found = true; break; }
+            if (!found) return -1;
+            ++hits;
+            start = end;
+        }
+        return hits;
+    };
+    const int h = words_in(a.help);
+    if (h > 0) return 500 + h;
+    // Keys: exact only ("[" finds tempo down).
+    return std::string_view(a.keys) == q ? 100 : -1;
 }

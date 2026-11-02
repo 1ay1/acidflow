@@ -259,7 +259,11 @@ bool App::load_slot_from_path(const std::filesystem::path& path,
 bool App::load_pattern_slot(int slot, bool quiet) {
     char lbl[24];
     std::snprintf(lbl, sizeof(lbl), "slot %d", slot);
-    return load_slot_from_path(pattern_path(slot), lbl, quiet);
+    if (load_slot_from_path(pattern_path(slot), lbl, quiet)) return true;
+    if (!quiet)
+        set_toast("slot " + std::to_string(slot) + " is empty  \xc2\xb7  Shift+" + std::to_string(slot)
+                  + " saves the current pattern there");
+    return false;
 }
 
 // Scan the config dir for live_*.txt take files and sort newest-first so the
