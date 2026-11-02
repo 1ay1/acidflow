@@ -6,7 +6,7 @@
 
 <p align="center">
   A <b>Roland TB-303</b> acid bass simulator that lives in your terminal.<br>
-  Diode-ladder filter. 16-step sequencer with p-locks. 16-voice drum machine. Stereo FX. MIDI, JACK, Link, CLAP. No GUI toolkit.
+  Diode-ladder filter. 16-step sequencer with p-locks. 16-voice drum machine. Stereo FX. MIDI, JACK, CLAP. No GUI toolkit.
 </p>
 
 <p align="center">
@@ -41,9 +41,8 @@ Type `space` to play. Press `r` to randomize. Drag a knob. Export a WAV. Quit be
 - **Smart randomizer.** Four character archetypes for knobs, four groove archetypes for patterns, plus `M` for one-at-a-time evolving mutations that "walk" a pattern without obliterating it.
 - **9 save slots** (`Shift-1`…`Shift-9` to save, `1`…`9` to load) — each slot stores the full session state (sequence, drums, all knobs, FX) in a plain-text file (`slot_1.txt`…`slot_9.txt`). Drop an AI-generated file here to load it instantly.
 - **Shareable pattern export** (`p` to export, `P` to import) — writes the current session to a single compact base64 file (`pattern.txt`) you can paste into a message or forum post. Same full state as a slot, just a different format for sharing.
-- **5 UI themes** — classic / cyber / moss / ice / mono — cycled with `T`.
+- **Themes from maya** — acidflow's own "acid" look, your terminal's palette, or any of maya's schemes (gruvbox, tokyonight, dracula, nord, catppuccin…), cycled with `T` and remembered.
 - **Cross-platform.** Linux (JACK or ALSA), macOS (CoreAudio), Windows (WASAPI). JACK is used when a server is running (PipeWire's included) and patches straight into a DAW; set `ACIDFLOW_AUDIO=alsa` to force ALSA.
-- **Ableton Link** (optional build, `K` to toggle) — share tempo and bar phase with Live, Bitwig and anything else on the network.
 - **CLAP plugin** — the same engine as an instrument in your DAW: notes in (legato = slide, velocity ≥ 100 = accent), 16 automatable parameters, stereo out.
 - **Stems.** `e` bounces a 24-bit stereo mix plus the dry synth and drum buses, without stopping playback.
 - **Lock-free audio.** UI ↔ audio thread communication is atomic-only. Per-sample 15 ms parameter smoothing kills knob zipper. ~5–6 ms output latency.
@@ -157,7 +156,6 @@ The UI is a [jaal](https://github.com/agentty-org/jaal) program: on input or a t
 
 ```bash
 cmake -B build -DACIDFLOW_BUILD_CLAP=ON   # also build acidflow.clap
-cmake -B build -DACIDFLOW_LINK=ON         # Ableton Link (GPLv2+, fetched at configure)
 ctest --test-dir build -LE perf           # run the tests
 ./build/acid_render out.wav 4             # offline render of a reference line
 ```
@@ -231,3 +229,7 @@ Then press `1`–`9` in acidflow to load it. Use `Shift-1`…`Shift-9` to overwr
 ## Status
 
 acidflow is a personal project, but it's complete enough to make actual music with. Bug reports and pattern submissions welcome.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Everything acidflow builds with is MIT too: maya, jaal, and the CLAP SDK (fetched only for the plugin build). Nothing GPL is linked.

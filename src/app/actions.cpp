@@ -67,8 +67,6 @@ const std::vector<Action> kActions = {
         "Send notes, drum hits and clock to other gear or a DAW.", 0, RUN(a.toggle_midi_out())},
     {"midi.sync",   Scope::Global, "I", "Follow MIDI clock",
         "Take tempo and start/stop from an external MIDI clock.", 0, RUN(a.toggle_midi_sync())},
-    {"link",        Scope::Global, "K", "Ableton Link",
-        "Share tempo and bar position with other apps on the network.", 0, RUN(a.toggle_link())},
     {"theme",       Scope::Global, "T", "Change colours",
         "Cycle through the colour themes.", 0, RUN(a.next_theme())},
     {"quit",        Scope::Global, "q / Esc", "Quit",

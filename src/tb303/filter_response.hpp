@@ -188,10 +188,9 @@ inline float diode_ladder_mag(float f_over_stage, float k) {
             // t = 0 at bottom row, 1 at top row
             float t = chart_h <= 1 ? 1.0f
                     : static_cast<float>(row) / static_cast<float>(chart_h - 1);
-            float hue = 12.0f + t * 38.0f;                 // 12° red → 50° yellow
-            float sat = 0.95f - t * 0.10f;                 // slight desat at top
-            float lgt = 0.38f + t * 0.28f;                 // brighter near top
-            row_col[static_cast<size_t>(row)] = Color::hsl(hue, sat, lgt);
+            // Theme hot (base) → warning (top): embers in the theme's own hues.
+            row_col[static_cast<size_t>(row)] = mix(mix(clr_hot(), clr_grid(), 0.25f),
+                                                    Color::slot(ThemeSlot::Warning), t);
         }
 
         std::vector<Element> rows;
@@ -224,7 +223,7 @@ inline float diode_ladder_mag(float f_over_stage, float k) {
                     if (show_live && c == live_col) {
                         // Brightest marker in the scene — the actual current
                         // filter corner. This is the thing that moves.
-                        fg = Color::rgb(255, 240, 120);
+                        fg = clr_text();
                         st = Style{}.with_fg(fg).with_bold();
                     } else if (c == fc_col) {
                         fg = clr_hot();
@@ -238,14 +237,14 @@ inline float diode_ladder_mag(float f_over_stage, float k) {
                     // pale cyan dotted marker — distinct hue from the filter's
                     // warm palette so the two layers are legible at once.
                     glyph = "\xe2\x97\xa6";               // ◦ small circle
-                    fg    = Color::rgb(130, 210, 230);    // pale cyan
+                    fg    = clr_slide();                   // spectrum: the cool hue
                     st    = Style{}.with_fg(fg);
                 } else if (show_live && c == live_col) {
                     // solid vertical marker above the chart for the live fc —
                     // brighter and thicker than the static fc ghost line so it
                     // reads as "this is where the envelope pushed it".
                     glyph = "\xe2\x94\x83";               // ┃ heavy vertical
-                    fg    = Color::rgb(255, 240, 120);
+                    fg    = clr_text();
                     st    = Style{}.with_fg(fg).with_bold();
                 } else if (c == fc_col) {
                     // empty cell above the cutoff bar — draw a red dashed ghost

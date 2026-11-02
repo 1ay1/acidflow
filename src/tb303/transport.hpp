@@ -500,8 +500,8 @@ struct RichText {
                         else                fg = clr_accent();
                     } else {
                         if (s.rest)         fg = clr_grid();
-                        else if (s.slide)   fg = Color::rgb(70, 120, 160);
-                        else if (s.accent)  fg = Color::rgb(150, 80, 60);
+                        else if (s.slide)   fg = mix(clr_slide(), clr_grid(), 0.45f);
+                        else if (s.accent)  fg = mix(clr_hot(), clr_grid(), 0.45f);
                         else                fg = clr_panel_hi();
                     }
                     Style st = is_cur

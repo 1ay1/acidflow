@@ -181,18 +181,9 @@ float acid_current_bpm(void);
 int   acid_is_playing(void);
 
 // Align the sequencer to an external beat position (beat at the next block's
-// first sample) and tempo. Used by Ableton Link; safe from any thread.
+// first sample) and tempo, for an external clock. Safe from any thread.
 void  acid_seq_sync_beat(double beat, float bpm);
 
-// ── Ableton Link (optional, -DACIDFLOW_LINK=ON) ─────────────────────────────
-// When enabled, tempo and beat phase follow the Link session and BPM changes
-// made here propagate to it. Without Link these are no-ops returning 0.
-void  acid_link_enable(int on);
-int   acid_link_enabled(void);
-int   acid_link_peers(void);
-void  acid_link_set_tempo(float bpm);
-// Called by the audio backend once per block, before render.
-void  acid_link_tick(int frames, int sample_rate);
 
 #ifdef __cplusplus
 }

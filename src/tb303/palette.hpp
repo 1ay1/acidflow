@@ -16,12 +16,7 @@ using namespace maya;
 
 // An opaque backing for floating cards, a little darker than the panels so
 // they read as on top.
-inline Color card_bg() {
-    const Color g = clr_grid();
-    if (g.kind() != Color::Kind::Rgb) return Color::rgb(16, 16, 20);
-    return Color::rgb(static_cast<uint8_t>(g.raw_r() / 2), static_cast<uint8_t>(g.raw_g() / 2),
-                      static_cast<uint8_t>(g.raw_b() / 2));
-}
+inline Color card_bg() { return Color::slot(ThemeSlot::Overlay); }
 
 [[nodiscard]] inline Element build_palette(const std::string& query,
                                            const std::vector<const Action*>& matches,

@@ -17,7 +17,6 @@ option(ACIDFLOW_BUILD_APP    "Build the terminal app (needs ../maya)"       ON)
 option(ACIDFLOW_BUILD_TESTS  "Build the test suite"                         ON)
 option(ACIDFLOW_BUILD_CLAP   "Build the CLAP plugin (fetches the CLAP SDK)" OFF)
 option(ACIDFLOW_NATIVE       "Tune for this CPU (-march=native)"            ON)
-option(ACIDFLOW_LINK         "Ableton Link tempo sync (GPLv2+, fetched)"    OFF)
 
 # Shared compile options for everything that runs DSP.
 add_library(acid_flags INTERFACE)
@@ -42,34 +41,6 @@ target_include_directories(acid_engine PUBLIC src)
 target_link_libraries(acid_engine PUBLIC acid_flags PRIVATE acid_warnings)
 set_target_properties(acid_engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# Ableton Link is GPLv2+, so it's opt-in. Off, a stub provides the hooks.
-if(ACIDFLOW_LINK)
-    include(FetchContent)
-    FetchContent_Declare(link
-        URL      https://github.com/Ableton/link/archive/refs/tags/Link-3.1.3.tar.gz
-        URL_HASH SHA256=b0eba86d40a46b01ab821cdfb53041bfc693f0266538ea8163f1cea7ac42f476
-        SOURCE_SUBDIR include)
-    FetchContent_Declare(asio
-        URL      https://github.com/chriskohlhoff/asio/archive/refs/tags/asio-1-30-2.tar.gz
-        URL_HASH SHA256=755bd7f85a4b269c67ae0ea254907c078d408cce8e1a352ad2ed664d233780e8
-        SOURCE_SUBDIR asio/include)
-    FetchContent_MakeAvailable(link asio)
-    target_sources(acid_engine PRIVATE src/link.cpp)
-    target_include_directories(acid_engine SYSTEM PRIVATE
-        ${link_SOURCE_DIR}/include ${asio_SOURCE_DIR}/asio/include)
-    if(APPLE)
-        target_compile_definitions(acid_engine PRIVATE LINK_PLATFORM_MACOSX=1)
-    elseif(WIN32)
-        target_compile_definitions(acid_engine PRIVATE LINK_PLATFORM_WINDOWS=1 _WIN32_WINNT=0x0601)
-        target_link_libraries(acid_engine PRIVATE ws2_32 iphlpapi winmm)
-    else()
-        target_compile_definitions(acid_engine PRIVATE LINK_PLATFORM_LINUX=1)
-        find_package(Threads REQUIRED)
-        target_link_libraries(acid_engine PRIVATE Threads::Threads)
-    endif()
-else()
-    target_sources(acid_engine PRIVATE src/link_stub.cpp)
-endif()
 
 add_executable(acid_render tools/acid_render.cpp)
 target_link_libraries(acid_render PRIVATE acid_engine acid_warnings)

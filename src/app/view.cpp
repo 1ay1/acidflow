@@ -17,19 +17,12 @@ Element App::build_knob_row() const {
     //   ENV     (decay)               : amber
     //   AMP     (accent, volume)      : green
     auto group_color_for = [](int i) -> maya::Color {
-        using maya::Color;
         switch (i) {
-            case K_TUNE:   return Color::rgb(180, 130, 230); // OSC    violet
-            case K_WAVE:   return Color::rgb(180, 130, 230);
-            case K_CUTOFF: return Color::rgb( 90, 200, 220); // FILTER cyan
-            case K_RES:    return Color::rgb( 90, 200, 220);
-            case K_ENV:    return Color::rgb( 90, 200, 220);
-            case K_DECAY:  return Color::rgb(230, 180,  90); // ENV    amber
-            case K_ACCENT: return Color::rgb(120, 210, 140); // AMP    green
-            case K_DRIVE:  return Color::rgb(120, 210, 140);
-            case K_VOL:    return Color::rgb(120, 210, 140);
+            case K_TUNE: case K_WAVE:              return tb303::clr_group(4);   // OSC
+            case K_CUTOFF: case K_RES: case K_ENV: return tb303::clr_group(5);   // VCF
+            case K_DECAY:                          return tb303::clr_group(2);   // EG
+            default:                               return tb303::clr_group(3);   // VCA
         }
-        return tb303::clr_accent();
     };
 
     auto build_one = [&](int i) -> Element {
@@ -215,17 +208,11 @@ Element App::build_knob_row() const {
 //   OD (pre-filter, amber) → DELAY (warm orange) → REVERB (cool teal)
 Element App::build_fx_row() const {
     auto group_color_for = [](int i) -> maya::Color {
-        using maya::Color;
         switch (i) {
-            case FX_OD:    return Color::rgb(230, 180,  90);  // OD       amber
-            case FX_DMIX:
-            case FX_DFB:
-            case FX_DTIME: return Color::rgb(220, 150,  80);  // DELAY    orange
-            case FX_RMIX:
-            case FX_RSIZE:
-            case FX_RDAMP: return Color::rgb( 90, 190, 200);  // REVERB   teal
+            case FX_OD:                                  return tb303::clr_group(2);   // OD
+            case FX_DMIX: case FX_DFB: case FX_DTIME:    return tb303::clr_group(6);   // DELAY
+            default:                                     return tb303::clr_group(5);   // REVERB
         }
-        return tb303::clr_accent();
     };
 
     auto build_one = [&](int i) -> Element {
@@ -565,10 +552,7 @@ Element App::render_frame() const {
     bool on_downbeat = g_playing && g_current_step >= 0 && (g_current_step % 4 == 0);
     float pulse_amt = on_downbeat ? (1.0f - g_step_phase) : 0.0f;
     maya::Color brand_col = on_downbeat
-        ? maya::Color::rgb(
-            static_cast<uint8_t>(255),
-            static_cast<uint8_t>(138 + (255 - 138) * pulse_amt),
-            static_cast<uint8_t>(40  + (140 - 40)  * pulse_amt))
+        ? tb303::mix(tb303::clr_accent(), tb303::clr_text(), pulse_amt * 0.6f)
         : tb303::clr_accent();
 
     auto brand = Element{TextElement{
@@ -577,8 +561,6 @@ Element App::render_frame() const {
         .wrap    = TextWrap::NoWrap,
     }};
     std::string sub = std::string("  acid bass simulator  \xc2\xb7  ") + acid_audio_driver();
-    if (acid_link_enabled())
-        sub += "  \xc2\xb7  link " + std::to_string(acid_link_peers());
     const std::string sub_text = sub;
     auto brand_sub = Element{TextElement{
         .content = std::move(sub),
@@ -593,10 +575,8 @@ Element App::render_frame() const {
     // render path.
     Element status_el;
     if (g_toast_t > 0.0f) {
-        float t = g_toast_t / kToastDur;
-        uint8_t r = static_cast<uint8_t>(120 + (255 - 120) * t);
-        uint8_t g = static_cast<uint8_t>(120 + ( 70 - 120) * t);
-        uint8_t b = static_cast<uint8_t>(120 + ( 70 - 120) * t);
+        const float t = g_toast_t / kToastDur;
+        const Color toast_col = tb303::mix(tb303::clr_muted(), tb303::clr_hot(), t);
         // Fit what's left after the "◆ TB-303" brand (the subtitle gives
         // way to a long toast below); trim with … rather than run into it.
         const int room = std::max(10, (g_term_w > 0 ? g_term_w : 120) - 14);
@@ -612,7 +592,7 @@ Element App::render_frame() const {
         if (n > room) { msg.resize(cut); msg += "\xe2\x80\xa6"; }
         status_el = Element{TextElement{
             .content = std::move(msg),
-            .style   = Style{}.with_fg(maya::Color::rgb(r, g, b)).with_bold(),
+            .style   = Style{}.with_fg(toast_col).with_bold(),
             .wrap    = TextWrap::NoWrap,
         }};
     } else {

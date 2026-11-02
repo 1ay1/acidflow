@@ -151,15 +151,13 @@ The bottom strip shows the few keys for the currently-focused section, ending wi
 
 ## Themes
 
-Five color themes are built in:
+acidflow uses maya's theme system, so the colours are the ones every maya app shares. `T` cycles through:
 
-1. **classic** — 303 silver + Roland orange.
-2. **cyber** — magenta and cyan on ink.
-3. **moss** — chartreuse and amber on forest.
-4. **ice** — steel blue and coral on slate.
-5. **mono** — black and white only.
+1. **acid** — 303 silver + Roland orange (the default).
+2. **terminal** — your terminal's own palette, whatever it is.
+3. A handful of well-known schemes: gruvbox dark, tokyonight, dracula, nord, catppuccin mocha, rose pine, catppuccin latte (light), github dark.
 
-Cycle with `T`. The choice affects every color in the program (accents, highlights, text, backgrounds). Themes are saved with user slots — if you save a pattern to slot 3 in ice theme, loading slot 3 later will also set the theme.
+The choice affects every colour in the program and is saved when you quit. Any of maya's built-in schemes can be picked by name in `prefs.txt` (see the manual).
 
 ## Mouse
 

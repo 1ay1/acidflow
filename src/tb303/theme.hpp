@@ -1,139 +1,146 @@
 #pragma once
-// Shared palette + small text-measurement helper for the tb303 widgets.
-// Every widget header pulls in this file, so anything broadly reused by more
-// than one widget (like display_cols) belongs here.
+// acidflow's colours, on maya's theme system.
 //
-// Themes are runtime-selectable — the UI thread flips the current index and
-// every subsequent render reads the new palette. All widgets access colours
-// via `clr_*()` functions (NOT raw constants) so a theme switch is one
-// pointer-bump away. Adding a theme = append to kThemes below; everything
-// else follows from the function calls that already exist throughout the UI.
+// Every widget colour is a maya theme SLOT (Color::slot), so it follows
+// whatever theme is live: acidflow's own "303" look, the terminal's palette
+// (theme::native), or any of maya's built-in schemes. `T` cycles them and
+// the choice is saved by name.
+//
+// The roles acidflow needs map onto maya's slots:
+//   accent    → primary      the orange of the 303 (focus, the brand)
+//   accent_d  → warning      dimmer warm tone (some drum rows, env locks)
+//   hot       → error        accents, the playing step, REC
+//   slide     → info         slides, the filter curve
+//   ok        → success      playing, confirmations
+//   text/muted/dim           text / muted / placeholder
+//   panel_hi  → border       panel borders
+//   grid      → surface      the faint grid and the scope bed
+//
+// Pixel art (the scope, the filter chart) needs real RGB, so it resolves a
+// slot against the live theme with rgb_of(); on a theme without channels
+// (native) it falls back to a sane literal.
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <string>
 #include <string_view>
 
 #include <maya/maya.hpp>
+#include <maya/style/schemes.hpp>
+#include <maya/element/pixels.hpp>
 
 namespace tb303 {
 
 using namespace maya;
 
-struct Palette {
-    const char* name;
-    Color accent;
-    Color accent_d;
-    Color hot;
-    Color slide;
-    Color text;
-    Color muted;
-    Color dim;
-    Color panel;
-    Color panel_hi;
-    Color grid;
-    Color ok;
-};
+// acidflow's own look: the Roland orange on a dark silver-grey, the palette
+// it always had, stated as a full maya Theme so maya widgets agree with it.
+inline constexpr Theme kAcidTheme = Theme::derive(theme::native, [](Theme& t) {
+    t.primary      = Color::rgb(255, 138,  40);   // Roland orange
+    t.secondary    = Color::rgb(160,  80,  20);
+    t.accent       = Color::rgb(255, 138,  40);
+    t.success      = Color::rgb( 70, 220, 130);
+    t.error        = Color::rgb(255,  70,  70);
+    t.warning      = Color::rgb(160,  80,  20);
+    t.info         = Color::rgb( 90, 200, 255);
+    t.text         = Color::rgb(225, 225, 230);
+    t.inverse_text = Color::rgb( 20,  20,  24);
+    t.muted        = Color::rgb(120, 120, 130);
+    t.surface      = Color::rgb( 40,  45,  55);
+    t.background   = Color::default_color();      // keep the terminal's own bg
+    t.border       = Color::rgb(110, 115, 135);
+    t.highlight    = Color::rgb( 55,  58,  70);
+    t.selection    = Color::rgb( 55,  58,  70);
+    t.link         = Color::rgb( 90, 200, 255);
+    t.placeholder  = Color::rgb( 70,  70,  80);
+    t.overlay      = Color::rgb( 20,  22,  28);
+});
 
-// Theme library. Each entry is a self-contained palette; add new ones here.
-// Ordering matters for the cycle key — index 0 is the default, then rotate.
-inline constexpr Palette kThemes[] = {
-    { "classic",                                                     // 303 silver + orange
-      Color::rgb(255, 138,  40),  // accent   (Roland orange)
-      Color::rgb(160,  80,  20),  // accent_d
-      Color::rgb(255,  70,  70),  // hot      (red, for accents/playing)
-      Color::rgb( 90, 200, 255),  // slide    (cyan)
-      Color::rgb(225, 225, 230),  // text
-      Color::rgb(120, 120, 130),  // muted
-      Color::rgb( 70,  70,  80),  // dim
-      Color::rgb( 55,  58,  70),  // panel
-      Color::rgb(110, 115, 135),  // panel_hi
-      Color::rgb( 40,  45,  55),  // grid
-      Color::rgb( 70, 220, 130),  // ok
-    },
-    { "cyber",                                                       // magenta / cyan / ink
-      Color::rgb(255,  60, 200),  // hot pink
-      Color::rgb(140,  20, 110),
-      Color::rgb(255,  90, 255),  // fuchsia
-      Color::rgb( 80, 255, 220),  // mint
-      Color::rgb(235, 235, 255),
-      Color::rgb(130, 120, 180),
-      Color::rgb( 70,  60, 100),
-      Color::rgb( 35,  25,  60),
-      Color::rgb(130, 100, 200),
-      Color::rgb( 25,  20,  40),
-      Color::rgb(120, 255, 200),
-    },
-    { "moss",                                                        // earth / forest
-      Color::rgb(190, 210,  90),  // chartreuse
-      Color::rgb(110, 130,  40),
-      Color::rgb(255, 200, 120),  // amber
-      Color::rgb(200, 160, 100),  // tan
-      Color::rgb(230, 225, 210),
-      Color::rgb(140, 150, 120),
-      Color::rgb( 75,  85,  65),
-      Color::rgb( 45,  55,  45),
-      Color::rgb(110, 130, 100),
-      Color::rgb( 30,  40,  30),
-      Color::rgb(150, 220, 140),
-    },
-    { "ice",                                                         // steel / blue
-      Color::rgb(120, 200, 255),  // ice blue
-      Color::rgb( 40, 100, 160),
-      Color::rgb(255, 120, 180),  // coral
-      Color::rgb(180, 255, 240),  // frost
-      Color::rgb(235, 240, 250),
-      Color::rgb(130, 145, 170),
-      Color::rgb( 60,  70,  85),
-      Color::rgb( 30,  38,  52),
-      Color::rgb(100, 125, 160),
-      Color::rgb( 22,  28,  40),
-      Color::rgb(120, 230, 200),
-    },
-    { "mono",                                                        // monochrome
-      Color::rgb(230, 230, 230),
-      Color::rgb(140, 140, 140),
-      Color::rgb(255, 255, 255),
-      Color::rgb(200, 200, 200),
-      Color::rgb(235, 235, 235),
-      Color::rgb(140, 140, 140),
-      Color::rgb( 70,  70,  70),
-      Color::rgb( 45,  45,  45),
-      Color::rgb(120, 120, 120),
-      Color::rgb( 30,  30,  30),
-      Color::rgb(200, 200, 200),
-    },
+// What `T` cycles through. "acid" first; then the terminal's own colours;
+// then a handful of maya's schemes, light and dark.
+struct ThemeChoice { const char* name; const Theme* theme; };
+inline constexpr ThemeChoice kThemeChoices[] = {
+    {"acid",             &kAcidTheme},
+    {"terminal",         &theme::native},
+    {"gruvbox dark",     &theme::gruvbox_dark},
+    {"tokyonight",       &theme::tokyonight},
+    {"dracula",          &theme::dracula},
+    {"nord",             &theme::nord},
+    {"catppuccin mocha", &theme::catppuccin_mocha},
+    {"rose pine",        &theme::rose_pine},
+    {"catppuccin latte", &theme::catppuccin_latte},
+    {"github dark",      &theme::github_dark},
 };
-inline constexpr int kThemeCount = sizeof(kThemes) / sizeof(kThemes[0]);
+inline constexpr int kThemeCount = static_cast<int>(sizeof(kThemeChoices) / sizeof(kThemeChoices[0]));
 
-// Currently-selected theme. Single int, no atomics needed — UI thread is the
-// only writer and only reader. Stored in a header-inline variable so there's
-// no standalone .cpp file to add to the build.
 inline int g_theme_idx = 0;
+inline std::string g_theme_name = "acid";   // what's live, for prefs and toasts
 
-inline const Palette& active_theme() {
-    int i = g_theme_idx;
-    if (i < 0 || i >= kThemeCount) i = 0;
-    return kThemes[i];
+inline const ThemeChoice& active_theme() {
+    const int i = (g_theme_idx >= 0 && g_theme_idx < kThemeCount) ? g_theme_idx : 0;
+    return kThemeChoices[i];
 }
+// Install the theme in maya; every slot colour repaints from it.
+inline void apply_theme() { app_set_theme(*active_theme().theme); }
 inline void set_theme(int i) {
-    if (i < 0) i = 0;
-    if (i >= kThemeCount) i = kThemeCount - 1;
-    g_theme_idx = i;
+    g_theme_idx = (i >= 0 && i < kThemeCount) ? i : 0;
+    g_theme_name = kThemeChoices[g_theme_idx].name;
+    apply_theme();
 }
-inline void cycle_theme() {
-    g_theme_idx = (g_theme_idx + 1) % kThemeCount;
+inline void cycle_theme() { set_theme((g_theme_idx + 1) % kThemeCount); }
+// By name, for the saved prefs. Any maya scheme name works too ("Solarized
+// Dark", "Kanagawa"...): it's looked up in maya's full table.
+inline bool set_theme_by_name(std::string_view name) {
+    for (int i = 0; i < kThemeCount; ++i)
+        if (name == kThemeChoices[i].name) { set_theme(i); return true; }
+    for (const auto& s : theme::schemes)
+        if (name == s.name) {
+            g_theme_idx = -1;          // T continues from the first choice
+            g_theme_name = s.name;
+            app_set_theme(*s.theme);
+            return true;
+        }
+    return false;
 }
 
-inline Color clr_accent()   { return active_theme().accent;   }
-inline Color clr_accent_d() { return active_theme().accent_d; }
-inline Color clr_hot()      { return active_theme().hot;      }
-inline Color clr_slide()    { return active_theme().slide;    }
-inline Color clr_text()     { return active_theme().text;     }
-inline Color clr_muted()    { return active_theme().muted;    }
-inline Color clr_dim()      { return active_theme().dim;      }
-inline Color clr_panel()    { return active_theme().panel;    }
-inline Color clr_panel_hi() { return active_theme().panel_hi; }
-inline Color clr_grid()     { return active_theme().grid;     }
-inline Color clr_ok()       { return active_theme().ok;       }
+// Role colours, as slots.
+inline Color clr_accent()   { return Color::slot(ThemeSlot::Primary);     }
+inline Color clr_accent_d() { return Color::slot(ThemeSlot::Warning);     }
+inline Color clr_hot()      { return Color::slot(ThemeSlot::Error);       }
+inline Color clr_slide()    { return Color::slot(ThemeSlot::Info);        }
+inline Color clr_ok()       { return Color::slot(ThemeSlot::Success);     }
+inline Color clr_text()     { return Color::slot(ThemeSlot::Text);        }
+inline Color clr_muted()    { return Color::slot(ThemeSlot::Muted);       }
+inline Color clr_dim()      { return Color::slot(ThemeSlot::Placeholder); }
+inline Color clr_panel()    { return Color::slot(ThemeSlot::Highlight);   }
+inline Color clr_panel_hi() { return Color::slot(ThemeSlot::Border);      }
+inline Color clr_grid()     { return Color::slot(ThemeSlot::Surface);     }
+// Knob/FX group colours (OSC, VCF, EG, VCA / OD, DELAY, REVERB), from the
+// theme's own series ramp so they stay distinct on any scheme.
+inline Color clr_group(int i) { return theme::series(theme::live(), static_cast<std::size_t>(i)); }
+
+// The live theme's RGB for a slot, for pixel art. Named/default colours
+// (theme::native) have no channels, so they get the given fallback.
+inline Rgb rgb_of(Color c, Rgb fallback) {
+    const LitColor l = theme::live().resolve(c);
+    if (!l.has_channels()) return fallback;
+    return Rgb{l.r(), l.g(), l.b()};
+}
+
+// Blend two theme colours, t = 0 → a, 1 → b. For fades (toasts, the brand
+// pulse, gradients). Without channels (native) there's nothing to blend,
+// so it snaps to whichever end is nearer.
+inline Color mix(Color a, Color b, float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    const LitColor la = theme::live().resolve(a), lb = theme::live().resolve(b);
+    if (!la.has_channels() || !lb.has_channels()) return t < 0.5f ? a : b;
+    auto m = [t](uint8_t x, uint8_t y) {
+        return static_cast<uint8_t>(std::lround(x + (static_cast<float>(y) - x) * t));
+    };
+    return Color::rgb(m(la.r(), lb.r()), m(la.g(), lb.g()), m(la.b(), lb.b()));
+}
 
 // Rough display-width counter that treats every UTF-8 multi-byte sequence as
 // a single East-Asian Narrow glyph. Not perfect in general, but for our

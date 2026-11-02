@@ -23,7 +23,6 @@ These work regardless of focus:
 | `I` (Shift+I) | Toggle MIDI sync in |
 | `e` | Export pattern as WAV (4 loops) |
 | `W` (Shift+W) | Start / stop live recording (24-bit stereo WAV) |
-| `K` (Shift+K) | Toggle Ableton Link (builds with `-DACIDFLOW_LINK=ON`) |
 | `E` (Shift+E) | Export pattern as MIDI (.mid) |
 | `p` | Export pattern as shareable text |
 | `P` (Shift+P) | Import pattern from text |

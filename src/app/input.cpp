@@ -568,8 +568,6 @@ void App::handle_event(const Event& ev) {
     // Incoming notes still trigger the bass voice regardless; this switch
     // controls only the tempo-slaving path.
     if (key(ev, 'I')) { toggle_midi_sync(); return; }
-    // Ableton Link: share tempo and bar phase with other apps on the network.
-    if (key(ev, 'K')) { toggle_link(); return; }
     // MIDI learn: `l` arms the focused knob or FX; the next CC binds to it.
     // `l` again while armed cancels.
     if (key(ev, 'l') && (g_focus == Section::Knobs || g_focus == Section::FX)) {
@@ -877,10 +875,8 @@ void App::handle_event(const Event& ev) {
 void App::next_theme() {
     tb303::cycle_theme();
     g_theme_chosen = true;
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "\xe2\x97\x86 theme: %s",
-                  tb303::active_theme().name);
-    set_toast(buf);
+    set_toast("\xe2\x97\x86 theme: " + tb303::g_theme_name
+              + "  \xc2\xb7  T for the next one");
 }
 
 void App::toggle_midi_out() {
@@ -897,14 +893,6 @@ void App::toggle_midi_sync() {
     set_toast(g_midi_sync
         ? "\xe2\x99\xaa MIDI sync on  (waiting for clock/start)"
         : "MIDI sync off");
-}
-
-void App::toggle_link() {
-    const bool on = !acid_link_enabled();
-    acid_link_enable(on ? 1 : 0);
-    g_link_bpm_sent = g_bpm;
-    if (on && !acid_link_enabled()) set_toast("Link isn't in this build (-DACIDFLOW_LINK=ON)");
-    else set_toast(on ? "\xe2\x97\x8e Link on" : "Link off");
 }
 
 void App::toggle_song_mode() {

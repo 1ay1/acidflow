@@ -17,15 +17,3 @@ if(TARGET acid_app)
     target_link_libraries(ui_test PRIVATE acid_app)
     add_test(NAME ui COMMAND ui_test)
 endif()
-
-if(ACIDFLOW_LINK)
-    add_executable(link_test link_test.cpp)
-    target_include_directories(link_test SYSTEM PRIVATE
-        ${link_SOURCE_DIR}/include ${asio_SOURCE_DIR}/asio/include)
-    target_link_libraries(link_test PRIVATE acid_engine)
-    get_target_property(_defs acid_engine COMPILE_DEFINITIONS)
-    target_compile_definitions(link_test PRIVATE ${_defs})
-    # Needs multicast on loopback; label it so sandboxed CI can skip it.
-    add_test(NAME link COMMAND link_test)
-    set_tests_properties(link PROPERTIES LABELS net)
-endif()

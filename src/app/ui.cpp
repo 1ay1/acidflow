@@ -192,16 +192,16 @@ void App::toggle_all_mute() {
 void App::save_session() {
     save_slot_to(config_dir() / "session.txt");
     std::ofstream f(config_dir() / "prefs.txt");
-    if (g_theme_chosen) f << "theme " << tb303::g_theme_idx << "\n";
+    if (g_theme_chosen) f << "theme_name " << tb303::g_theme_name << "\n";
     f << "focus " << static_cast<int>(g_focus) << "\n"
       << "welcomed " << (g_first_run ? 0 : 1) << "\n"
       << "undo_hints " << g_undo_hints_left << "\n";
 }
 
 void App::load_session() {
-    // NO_COLOR (no-color.org): start in the greyscale theme. A theme the user
-    // picked and saved still wins.
-    if (const char* nc = std::getenv("NO_COLOR"); nc && *nc) tb303::set_theme(tb303::kThemeCount - 1);
+    // Install acidflow's own look unless prefs below pick another. (NO_COLOR
+    // is honoured by maya itself: it renders without colour whatever the theme.)
+    tb303::set_theme(0);
     std::error_code ec;
     const auto sess = config_dir() / "session.txt";
     if (std::filesystem::exists(sess, ec)) {
@@ -209,10 +209,13 @@ void App::load_session() {
         g_preset_index = -1;
     }
     std::ifstream f(config_dir() / "prefs.txt");
-    std::string k;
-    int v = 0;
-    while (f >> k >> v) {
-        if (k == "theme") { tb303::set_theme(v); g_theme_chosen = true; }
+    std::string line;
+    while (std::getline(f, line)) {
+        const auto sp = line.find(' ');
+        if (sp == std::string::npos) continue;
+        const std::string k = line.substr(0, sp), val = line.substr(sp + 1);
+        const int v = std::atoi(val.c_str());
+        if (k == "theme_name") { if (tb303::set_theme_by_name(val)) g_theme_chosen = true; }
         else if (k == "focus" && v >= 0 && v < 5) g_focus = static_cast<Section>(v);
         else if (k == "welcomed") g_first_run = v == 0;
         else if (k == "undo_hints") g_undo_hints_left = std::clamp(v, 0, 4);

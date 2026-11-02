@@ -52,11 +52,10 @@ struct ScopeState {
 
 namespace scope_detail {
 
+// The scope's bed: the theme's surface, darkened so the trace stands out.
 inline Rgb dark_bed() {
-    const Color gc = clr_grid();
-    if (gc.kind() != Color::Kind::Rgb) return Rgb{12, 12, 16};
-    return Rgb{static_cast<uint8_t>(gc.raw_r() / 3), static_cast<uint8_t>(gc.raw_g() / 3),
-               static_cast<uint8_t>(gc.raw_b() / 3)};
+    const Rgb s = rgb_of(clr_grid(), Rgb{36, 36, 48});
+    return Rgb{static_cast<uint8_t>(s.r / 3), static_cast<uint8_t>(s.g / 3), static_cast<uint8_t>(s.b / 3)};
 }
 
 // Draw `img` (w × ph pixels): background, zero line, then traces oldest to
@@ -75,6 +74,10 @@ inline void rasterise(Image& img, const std::vector<std::vector<float>>& traces,
         const float t = 0.5f - 0.5f * std::clamp(s * gain, -1.0f, 1.0f);
         return std::clamp(static_cast<int>(std::lround(t * (ph - 1))), 0, ph - 1);
     };
+    // Trace colours from the theme: primary at the edges, warning (hotter)
+    // through the middle, so it glows like a phosphor.
+    const Rgb edge = rgb_of(clr_accent(), Rgb{255, 138, 40});
+    const Rgb core = rgb_of(Color::slot(ThemeSlot::Warning), Rgb{255, 200, 80});
     const int n = static_cast<int>(traces.size());
     for (int age = n - 1; age >= 0; --age) {
         const auto& tr = traces[static_cast<size_t>(n - 1 - age)];
@@ -90,7 +93,9 @@ inline void rasterise(Image& img, const std::vector<std::vector<float>>& traces,
             for (int y = std::min(prev, r); y <= std::max(prev, r); ++y) {
                 const float ct = 1.0f - std::fabs((y + 0.5f) / ph * 2.0f - 1.0f);
                 const Rgb old = img(x, y);
-                const float rr = (190 + 65 * ct) * a, gg = (70 + 80 * ct) * a * a, bb = 18 * a;
+                auto lerp = [ct](uint8_t e, uint8_t c) { return e + (static_cast<float>(c) - e) * ct * 0.5f; };
+                const float rr = lerp(edge.r, core.r) * a, gg = lerp(edge.g, core.g) * a * a,
+                            bb = lerp(edge.b, core.b) * a * a;
                 auto ch = [](uint8_t o, float v) {
                     return static_cast<uint8_t>(static_cast<int>(std::max<float>(o, v)) & 0xF8);
                 };
@@ -124,8 +129,9 @@ inline void rasterise(Image& img, const std::vector<std::vector<float>>& traces,
             const int mx = x + std::max(0, (w - static_cast<int>(msg.size())) / 2);
             const int my = y + h / 2 - 1;
             auto& pool = *c.style_pool();
-            const auto sid = pool.intern(Style{}.with_fg(clr_muted()).with_bg(Color::rgb(
-                scope_detail::dark_bed().r, scope_detail::dark_bed().g, scope_detail::dark_bed().b)));
+            const auto bed = scope_detail::dark_bed();
+            const auto sid = pool.intern(Style{}.with_fg(theme::live().resolve(clr_muted()))
+                                             .with_bg(Color::rgb(bed.r, bed.g, bed.b)));
             for (int i = 0; i < static_cast<int>(msg.size()) && mx + i < x + w; ++i)
                 c.set(mx + i, my, msg[static_cast<size_t>(i)], sid);
         }
@@ -143,7 +149,7 @@ inline void rasterise(Image& img, const std::vector<std::vector<float>>& traces,
                 txt += "\xe2\x96\x88";   // █
                 const float ct = static_cast<float>(c) / std::max(1, w - 1);
                 fg = (peak > 0.9f && c > static_cast<int>(w * 0.8f))
-                   ? clr_hot() : Color::hsl(35.0f - ct * 20.0f, 0.9f, 0.45f + ct * 0.10f);
+                   ? clr_hot() : mix(clr_accent(), clr_hot(), ct * 0.6f);
             } else {
                 txt += "\xe2\x96\x81";   // ▁
                 fg = clr_grid();

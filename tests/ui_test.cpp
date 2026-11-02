@@ -424,6 +424,32 @@ TEST("scope trace uses most of the height during playback") {
     CHECK(clipped < n / 10);
 }
 
+// Themes are maya themes: T installs the next one in maya, every slot colour
+// follows it, and the choice comes back by name next launch.
+TEST("T switches maya's live theme and it is restored by name") {
+    Clean c;
+    {
+        H h;
+        REQUIRE(tb303::g_theme_name == "acid");
+        const auto acid = theme::live().resolve(tb303::clr_accent());
+        key(h, U'T');
+        CHECK(tb303::g_theme_name == "terminal");
+        CHECK(theme::live() == theme::native);
+        key(h, U'T');
+        CHECK(tb303::g_theme_name == "gruvbox dark");
+        CHECK(theme::live() == theme::gruvbox_dark);
+        CHECK(!(theme::live().resolve(tb303::clr_accent()) == acid));
+        CHECK(has(app(h).g_toast, "gruvbox dark"));
+    }   // quit saves prefs
+    tb303::set_theme(0);
+    H h2;
+    CHECK(tb303::g_theme_name == "gruvbox dark");
+    CHECK(theme::live() == theme::gruvbox_dark);
+    // Any maya scheme name works in prefs.
+    CHECK(tb303::set_theme_by_name("Solarized Dark") || tb303::set_theme_by_name("Dracula"));
+    tb303::set_theme(0);
+}
+
 // The layout at common terminal sizes: every panel is there, labels aren't
 // cut, and the way to help is on screen.
 TEST("layout holds at 80x24, 100x30, 120x40 and 160x50") {

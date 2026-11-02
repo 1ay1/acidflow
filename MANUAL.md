@@ -47,7 +47,7 @@ It's a set of pieces that fit together:
 - An **FX rack**: a pre-filter overdrive on the 303 voice, then a tempo-synced stereo tape delay and a plate reverb on the whole mix.
 - **MIDI I/O** on Linux (ALSA sequencer), macOS (CoreMIDI) and Windows (WinMM): note and drum output on channel 10, clock out, external clock/start/stop sync, and note-in routing to the bass voice.
 - **Song mode** (chain saved slots on pattern wrap) and **jam mode** (two-octave live keyboard into the 303 voice).
-- A **TUI** built on the [`maya`](https://github.com/1ay1/maya) C++26 framework — keyboard-first, mouse-aware, full-screen, five switchable colour themes.
+- A **TUI** built on the [`maya`](https://github.com/1ay1/maya) C++26 framework — keyboard-first, mouse-aware, full-screen, themed through maya's colour themes.
 
 The 303 voice itself is still monophonic — the original was, too. Everything around it (drums, FX, MIDI, chaining) is additive: skip the keybinds and you have a faithful 303; use them and you have most of a sketchpad.
 
@@ -129,7 +129,7 @@ Under 38 rows (the default 80×24 included) acidflow uses a compact layout: the 
 
 ### Without colour
 
-If the `NO_COLOR` environment variable is set, acidflow starts in the greyscale **mono** theme (a theme you pick with `T` is remembered and wins). Accents, slides, rests and the playing step all have their own symbols, not just colours.
+If the `NO_COLOR` environment variable is set, maya draws no colour at all. Accents, slides, rests and the playing step all have their own symbols, not just colours, so nothing is lost.
 
 ---
 
@@ -562,17 +562,18 @@ The backend is a zero-overhead path when both toggles are off — no allocations
 
 ## 13. Themes
 
-Five palettes. Press `T` (Shift+T) to cycle them — the change is immediate and applies to every panel, border, glyph, and status light.
+acidflow's colours come from [maya's theme system](https://github.com/1ay1/maya), so they follow the same themes every maya app uses. Press `T` (Shift+T) to cycle; the change is immediate and applies to every panel, border, glyph and status light. The choice is saved when you quit and comes back next time.
 
 | Theme | Feel |
 |---|---|
-| **classic** | 303-silver + Roland orange on near-black (default) |
-| **cyber** | hot pink + mint cyan on deep ink |
-| **moss** | chartreuse + amber on forest green |
-| **ice** | ice-blue + coral on steel |
-| **mono** | pure greyscale — for screenshots or "I'm done looking at colours" |
+| **acid** | 303-silver + Roland orange on your terminal's background (default) |
+| **terminal** | your terminal's own palette, nothing stated by acidflow; reads right on light and dark terminals alike |
+| **gruvbox dark**, **tokyonight**, **dracula**, **nord**, **catppuccin mocha**, **rose pine**, **github dark** | well-known dark schemes, each with its own background |
+| **catppuccin latte** | a light scheme |
 
-Theme choice is not persisted across runs — every launch starts on **classic**.
+Any of maya's ~600 built-in schemes can be used: put its name in `~/.config/acidflow/prefs.txt` as `theme_name Solarized Dark` (the names are the upstream ones, like `Kanagawa` or `Everforest Dark`).
+
+Colours are given as roles (accent, hot, slide, border, ...) rather than fixed RGB, which is why every theme works without acidflow knowing about it. With `NO_COLOR` set, maya draws no colour at all; accents, slides, rests and the playing step all still have their own symbols.
 
 ---
 
@@ -795,7 +796,7 @@ This is the full canonical list, also accessible inside the app via `?`.
 | `r` | Randomize current section |
 | `R` | Randomize everything (knobs + pattern) |
 | `M` (Shift+M) | Evolve pattern — one small mutation per press |
-| `T` (Shift+T) | Cycle colour theme (classic / cyber / moss / ice / mono) |
+| `T` (Shift+T) | Cycle colour theme (acid / terminal / gruvbox / tokyonight / …) |
 | `n` | Toggle **song mode** (chain saved slots on pattern wrap) |
 | `k` | Toggle **jam mode** (two-octave live keyboard into the 303 voice) |
 | `O` (Shift+O) | Toggle **MIDI out** (notes + drums + clock) |

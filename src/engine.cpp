@@ -273,7 +273,7 @@ std::atomic<float>    g_seq_step_phase           {0.0f};
 
 double g_seq_clock       = 0.0;         // samples into the current step
 int    g_seq_step        = -1;          // playing step (-1 = idle)
-// Beat position posted by an external clock (Link); seq bumps per post.
+// Beat position posted by an external clock; seq bumps per post.
 std::atomic<double>   g_sync_beat     {0.0};
 std::atomic<uint32_t> g_sync_beat_seq {0};
 uint32_t              g_sync_beat_seen = 0;
@@ -777,7 +777,7 @@ void render(float* out, int frames) {
     }
     g_seq_was_playing = sp_on;
 
-    // External beat sync (Ableton Link): if a target beat was posted, move the
+    // External beat sync: if a target beat was posted, move the
     // step clock to it. Small drift is nudged out over a few blocks; a big
     // jump (joining a session, tempo leap) snaps.
     if (sp_on && g_sync_beat_seq.load(std::memory_order_acquire) != g_sync_beat_seen) {
@@ -1594,7 +1594,6 @@ void set_sample_rate(int sr)          { g_core->set_sample_rate(sr); }
 int  sample_rate()                    { return g_core->sample_rate(); }
 void render(float* out, int frames)   { g_core->render(out, frames); }
 void render_live(float* out, int frames) {
-    acid_link_tick(frames, g_core->sample_rate());
     g_core->render(out, frames);
 }
 float cutoff_knob_hz(float k) {
@@ -1912,7 +1911,7 @@ float acid_current_bpm(void) {
     return acid::cur()->g_seq_bpm.load(std::memory_order_relaxed);
 }
 
-// Align the sequencer to an external beat position (Ableton Link). Call per
+// Align the sequencer to an external beat position. Call per
 // audio block with the beat at the block's first sample.
 void acid_seq_sync_beat(double beat, float bpm) {
     acid::Core* c = acid::cur();
