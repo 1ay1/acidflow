@@ -110,15 +110,12 @@ int acid_sample_rate(void);
 // use at render rate (~30 Hz) — safe to call cheaply every frame.
 int acid_fft_bins(float* out_mags, int n_bins);
 
-// Offline WAV bounce: render `loops` repetitions of the given pattern into
-// `path` at the engine's sample rate, 16-bit PCM mono. Uses the same in-engine
-// sequencer as live playback — swing and BPM apply identically — and runs
-// synchronously so it can't drop frames. The UI should NOT be running
-// `acid_start()` for the duration of the call (engine globals are shared).
-// Returns 0 on success, -1 on file-open failure.
+// Offline bounce: render `loops` repetitions of the pattern as a 24-bit stereo
+// WAV. It runs on a private engine that copies the live knobs, so it's safe
+// while audio is playing and every bounce is identical. Returns 0 or -1.
 //
-// The `notes` array carries pattern_length entries; each slot is (midi, flags)
-// packed as one int per step where flags bits are {rest=1, accent=2, slide=4}.
+// Each `notes` entry is midi | flags<<8 (rest=1, accent=2, slide=4)
+// | prob<<11 (0..100) | (ratchet-1)<<18.
 int acid_render_wav(const char* path,
                     const int*  notes,       // pattern_length entries
                     int         pattern_length,
@@ -126,10 +123,21 @@ int acid_render_wav(const char* path,
                     float       swing,       // 0.50..0.75
                     int         loops);
 
+// Same, plus stems: the dry synth and drum buses in sync with the mix, and a
+// longer tail so the FX ring out. Any path may be null to skip that file.
+int acid_render_stems(const char* mix_path,
+                      const char* synth_path,
+                      const char* drums_path,
+                      const int*  notes,
+                      int         pattern_length,
+                      float       bpm,
+                      float       swing,
+                      int         loops);
+
 // Live recording: capture the running audio-thread output (post-FX, the same
 // samples the device hears) into a WAV file. `begin` allocates a capture
 // buffer sized for `max_seconds` and arms the audio-thread tap; `end` stops
-// the tap, writes a 16-bit PCM mono WAV to `path`, and frees the buffer.
+// the tap, writes a 24-bit stereo WAV to `path`, and frees the buffer.
 // Safe to call while `acid_start()` is running — no streams are torn down.
 // Returns 0 on success, -1 on allocation or file failure. Calling `begin`
 // while already recording is a no-op (-1). Calling `end` without a prior

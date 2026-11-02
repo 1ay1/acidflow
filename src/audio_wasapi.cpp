@@ -45,7 +45,7 @@ template <typename T>
 void safe_release(T*& p) { if (p) { p->Release(); p = nullptr; } }
 
 void audio_thread() {
-    std::vector<float> mono(acid::kBufFrames);
+    std::vector<float> lr(static_cast<size_t>(acid::kBufFrames) * acid::kChannels);
     g_client->Start();
 
     while (g_run.load(std::memory_order_relaxed)) {
@@ -67,13 +67,16 @@ void audio_thread() {
         while (done < avail) {
             UINT32 chunk = std::min<UINT32>(avail - done,
                                             static_cast<UINT32>(acid::kBufFrames));
-            acid::render(mono.data(), static_cast<int>(chunk));
-            // Splat mono into every channel of the device mix format.
+            acid::render(lr.data(), static_cast<int>(chunk));
+            // Stereo into the first two channels (mono devices get the sum),
+            // any surround channels stay silent.
             for (UINT32 i = 0; i < chunk; ++i) {
-                float s = mono[i];
-                for (UINT32 c = 0; c < g_channels; ++c) {
-                    out[(done + i) * g_channels + c] = s;
-                }
+                float* f = &out[(done + i) * g_channels];
+                const float l = lr[2 * i], r = lr[2 * i + 1];
+                if (g_channels == 1) { f[0] = 0.5f * (l + r); continue; }
+                f[0] = l;
+                f[1] = r;
+                for (UINT32 c = 2; c < g_channels; ++c) f[c] = 0.0f;
             }
             done += chunk;
         }

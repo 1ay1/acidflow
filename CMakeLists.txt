@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(acidflow VERSION 0.1.0 LANGUAGES CXX)
+project(acidflow VERSION 0.2.0 LANGUAGES CXX)
 
 if(MSVC)
     set(CMAKE_CXX_STANDARD 23)
@@ -13,69 +13,91 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-# ── maya framework ──────────────────────────────────────────────────────────
-# Expect a sibling checkout at ../maya. If that ever becomes inconvenient,
-# swap this for FetchContent_Declare(maya ...).
-# We only need the library and maya::app (the jaal runtime), not its demos.
-set(MAYA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(MAYA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../maya ${CMAKE_CURRENT_BINARY_DIR}/maya)
+option(ACIDFLOW_BUILD_APP    "Build the terminal app (needs ../maya)"       ON)
+option(ACIDFLOW_BUILD_TESTS  "Build the test suite"                         ON)
+option(ACIDFLOW_BUILD_CLAP   "Build the CLAP plugin (fetches the CLAP SDK)" OFF)
+option(ACIDFLOW_NATIVE       "Tune for this CPU (-march=native)"            ON)
 
-# ── Platform-specific audio backend ─────────────────────────────────────────
-# Every backend implements the C interface in src/audio.hpp (acid_start /
-# acid_stop). The shared DSP lives in engine.cpp and is platform-agnostic.
-set(ACIDFLOW_SOURCES
-    src/main.cpp
-    src/engine.cpp
-)
+# Shared compile options for everything that runs DSP.
+add_library(acid_flags INTERFACE)
+target_compile_options(acid_flags INTERFACE
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O3 -funroll-loops>
+    $<$<AND:$<BOOL:${ACIDFLOW_NATIVE}>,$<CXX_COMPILER_ID:GNU,Clang,AppleClang>>:-march=native>
+    $<$<CXX_COMPILER_ID:MSVC>:/O2 /utf-8>)
+target_compile_definitions(acid_flags INTERFACE $<$<CXX_COMPILER_ID:MSVC>:_USE_MATH_DEFINES>)
 
-if(APPLE)
-    list(APPEND ACIDFLOW_SOURCES src/audio_coreaudio.cpp src/midi_stub.cpp)
-    find_library(AUDIO_TOOLBOX   AudioToolbox   REQUIRED)
-    find_library(CORE_AUDIO      CoreAudio      REQUIRED)
-    find_library(CORE_FOUNDATION CoreFoundation REQUIRED)
-    set(ACIDFLOW_AUDIO_LIBS
-        ${AUDIO_TOOLBOX}
-        ${CORE_AUDIO}
-        ${CORE_FOUNDATION}
-    )
-elseif(WIN32)
-    list(APPEND ACIDFLOW_SOURCES src/audio_wasapi.cpp src/midi_stub.cpp)
-    # WASAPI lives in ole32 (CoCreateInstance/MMDeviceEnumerator) and the
-    # audio client headers ship with the Windows SDK. No explicit audio lib
-    # needed — link ole32 for COM and winmm for timing helpers.
-    set(ACIDFLOW_AUDIO_LIBS ole32 winmm)
-elseif(UNIX)
-    list(APPEND ACIDFLOW_SOURCES src/audio_alsa.cpp src/midi_alsa.cpp)
-    # Prefer pkg-config (handles multiarch include paths) but fall back to a
-    # plain library lookup for minimal distros.
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-        pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
-        set(ACIDFLOW_AUDIO_LIBS PkgConfig::ALSA)
+# Strict warnings for our own DSP code (maya's headers trip -Wextra's
+# missing-field-initializer check, so the app doesn't get these).
+add_library(acid_warnings INTERFACE)
+target_compile_options(acid_warnings INTERFACE
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra>
+    $<$<CXX_COMPILER_ID:MSVC>:/W3>)
+
+# ── Engine ──────────────────────────────────────────────────────────────────
+# The DSP and sequencer, with no terminal or device dependency. Linked by the
+# app, the offline renderer, the tests and the plugin.
+add_library(acid_engine STATIC src/engine.cpp)
+target_include_directories(acid_engine PUBLIC src)
+target_link_libraries(acid_engine PUBLIC acid_flags PRIVATE acid_warnings)
+set_target_properties(acid_engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_executable(acid_render tools/acid_render.cpp)
+target_link_libraries(acid_render PRIVATE acid_engine acid_warnings)
+
+# ── App ─────────────────────────────────────────────────────────────────────
+if(ACIDFLOW_BUILD_APP)
+    # Expect a sibling checkout at ../maya. We only need the library and
+    # maya::app (the jaal runtime), not its demos or tests.
+    set(MAYA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(MAYA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../maya ${CMAKE_CURRENT_BINARY_DIR}/maya)
+
+    # Every backend implements acid_start/acid_stop/acid_audio_driver and
+    # acid_midi_start/acid_midi_stop from src/audio.hpp.
+    set(ACIDFLOW_PLATFORM_SOURCES)
+    set(ACIDFLOW_PLATFORM_LIBS)
+    if(APPLE)
+        list(APPEND ACIDFLOW_PLATFORM_SOURCES src/audio_coreaudio.cpp src/midi_coremidi.cpp)
+        find_library(AUDIO_TOOLBOX   AudioToolbox   REQUIRED)
+        find_library(CORE_AUDIO      CoreAudio      REQUIRED)
+        find_library(CORE_MIDI       CoreMIDI       REQUIRED)
+        find_library(CORE_FOUNDATION CoreFoundation REQUIRED)
+        list(APPEND ACIDFLOW_PLATFORM_LIBS ${AUDIO_TOOLBOX} ${CORE_AUDIO} ${CORE_MIDI} ${CORE_FOUNDATION})
+    elseif(WIN32)
+        list(APPEND ACIDFLOW_PLATFORM_SOURCES src/audio_wasapi.cpp src/midi_winmm.cpp)
+        list(APPEND ACIDFLOW_PLATFORM_LIBS ole32 winmm)
+    elseif(UNIX)
+        # JACK is loaded at runtime (dlopen), so only ALSA is a build dep.
+        list(APPEND ACIDFLOW_PLATFORM_SOURCES
+            src/audio_linux.cpp src/audio_jack.cpp src/audio_alsa.cpp src/midi_alsa.cpp)
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
+            list(APPEND ACIDFLOW_PLATFORM_LIBS PkgConfig::ALSA)
+        else()
+            find_library(ALSA_LIB asound REQUIRED)
+            list(APPEND ACIDFLOW_PLATFORM_LIBS ${ALSA_LIB})
+        endif()
+        list(APPEND ACIDFLOW_PLATFORM_LIBS ${CMAKE_DL_LIBS})
     else()
-        find_library(ALSA_LIB asound REQUIRED)
-        set(ACIDFLOW_AUDIO_LIBS ${ALSA_LIB})
+        message(FATAL_ERROR "Unsupported platform: no audio backend available")
     endif()
-else()
-    message(FATAL_ERROR "Unsupported platform: no audio backend available")
+
+    add_executable(acidflow src/main.cpp ${ACIDFLOW_PLATFORM_SOURCES})
+    target_link_libraries(acidflow PRIVATE acid_engine maya::app ${ACIDFLOW_PLATFORM_LIBS})
+    if(UNIX)
+        find_package(Threads REQUIRED)
+        target_link_libraries(acidflow PRIVATE Threads::Threads)
+    endif()
 endif()
 
-add_executable(acidflow ${ACIDFLOW_SOURCES})
-target_link_libraries(acidflow PRIVATE maya::app ${ACIDFLOW_AUDIO_LIBS})
-target_include_directories(acidflow PRIVATE src)
-target_compile_options(acidflow PRIVATE
-    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O3 -march=native -funroll-loops>
-    $<$<CXX_COMPILER_ID:MSVC>:/O2 /utf-8>
-)
-target_compile_definitions(acidflow PRIVATE
-    $<$<CXX_COMPILER_ID:MSVC>:_USE_MATH_DEFINES>
-)
+# ── Tests ───────────────────────────────────────────────────────────────────
+if(ACIDFLOW_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
 
-# Worker thread in audio_alsa.cpp / audio_wasapi.cpp needs pthreads on
-# *nix; Windows uses the Win32 thread API inside std::thread and needs no
-# extra lib. Harmless on Apple since pthreads are always linked.
-if(UNIX)
-    find_package(Threads REQUIRED)
-    target_link_libraries(acidflow PRIVATE Threads::Threads)
+# ── CLAP plugin ─────────────────────────────────────────────────────────────
+if(ACIDFLOW_BUILD_CLAP)
+    add_subdirectory(plugin)
 endif()
