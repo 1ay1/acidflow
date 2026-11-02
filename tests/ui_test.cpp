@@ -286,6 +286,34 @@ TEST("every single-key action listed in help does something") {
     CHECK(checked > 15);
 }
 
+// An overlay floats over the workspace; it must not shrink it.
+TEST("palette and welcome card keep the full screen height") {
+    auto last_row_with = [](const std::string& s, const char* what) {
+        int row = 0, best = -1;
+        size_t pos = 0;
+        while (pos < s.size()) {
+            const size_t nl = s.find('\n', pos);
+            if (s.substr(pos, nl - pos).find(what) != std::string::npos) best = row;
+            ++row;
+            pos = nl + 1;
+        }
+        return best;
+    };
+    for (int rows : {24, 40, 60}) {
+        Clean c;
+        H h;
+        key(h, U':');
+        CHECK(last_row_with(screen(h, 120, rows), ": commands") == rows - 1);
+    }
+    for (int rows : {24, 60}) {
+        Clean c(/*fresh=*/true);
+        H h;
+        const std::string s = screen(h, 120, rows);
+        CHECK(has(s, "welcome to acidflow"));
+        CHECK(last_row_with(s, ": commands") == rows - 1);
+    }
+}
+
 // The layout at common terminal sizes: every panel is there, labels aren't
 // cut, and the way to help is on screen.
 TEST("layout holds at 80x24, 100x30, 120x40 and 160x50") {

@@ -651,13 +651,15 @@ Element App::render_frame() const {
                   std::move(knob_row) | dsl::grow(8),
                   std::move(fx_row)   | dsl::grow(6));
 
+    // grow(1): as a zstack's base layer the column must still fill the
+    // screen, or an open overlay shrinks the whole app to its content height.
     Element main = (dsl::v(
         std::move(title_bar),
         std::move(voice_row),
         std::move(middle_row),
         std::move(step_row),
         std::move(help_bar)
-    ) | dsl::gap(0)).build();
+    ) | dsl::gap(0) | dsl::grow(1)).build();
 
     // Overlays float over the workspace, which stays visible around them.
     if (g_palette_open) {
