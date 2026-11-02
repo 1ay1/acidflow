@@ -20,7 +20,8 @@ namespace {
 struct TempHome {
     std::filesystem::path dir;
     TempHome() {
-        dir = std::filesystem::temp_directory_path() / ("acidflow_ui_test_" + std::to_string(::getpid()));
+        const auto tag = std::chrono::steady_clock::now().time_since_epoch().count();
+        dir = std::filesystem::temp_directory_path() / ("acidflow_ui_test_" + std::to_string(tag));
         std::filesystem::create_directories(dir);
 #if defined(_WIN32)
         _putenv_s("APPDATA", dir.string().c_str());

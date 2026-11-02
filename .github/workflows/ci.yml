@@ -1,0 +1,134 @@
+name: ci
+
+# Build and test on Linux, macOS and Windows. maya's runtime (jaal) needs
+# C++26 structured binding packs, so the floor is gcc 16 / clang 22, which
+# don't ship on the runner images yet; they're installed below, the same way
+# maya's own CI does it.
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-gcc16,   os: ubuntu-latest, cc: gcc-16,   cxx: g++-16 }
+          - { name: linux-clang22, os: ubuntu-latest, cc: clang-22, cxx: clang++-22 }
+          - { name: macos-gcc16,   os: macos-14,      cc: gcc-16,   cxx: g++-16 }
+          - { name: windows-msvc,  os: windows-2025,  cc: "",       cxx: "" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: acidflow
+      # acidflow builds against a sibling checkout of maya.
+      - uses: actions/checkout@v4
+        with:
+          repository: 1ay1/maya
+          path: maya
+          submodules: true
+
+      - name: Install toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libasound2-dev
+          if [ "${{ matrix.cc }}" = "clang-22" ]; then
+            wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+            chmod +x /tmp/llvm.sh
+            sudo /tmp/llvm.sh 22
+            sudo apt-get install -y libstdc++-16-dev
+          else
+            sudo apt-get install -y g++-16
+          fi
+
+      - name: Install toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: brew install gcc@16 ninja || true
+
+      - name: Install Ninja (Windows)
+        if: runner.os == 'Windows'
+        uses: seanmiddleditch/gha-setup-ninja@v6
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        shell: bash
+        working-directory: acidflow
+        run: |
+          export CC="${{ matrix.cc }}" CXX="${{ matrix.cxx }}"
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DACIDFLOW_NATIVE=OFF -DACIDFLOW_BUILD_CLAP=ON
+
+      - name: Build
+        working-directory: acidflow
+        run: cmake --build build -j
+
+      - name: Test
+        working-directory: acidflow
+        run: ctest --test-dir build --output-on-failure --timeout 120 -LE perf
+
+      - name: Bounce reference render
+        shell: bash
+        working-directory: acidflow
+        run: |
+          ./build/acid_render${{ runner.os == 'Windows' && '.exe' || '' }} reference.wav 2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: acidflow-${{ matrix.name }}
+          path: |
+            acidflow/build/acidflow
+            acidflow/build/acidflow.exe
+            acidflow/build/plugin/acidflow.clap
+            acidflow/reference.wav
+          if-no-files-found: ignore
+
+  # The same tree cross-compiled with llvm-mingw, and the test binaries run
+  # under Wine: catches MinGW-only breakage the MSVC leg doesn't.
+  windows-mingw:
+    name: windows-mingw (wine)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: acidflow
+      - uses: actions/checkout@v4
+        with:
+          repository: 1ay1/maya
+          path: maya
+          submodules: true
+      - name: Install llvm-mingw + wine
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build wine64
+          curl -sL https://github.com/mstorsjo/llvm-mingw/releases/latest/download/llvm-mingw-ucrt-ubuntu-22.04-x86_64.tar.xz \
+            | tar xJ -C /opt
+          echo "LLVM_MINGW=$(ls -d /opt/llvm-mingw-*)" >> "$GITHUB_ENV"
+      - name: Build
+        working-directory: acidflow
+        run: |
+          cmake -B build-win -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/llvm-mingw.cmake \
+            -DCMAKE_BUILD_TYPE=Release -DACIDFLOW_NATIVE=OFF -DACIDFLOW_BUILD_CLAP=ON
+          cmake --build build-win -j
+      - name: Test under Wine
+        working-directory: acidflow/build-win
+        env:
+          WINEDEBUG: -all
+        run: |
+          wine tests/dsp_test.exe
+          wine tests/engine_test.exe --skip headroom
+          wine tests/ui_test.exe
+          wine plugin/clap_test.exe plugin/acidflow.clap

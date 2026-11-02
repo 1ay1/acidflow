@@ -2,8 +2,20 @@
 //   clap_test path/to/acidflow.clap
 #include <clap/clap.h>
 
+#if defined(_WIN32)
+#include <windows.h>
+static void* dlopen(const char* p, int) { return reinterpret_cast<void*>(LoadLibraryA(p)); }
+static void* dlsym(void* h, const char* s) {
+    return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(h), s));
+}
+static const char* dlerror() { return "LoadLibrary failed"; }
+#define RTLD_NOW 0
+#define RTLD_LOCAL 0
+#else
 #include <dlfcn.h>
+#endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>

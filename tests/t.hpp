@@ -22,10 +22,17 @@ inline void fail(const char* file, int line, const std::string& what) {
 }
 
 inline int run(int argc, char** argv) {
-    const char* filter = argc > 1 ? argv[1] : nullptr;
+    // `name-filter` runs matching tests; `--skip filter` runs the rest.
+    const char* filter = nullptr;
+    const char* skip   = nullptr;
+    for (int a = 1; a < argc; ++a) {
+        if (std::string(argv[a]) == "--skip" && a + 1 < argc) skip = argv[++a];
+        else filter = argv[a];
+    }
     int ran = 0, bad = 0;
     for (auto& c : registry()) {
         if (filter && std::string(c.name).find(filter) == std::string::npos) continue;
+        if (skip && std::string(c.name).find(skip) != std::string::npos) continue;
         const int before = failures();
         try { c.fn(); } catch (Stop&) {}
         const bool ok = failures() == before;
