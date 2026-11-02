@@ -1,12 +1,13 @@
 #pragma once
-// Oscilloscope panel with phosphor persistence, drawn as a pixel image
-// (maya's pixels(): two pixels per cell, upper-half block). The persistence
-// buffer is owned by the app and advanced in update; the view only reads it.
+// Oscilloscope panel with phosphor persistence, drawn with pixels (two per
+// cell, upper-half block). The app keeps the last few triggered traces and
+// advances them in update; the view rasterises them at whatever size the
+// panel has, so the scope fills its slot at any terminal height.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -20,77 +21,105 @@ namespace tb303 {
 
 using namespace maya;
 
-// Phosphor buffer: one brightness byte per pixel. Sized to the scope's slot
-// at a fixed resolution and stretched by pixels() (nearest neighbour).
 struct ScopeState {
-    static constexpr int kW = 192;   // pixels across
-    static constexpr int kH = 48;    // pixels tall (24 cells of half blocks)
-    std::vector<uint8_t> phos = std::vector<uint8_t>(kW * kH, 0);
-    float peak = 0.0f;
+    static constexpr int kSamples = 512;   // samples per trace (time axis)
+    static constexpr int kHistory = 6;     // traces kept for the afterglow
+    std::array<std::vector<float>, kHistory> traces{};
+    int   newest = -1;                     // index of the latest trace, -1 = none
+    float peak   = 0.0f;
+    float gain   = 1.0f;                   // display gain, follows the signal level
 
-    // Pull the latest audio, trigger on a rising zero crossing, decay the old
-    // trace and stamp the new one. Called once per UI tick.
+    // Grab the latest audio, trigger on a rising zero crossing, push it as
+    // the newest trace. Called once per UI tick.
     void advance() {
-        for (auto& v : phos) v = v >= 40 ? static_cast<uint8_t>(v - 40) : 0;
-
-        const int want = kW;
         float pulled[4096];
-        const int pull_n = std::min(want * 3, 4096);
-        const int got = acid_scope_tail(pulled, pull_n);
-        // Most recent rising crossing that still has `want` samples after it.
-        int trigger = -1;
-        for (int i = got - want; i > 0; --i)
-            if (pulled[i] >= 0.01f && pulled[i - 1] < -0.01f) { trigger = i; break; }
-        const int start = trigger >= 0 ? trigger : std::max(0, got - want);
-
-        auto row_of = [](float s) {
-            const float t = 0.5f - 0.5f * std::clamp(s, -1.0f, 1.0f);
-            return std::clamp(static_cast<int>(std::lround(t * (kH - 1))), 0, kH - 1);
-        };
-        int prev = row_of(start < got ? pulled[start] : 0.0f);
-        for (int x = 0; x < want && start + x < got; ++x) {
-            const int r = row_of(pulled[start + x]);
-            // Fill between consecutive samples so steep edges stay solid.
-            for (int y = std::min(prev, r); y <= std::max(prev, r); ++y)
-                phos[static_cast<size_t>(y * kW + x)] = 255;
-            prev = r;
-        }
+        const int got = acid_scope_tail(pulled, std::min(kSamples * 3, 4096));
         peak = std::clamp(acid_output_peak(), 0.0f, 1.0f);
+        if (got < kSamples) return;
+        int start = got - kSamples;
+        for (int i = got - kSamples; i > 0; --i)
+            if (pulled[i] >= 0.01f && pulled[i - 1] < -0.01f) { start = i; break; }
+        newest = (newest + 1) % kHistory;
+        traces[static_cast<size_t>(newest)].assign(pulled + start, pulled + start + kSamples);
+        // Auto-gain: fit the trace to ~85% of the height. Fast to shrink,
+        // slow to grow, capped so silence doesn't blow noise up.
+        float mx = 0.0f;
+        for (int i = 0; i < kSamples; ++i) mx = std::max(mx, std::fabs(pulled[start + i]));
+        const float want = std::clamp(0.85f / std::max(mx, 1e-3f), 1.0f, 8.0f);
+        gain += (want < gain ? 0.5f : 0.05f) * (want - gain);
     }
 };
 
-[[nodiscard]] inline Element build_scope(const ScopeState& st) {
-    // Paint the phosphor buffer into an image: hot amber for this frame's
-    // trace, a dim afterglow for older ones, a faint zero line.
-    auto img = std::make_shared<Image>(ScopeState::kW, ScopeState::kH);
-    // A dark bed tinted toward the theme's grid colour.
+namespace scope_detail {
+
+inline Rgb dark_bed() {
     const Color gc = clr_grid();
-    const Rgb   bg = gc.kind() == Color::Kind::Rgb
-        ? Rgb{static_cast<uint8_t>(gc.raw_r() / 3), static_cast<uint8_t>(gc.raw_g() / 3),
-              static_cast<uint8_t>(gc.raw_b() / 3)}
-        : Rgb{12, 12, 16};
+    if (gc.kind() != Color::Kind::Rgb) return Rgb{12, 12, 16};
+    return Rgb{static_cast<uint8_t>(gc.raw_r() / 3), static_cast<uint8_t>(gc.raw_g() / 3),
+               static_cast<uint8_t>(gc.raw_b() / 3)};
+}
+
+// Draw `img` (w × ph pixels): background, zero line, then traces oldest to
+// newest so the live one is on top.
+inline void rasterise(Image& img, const std::vector<std::vector<float>>& traces, float gain) {
+    const int w = img.width(), ph = img.height();
+    const Rgb bg = dark_bed();
     const Rgb zero{static_cast<uint8_t>(bg.r + 30), static_cast<uint8_t>(bg.g + 26),
                    static_cast<uint8_t>(bg.b + 24)};
-    for (int y = 0; y < ScopeState::kH; ++y) {
-        const float ct = 1.0f - std::fabs((y + 0.5f) / ScopeState::kH * 2.0f - 1.0f);
-        for (int x = 0; x < ScopeState::kW; ++x) {
-            const uint8_t v = st.phos[static_cast<size_t>(y * ScopeState::kW + x)];
-            Rgb px = bg;
-            if (y == ScopeState::kH / 2 && (x & 3) == 0) px = zero;
-            if (v > 0) {
-                // 255 = live: bright amber, hotter in the middle rows. Below
-                // that the trail fades toward the background.
-                const float a = v / 255.0f;
-                const float r = (190 + 65 * ct) * a, g = (70 + 80 * ct) * a * a, b = 18 * a;
-                px = Rgb{static_cast<uint8_t>(std::max<float>(bg.r, r)) , static_cast<uint8_t>(std::max<float>(bg.g, g)),
-                         static_cast<uint8_t>(std::max<float>(bg.b, b))};
-                px.r &= 0xF8; px.g &= 0xF8; px.b &= 0xF8;   // keep the style cache small
+    for (int y = 0; y < ph; ++y)
+        for (int x = 0; x < w; ++x) img(x, y) = bg;
+    const int mid = ph / 2;
+    for (int x = 0; x < w; x += 4) img(x, mid) = zero;
+
+    auto row_of = [&](float s) {
+        const float t = 0.5f - 0.5f * std::clamp(s * gain, -1.0f, 1.0f);
+        return std::clamp(static_cast<int>(std::lround(t * (ph - 1))), 0, ph - 1);
+    };
+    const int n = static_cast<int>(traces.size());
+    for (int age = n - 1; age >= 0; --age) {
+        const auto& tr = traces[static_cast<size_t>(n - 1 - age)];
+        if (tr.empty()) continue;
+        // Live trace is bright amber; older ones fade toward the bed.
+        const float a = age == 0 ? 1.0f : 0.45f * std::pow(0.6f, static_cast<float>(age - 1));
+        const int ns = static_cast<int>(tr.size());
+        int prev = row_of(tr[0]);
+        for (int x = 0; x < w; ++x) {
+            const int i = std::min(ns - 1, x * ns / std::max(1, w));
+            const int r = row_of(tr[static_cast<size_t>(i)]);
+            // Fill between neighbouring columns so steep edges stay solid.
+            for (int y = std::min(prev, r); y <= std::max(prev, r); ++y) {
+                const float ct = 1.0f - std::fabs((y + 0.5f) / ph * 2.0f - 1.0f);
+                const Rgb old = img(x, y);
+                const float rr = (190 + 65 * ct) * a, gg = (70 + 80 * ct) * a * a, bb = 18 * a;
+                auto ch = [](uint8_t o, float v) {
+                    return static_cast<uint8_t>(static_cast<int>(std::max<float>(o, v)) & 0xF8);
+                };
+                img(x, y) = Rgb{ch(old.r, rr), ch(old.g, gg), ch(old.b, bb)};
             }
-            (*img)(x, y) = px;
+            prev = r;
         }
     }
+}
 
-    // Peak meter: one cell row of blocks under the trace.
+}  // namespace scope_detail
+
+[[nodiscard]] inline Element build_scope(const ScopeState& st) {
+    // Traces oldest → newest, copied so the element outlives this model.
+    std::vector<std::vector<float>> traces;
+    if (st.newest >= 0)
+        for (int k = 1; k <= ScopeState::kHistory; ++k)
+            traces.push_back(st.traces[static_cast<size_t>((st.newest + k) % ScopeState::kHistory)]);
+
+    // Rasterised at paint time at the panel's real size (w × 2h pixels), so
+    // the trace stays one pixel thick and fills the panel at any height.
+    auto trace = detail::paint([traces = std::move(traces), gain = st.gain](Canvas& c, int x, int y, int w, int h) {
+        if (w <= 0 || h <= 0) return;
+        Image img(w, h * 2);
+        scope_detail::rasterise(img, traces, gain);
+        detail::paint_pixels(c, img, x, y, w, h);
+    }, /*min_w=*/0, /*min_h=*/2);
+
+    // Peak meter: exactly one cell row under the trace.
     auto meter = dsl::fill([peak = st.peak](int w, int) -> Element {
         const int lit = std::clamp(static_cast<int>(std::lround(peak * w)), 0, w);
         std::string txt;
@@ -119,8 +148,8 @@ struct ScopeState {
         .border_text(" SCOPE ", BorderTextPos::Top)
         .align_self(Align::Stretch)
         .padding(0, 1, 0, 1)(
-            pixels(std::shared_ptr<const Image>(std::move(img))) | dsl::grow(1),
-            std::move(meter));
+            std::move(trace) | dsl::grow(1),
+            std::move(meter) | dsl::height(1) | dsl::grow(0));
 }
 
 } // namespace tb303
