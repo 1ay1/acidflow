@@ -1,0 +1,201 @@
+name: release
+
+# Push a tag like v0.2.0 to build every platform and publish a GitHub release.
+# The tag must match project(VERSION) in CMakeLists.txt.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build and publish"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  unix:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 so the binary runs on glibc 2.35 and newer.
+          - { target: linux-x86_64,  os: ubuntu-22.04 }
+          - { target: linux-arm64,   os: ubuntu-22.04-arm }
+          - { target: macos-arm64,   os: macos-14 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          path: acidflow
+      - uses: actions/checkout@v4
+        with:
+          repository: 1ay1/maya
+          path: maya
+          submodules: true
+
+      - name: Check version
+        working-directory: acidflow
+        run: |
+          v=$(sed -n 's/^project(acidflow VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          [ "v$v" = "$TAG" ] || { echo "tag $TAG does not match CMake version $v"; exit 1; }
+
+      - name: Install toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y g++-16 ninja-build libasound2-dev
+          pip3 install cmake
+          echo "CC=gcc-16" >> "$GITHUB_ENV"
+          echo "CXX=g++-16" >> "$GITHUB_ENV"
+
+      - name: Install toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install gcc ninja
+          # Apple clang builds the CoreMIDI C shim; C++ is gcc.
+          echo "CC=clang" >> "$GITHUB_ENV"
+          echo "CXX=g++-16" >> "$GITHUB_ENV"
+          echo "MACOSX_DEPLOYMENT_TARGET=13.0" >> "$GITHUB_ENV"
+
+      - name: Build
+        working-directory: acidflow
+        run: |
+          # libstdc++ is linked in so users don't need gcc 16's runtime.
+          flags="-static-libstdc++ -static-libgcc"
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DACIDFLOW_NATIVE=OFF -DACIDFLOW_BUILD_CLAP=ON \
+            -DCMAKE_EXE_LINKER_FLAGS="$flags" \
+            -DCMAKE_MODULE_LINKER_FLAGS="$flags" \
+            -DCMAKE_SHARED_LINKER_FLAGS="$flags"
+          cmake --build build -j
+
+      - name: Test
+        working-directory: acidflow
+        run: ctest --test-dir build --output-on-failure --timeout 120 -LE perf
+
+      - name: Smoke test in a pty
+        if: runner.os == 'Linux'
+        working-directory: acidflow
+        run: |
+          pip3 install pyte
+          python3 ../maya/tests/smoke.py build/acidflow || python3 ../maya/tests/smoke.py build/acidflow
+
+      - name: Package
+        working-directory: acidflow
+        run: |
+          name=acidflow-$TAG-${{ matrix.target }}
+          mkdir -p dist/$name
+          cp build/acidflow build/acid_render README.md MANUAL.md LICENSE dist/$name/
+          cp -R build/plugin/acidflow.clap dist/$name/
+          strip dist/$name/acidflow dist/$name/acid_render || true
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            echo "--- dynamic deps"; ldd dist/$name/acidflow
+          else
+            echo "--- dynamic deps"; otool -L dist/$name/acidflow
+            codesign --force -s - dist/$name/acidflow dist/$name/acid_render
+            codesign --force --deep -s - dist/$name/acidflow.clap
+          fi
+          tar -C dist -czf dist/$name.tar.gz $name
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: acidflow/dist/*.tar.gz
+
+  windows:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: windows-x86_64, arch: x86_64 }
+          - { target: windows-arm64,  arch: aarch64 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          path: acidflow
+      - uses: actions/checkout@v4
+        with:
+          repository: 1ay1/maya
+          path: maya
+          submodules: true
+
+      - name: Install llvm-mingw + wine
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build wine zip
+          gh release download -R mstorsjo/llvm-mingw -p '*-ucrt-ubuntu-22.04-x86_64.tar.xz' -O /tmp/llvm-mingw.tar.xz
+          sudo tar xJf /tmp/llvm-mingw.tar.xz -C /opt
+          echo "LLVM_MINGW=$(ls -d /opt/llvm-mingw-*)" >> "$GITHUB_ENV"
+
+      - name: Build
+        working-directory: acidflow
+        run: |
+          cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/llvm-mingw.cmake \
+            -DMINGW_ARCH=${{ matrix.arch }} -DCMAKE_BUILD_TYPE=Release \
+            -DACIDFLOW_NATIVE=OFF -DACIDFLOW_BUILD_CLAP=ON
+          cmake --build build -j
+
+      - name: Test under Wine
+        if: matrix.arch == 'x86_64'
+        working-directory: acidflow/build
+        env:
+          WINEDEBUG: -all
+        run: |
+          wine tests/dsp_test.exe
+          wine tests/engine_test.exe --skip headroom
+          wine tests/voice_test.exe
+          wine tests/ui_test.exe
+          wine plugin/clap_test.exe plugin/acidflow.clap
+
+      - name: Package
+        working-directory: acidflow
+        run: |
+          name=acidflow-$TAG-${{ matrix.target }}
+          mkdir -p dist/$name
+          cp build/acidflow.exe build/acid_render.exe build/plugin/acidflow.clap \
+             README.md MANUAL.md LICENSE dist/$name/
+          $LLVM_MINGW/bin/llvm-strip dist/$name/*.exe dist/$name/acidflow.clap
+          (cd dist && zip -r $name.zip $name)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: acidflow/dist/*.zip
+
+  publish:
+    needs: [unix, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist && sha256sum * > SHA256SUMS && cd ..
+          notes=.github/release-notes/$TAG.md
+          if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --generate-notes; fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "acidflow $TAG" "$@"
+          fi

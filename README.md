@@ -49,7 +49,9 @@ Type `space` to play. Press `r` to randomize. Drag a knob. Export a WAV. Quit be
 
 ## Install
 
-You need a C++26 compiler (recent GCC or Clang), CMake ≥ 3.28, and a sibling checkout of [`maya`](https://github.com/1ay1/maya) — the TUI framework acidflow is built on. maya pulls in its runtime, [jaal](https://github.com/agentty-org/jaal), as a git submodule, so clone it with `--recursive`.
+Prebuilt binaries for Linux (x86_64, arm64), macOS (Apple Silicon) and Windows (x86_64, arm64) are on the [releases page](https://github.com/1ay1/acidflow/releases). Each archive has the app, the offline renderer `acid_render` and the `acidflow.clap` plugin. The macOS build isn't notarized, so clear the quarantine flag once: `xattr -dr com.apple.quarantine acidflow acidflow.clap`.
+
+To build from source you need a C++26 compiler (recent GCC or Clang), CMake ≥ 3.28, and a sibling checkout of [`maya`](https://github.com/1ay1/maya) — the TUI framework acidflow is built on. maya pulls in its runtime, [jaal](https://github.com/agentty-org/jaal), as a git submodule, so clone it with `--recursive`.
 
 ```bash
 # Linux: install ALSA dev headers
@@ -70,7 +72,7 @@ cmake --build build -j
 ./build/acidflow
 ```
 
-macOS: same recipe — the CoreAudio backend is picked automatically.
+macOS: same recipe, but with Homebrew's gcc for C++ and Apple's clang for C (CoreMIDI's headers only compile with clang): `CC=clang CXX=g++-16 cmake -B build`. The CoreAudio backend is picked automatically.
 
 Windows: use a Visual Studio generator (MSVC toolchain from VS 2022 or 2026) and pass `--config Release` because the generator is multi-config:
 

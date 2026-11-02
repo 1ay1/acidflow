@@ -25,7 +25,8 @@ jobs:
         include:
           - { name: linux-gcc16,   os: ubuntu-latest, cc: gcc-16,   cxx: g++-16 }
           - { name: linux-clang22, os: ubuntu-latest, cc: clang-22, cxx: clang++-22 }
-          - { name: macos-gcc16,   os: macos-14,      cc: gcc-16,   cxx: g++-16 }
+          # Apple clang builds the CoreMIDI C shim; C++ stays on gcc.
+          - { name: macos-gcc16,   os: macos-14,      cc: clang,    cxx: g++-16 }
           - { name: windows-msvc,  os: windows-2025,  cc: "",       cxx: "" }
     steps:
       - uses: actions/checkout@v4
@@ -55,7 +56,7 @@ jobs:
 
       - name: Install toolchain (macOS)
         if: runner.os == 'macOS'
-        run: brew install gcc@16 ninja || true
+        run: brew install gcc ninja
 
       - name: Install Ninja (Windows)
         if: runner.os == 'Windows'
@@ -100,7 +101,7 @@ jobs:
   # under Wine: catches MinGW-only breakage the MSVC leg doesn't.
   windows-mingw:
     name: windows-mingw (wine)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -111,11 +112,13 @@ jobs:
           path: maya
           submodules: true
       - name: Install llvm-mingw + wine
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build wine64
-          curl -sL https://github.com/mstorsjo/llvm-mingw/releases/latest/download/llvm-mingw-ucrt-ubuntu-22.04-x86_64.tar.xz \
-            | tar xJ -C /opt
+          sudo apt-get install -y ninja-build wine
+          gh release download -R mstorsjo/llvm-mingw -p '*-ucrt-ubuntu-22.04-x86_64.tar.xz' -O /tmp/llvm-mingw.tar.xz
+          sudo tar xJf /tmp/llvm-mingw.tar.xz -C /opt
           echo "LLVM_MINGW=$(ls -d /opt/llvm-mingw-*)" >> "$GITHUB_ENV"
       - name: Build
         working-directory: acidflow
@@ -130,5 +133,6 @@ jobs:
         run: |
           wine tests/dsp_test.exe
           wine tests/engine_test.exe --skip headroom
+          wine tests/voice_test.exe
           wine tests/ui_test.exe
           wine plugin/clap_test.exe plugin/acidflow.clap

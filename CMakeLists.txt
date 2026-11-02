@@ -51,6 +51,10 @@ if(ACIDFLOW_BUILD_APP)
     # maya::app (the jaal runtime), not its demos or tests.
     set(MAYA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(MAYA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+    # Portable builds must not let maya bake in the host CPU either.
+    if(NOT ACIDFLOW_NATIVE OR CMAKE_CROSSCOMPILING)
+        set(MAYA_NATIVE_TUNING OFF CACHE BOOL "" FORCE)
+    endif()
     add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../maya ${CMAKE_CURRENT_BINARY_DIR}/maya)
 
     # Every backend implements acid_start/acid_stop/acid_audio_driver and
@@ -58,7 +62,14 @@ if(ACIDFLOW_BUILD_APP)
     set(ACIDFLOW_PLATFORM_SOURCES)
     set(ACIDFLOW_PLATFORM_LIBS)
     if(APPLE)
-        list(APPEND ACIDFLOW_PLATFORM_SOURCES src/audio_coreaudio.cpp src/midi_coremidi.cpp)
+        # CoreMIDI's headers use blocks, which gcc can't parse, so those calls
+        # sit in a C file. Build it with Apple's clang (CC=clang).
+        enable_language(C)
+        if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+            message(FATAL_ERROR "Set CC=clang on macOS: gcc can't compile CoreMIDI's headers.")
+        endif()
+        list(APPEND ACIDFLOW_PLATFORM_SOURCES
+            src/audio_coreaudio.cpp src/midi_coremidi.cpp src/coremidi_shim.c)
         find_library(AUDIO_TOOLBOX   AudioToolbox   REQUIRED)
         find_library(CORE_AUDIO      CoreAudio      REQUIRED)
         find_library(CORE_MIDI       CoreMIDI       REQUIRED)
