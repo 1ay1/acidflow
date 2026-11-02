@@ -1,8 +1,8 @@
 #pragma once
-// Short, context-aware help line. Different content per section so the user
-// always knows the active keys. When the full chip list is wider than the
-// terminal, we rotate items over time (marquee) so every chip is eventually
-// visible without the user having to scroll manually.
+// The bottom line. Normally: the few most useful keys for the focused panel,
+// then ": commands  ? help" pinned at the right so the way to everything else
+// is always on screen. When the mouse hovers something, it shows what that
+// thing is instead.
 
 #include <algorithm>
 #include <string>
@@ -10,6 +10,7 @@
 
 #include <maya/maya.hpp>
 
+#include "../app/actions.hpp"
 #include "section.hpp"
 #include "theme.hpp"
 
@@ -18,146 +19,94 @@ namespace tb303 {
 using namespace maya;
 
 namespace detail {
-
-// Count display columns of a UTF-8 string. Close enough for our label set
-// (mostly ASCII plus a handful of single-cell arrows and bullets): treat every
-// non-continuation byte as one cell.
-inline int u8cols(const char* s) {
+// Display columns of a UTF-8 string (our glyphs are all 1 cell wide).
+inline int u8cols(std::string_view s) {
     int n = 0;
-    for (; *s; ++s) if ((static_cast<unsigned char>(*s) & 0xC0) != 0x80) ++n;
+    for (unsigned char c : s) if ((c & 0xC0) != 0x80) ++n;
     return n;
 }
+}  // namespace detail
 
-} // namespace detail
-
-// `avail_w` is the terminal width; when chip width exceeds it we wrap around
-// so the bar marquees through the full set. `auto_scroll` rotates items over
-// time (one unit = one chip), `user_scroll` is the mouse-wheel offset. The
-// two sum so wheeling nudges without stopping the auto animation.
-[[nodiscard]] inline Element build_help_bar(Section sec, bool help_open,
-                                            int user_scroll = 0,
-                                            int avail_w = 0,
-                                            int auto_scroll = 0) {
-    struct K { const char* keys; const char* desc; };
-    std::vector<K> items;
-    items.push_back({"Tab",  "section"});
-    switch (sec) {
-        case Section::Knobs:
-            items.push_back({"\xe2\x86\x90\xe2\x86\x92", "select"}); // ←→
-            items.push_back({"\xe2\x86\x91\xe2\x86\x93", "value"});  // ↑↓
-            items.push_back({"[  ]", "coarse"});
-            items.push_back({"0",    "reset"});
-            items.push_back({"w",    "wave"});
-            items.push_back({"l",    "midi learn"});
-            items.push_back({"m",    "mute"});
-            break;
-        case Section::FX:
-            items.push_back({"\xe2\x86\x90\xe2\x86\x92", "select"});
-            items.push_back({"\xe2\x86\x91\xe2\x86\x93", "value"});
-            items.push_back({"[  ]", "coarse"});
-            items.push_back({"0",    "reset"});
-            items.push_back({"l",    "midi learn"});
-            items.push_back({"m",    "mute"});
-            break;
-        case Section::Sequencer:
-            items.push_back({"\xe2\x86\x90\xe2\x86\x92", "step"});
-            items.push_back({"\xe2\x86\x91\xe2\x86\x93", "pitch"});
-            items.push_back({"<  >",  "octave"});
-            items.push_back({"a",    "accent"});
-            items.push_back({"s",    "slide"});
-            items.push_back({"m",    "rest"});
-            items.push_back({"v",    "prob"});
-            items.push_back({"j",    "ratchet"});
-            items.push_back({"F/G/H/J", "plock"});
-            items.push_back({"L",    "unlock"});
-            items.push_back({"x",    "clear"});
-            break;
-        case Section::Drums:
-            items.push_back({"\xe2\x86\x90\xe2\x86\x92", "step"});
-            items.push_back({"\xe2\x86\x91\xe2\x86\x93", "voice"});
-            items.push_back({"space/x", "toggle"});
-            items.push_back({"1..0",  "quick"});
-            items.push_back({"[  ]",  "bus"});
-            items.push_back({"m",     "mute"});
-            items.push_back({"c/C",   "clear"});
-            break;
-        case Section::Transport:
-            items.push_back({"\xe2\x86\x91\xe2\x86\x93", "preset"}); // ↑↓
-            items.push_back({"[  ]",  "bpm"});
-            items.push_back({"{  }",  "length"});
-            items.push_back({"-  =",  "swing"});
-            items.push_back({"m",     "all mute"});
-            break;
+[[nodiscard]] inline Element build_help_bar(Section focus, const std::string& hover,
+                                            const std::string& mode_note, int avail_w) {
+    struct Chip { std::string k, v; };
+    std::vector<Chip> chips;
+    if (!mode_note.empty()) chips.push_back({"", mode_note});
+    if (hover.empty()) {
+        // Priority 1 first, then 2 if there's room. Global keys are listed in
+        // the welcome card and help, so only Space/Tab make the bar.
+        for (int pri : {1, 2})
+            for (const Action* a : actions_for(scope_of(focus))) {
+                if (a->hint != pri) continue;
+                if (a->scope == Scope::Global && std::string_view(a->id) != "play"
+                    && std::string_view(a->id) != "focus.next") continue;
+                chips.push_back({a->keys, a->name});
+            }
     }
-    items.push_back({"space", "play"});
-    items.push_back({"r/R",   "rand/all"});
-    items.push_back({"M",     "mutate"});
-    items.push_back({"T",     "theme"});
-    items.push_back({"e/E",   "wav/mid"});
-    items.push_back({"W",     "rec live"});
-    items.push_back({"p/P",   "text"});
-    items.push_back({"n",     "song"});
-    items.push_back({"k",     "jam"});
-    items.push_back({"I/O",   "midi"});
-    items.push_back({"?",     help_open ? "close" : "help"});
-    items.push_back({"q",     "quit"});
+    const Chip tail_cmd{":", "commands"}, tail_help{"?", "help"};
 
-    const int sep_cols = 5;           // "  ·  "
-    const int pad_cols = 2;           // left+right padding on the bar
-    int total_cols = pad_cols;
-    for (size_t i = 0; i < items.size(); ++i) {
-        total_cols += detail::u8cols(items[i].keys);
-        total_cols += 1 + detail::u8cols(items[i].desc);   // " desc"
-        if (i + 1 < items.size()) total_cols += sep_cols;
-    }
-
-    bool overflow = (avail_w > 0) && (total_cols > avail_w);
-    int n = static_cast<int>(items.size());
-
-    // Combined offset: auto marquee advances over time; wheel nudges by hand.
-    // When content fits, both are forced to 0 — nothing to scroll past.
-    int combined = overflow ? (auto_scroll + user_scroll) : 0;
-    int skip = ((combined % n) + n) % n;
-
-    std::vector<Element> row;
-    // Wrap each text span in an hstack with shrink(0) so yoga can't collapse
-    // the intrinsic width of a label when the full bar overflows. Without this
-    // every chip gets proportionally squeezed ("space" → "spa", "play" → "pl"
-    // etc.) instead of entire trailing chips being clipped off the right edge.
-    auto push_text = [&](std::string content, Style st) {
-        Element t = Element{TextElement{
-            .content = std::move(content),
-            .style   = st,
-            .wrap    = TextWrap::NoWrap,
-        }};
-        row.push_back(dsl::hstack().shrink(0)(std::move(t)));
+    auto width_of = [](const Chip& c) {
+        return (c.k.empty() ? 0 : detail::u8cols(c.k) + 1) + detail::u8cols(c.v);
     };
-    auto push_item = [&](const K& it, bool with_sep) {
-        if (with_sep) {
-            push_text("  \xc2\xb7  ", Style{}.with_fg(clr_dim()));   // "  ·  "
+    const int sep = 4;   // "  ·  " minus one
+    int budget = std::max(0, avail_w - 2 - width_of(tail_cmd) - width_of(tail_help) - 2 * sep - 2);
+
+    std::string txt;
+    std::vector<StyledRun> runs;
+    auto put = [&](const Chip& c, bool first) {
+        if (!first) {
+            size_t o = txt.size(); txt += "  \xc2\xb7  ";
+            runs.push_back({o, txt.size() - o, Style{}.with_fg(clr_dim())});
         }
-        push_text(it.keys, Style{}.with_fg(clr_accent()).with_bold());
-        push_text(std::string(" ") + it.desc, Style{}.with_fg(clr_muted()));
+        if (!c.k.empty()) {
+            size_t o = txt.size(); txt += c.k;
+            runs.push_back({o, txt.size() - o, Style{}.with_fg(clr_accent()).with_bold()});
+            txt += " ";
+        }
+        size_t o = txt.size(); txt += c.v;
+        runs.push_back({o, txt.size() - o, Style{}.with_fg(clr_muted())});
     };
 
-    // When overflowing, emit items as a wrap-around ring starting at `skip`
-    // so the animation loops smoothly (the last chip flows back to the first).
-    // When not overflowing, emit the full list in declaration order.
-    if (overflow) {
-        for (int i = 0; i < n; ++i) {
-            const K& it = items[static_cast<size_t>((skip + i) % n)];
-            push_item(it, i > 0);
-        }
+    if (!hover.empty()) {
+        // Hover text, trimmed to fit.
+        std::string h = hover;
+        while (detail::u8cols(h) > budget && !h.empty()) h.pop_back();
+        size_t o = txt.size(); txt += h;
+        runs.push_back({o, txt.size() - o, Style{}.with_fg(clr_text())});
     } else {
-        for (int i = 0; i < n; ++i) {
-            push_item(items[static_cast<size_t>(i)], i > 0);
+        bool first = true;
+        for (const auto& c : chips) {
+            const int w = width_of(c) + (first ? 0 : sep + 1);
+            if (w > budget) break;   // drop the rest rather than cut a chip in half
+            put(c, first);
+            budget -= w;
+            first = false;
         }
     }
+
+    // Right-pinned tail.
+    std::string tail;
+    std::vector<StyledRun> truns;
+    auto tput = [&](const Chip& c) {
+        if (!tail.empty()) { size_t o = tail.size(); tail += "   "; truns.push_back({o, 3, Style{}}); }
+        size_t o = tail.size(); tail += c.k;
+        truns.push_back({o, tail.size() - o, Style{}.with_fg(clr_accent()).with_bold()});
+        tail += " ";
+        o = tail.size(); tail += c.v;
+        truns.push_back({o, tail.size() - o, Style{}.with_fg(clr_muted())});
+    };
+    tput(tail_cmd);
+    tput(tail_help);
 
     return dsl::hstack()
         .padding(0, 1, 0, 1)
+        .justify(Justify::SpaceBetween)
         .min_width(Dimension::fixed(0))
-        .overflow(Overflow::Hidden)(std::move(row));
+        .overflow(Overflow::Hidden)(
+            Element{TextElement{.content = std::move(txt), .style = {},
+                                .wrap = TextWrap::NoWrap, .runs = std::move(runs)}},
+            Element{TextElement{.content = std::move(tail), .style = {},
+                                .wrap = TextWrap::NoWrap, .runs = std::move(truns)}});
 }
 
 } // namespace tb303

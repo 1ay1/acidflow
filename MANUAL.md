@@ -93,7 +93,7 @@ There are **no command-line flags**. Everything is configured inside the app.
 
 ### Quit
 
-Press `q`, `Q`, or `Esc`. Audio stops cleanly, the audio thread is joined, and your terminal returns to normal.
+Press `q`. Audio stops cleanly and your terminal returns to normal. Your session (knobs, FX, pattern, drums, theme and which panel you were in) is saved to `~/.config/acidflow/session.txt` and comes back the next time you start. `Esc` never quits: it closes whatever is open (help, the command palette, jam mode) and otherwise just reminds you that `q` quits.
 
 ---
 
@@ -101,17 +101,35 @@ Press `q`, `Q`, or `Esc`. Audio stops cleanly, the audio thread is joined, and y
 
 If you read nothing else, read this:
 
-1. **Run it.** It opens with the *Acid Tracks* preset loaded and the cursor on the sequencer.
-2. **Hit `Space`.** It starts playing at 122 BPM. The sequencer's currently-playing step lights up red.
+1. **Run it.** The first time, a welcome card lists the six keys you need. **Press `Enter`** and the *Acid Tracks* preset starts playing at 122 BPM. The sequencer's currently-playing step lights up red. (Any other key just closes the card.)
+2. **`Space`** stops and starts it.
 3. **Hit `Tab` once.** Focus moves to the **Transport** panel on the right. Press `↓` to scroll through presets — each one swaps in a new pattern and the contour preview fills in.
 4. **Hit `Tab` once more.** Focus moves to the **Knobs**. Use `←` and `→` to land on **CUTOFF** (the third one). Press `↑` repeatedly. You're playing the 303's signature filter sweep — the squelchy "wow" — by hand.
-5. **Hit `R`.** Capital R. Everything randomizes — knobs and pattern. A toast in the top-right tells you what archetype you got. Hit `R` again until something grabs you.
-6. **Press `?`** for the keyboard reference. **Press `?`** again to close it.
-7. **Press `Shift+1`** to save the current pattern to slot 1. **Press `1`** later to load it back.
-8. **Press `e`** to export the current pattern to a WAV (4 loops). Path will appear in a toast.
-9. **Press `q`** when you're done.
+5. **Hit `R`.** Capital R. Everything randomizes — knobs and pattern. A toast in the top-right tells you what you got. Hit `R` again until something grabs you. Went too far? **`u`** takes it back, and the toast says what it undid.
+6. **Press `:`** and type what you want to do — "tempo", "slide", "save", "clear". Every action is in there with its key next to it; `Enter` runs it.
+7. **Press `?`** for help on the panel you're in. Type to search it; `Esc` closes.
+8. **Press `Shift+1`** to save the current pattern to slot 1. **Press `1`** later to load it back.
+9. **Press `e`** to bounce the current pattern to a WAV (4 loops) plus stems.
+10. **Press `q`** when you're done. Next time it picks up where you left off.
 
 Everything else in this manual is detail.
+
+### Finding things without the manual
+
+- **The bottom line** always shows the keys for the panel you're in, and ends with `: commands  ? help`. Hover the mouse over a knob, step or drum and the line changes to say what that thing is and how to use it.
+- **The command palette (`:` or `Ctrl-K`)** searches every action by name and description. Actions that need a cursor position (like accent or slide) are listed too: picking one moves focus to the right panel and tells you the key.
+- **Help (`?`)** opens on the panel you came from, then lists everything else, plus a short "what the words mean" section for CUTOFF, RES, slide, p-lock and the rest. Type to filter it, `Tab` to jump to another panel's keys, `Esc` to clear the search or close.
+- **Toasts** after anything destructive say what changed and (the first few times) that `u` undoes it.
+
+Help, the palette and the bottom line all come from one table of actions in the code, so they can't disagree with what the keys actually do.
+
+### Small terminals
+
+Under 38 rows (the default 80×24 included) acidflow uses a compact layout: the voice and FX become one-line value strips, and the filter chart and scope step aside so the sequencer, drums and transport all fit. The strips still respond to the mouse.
+
+### Without colour
+
+If the `NO_COLOR` environment variable is set, acidflow starts in the greyscale **mono** theme (a theme you pick with `T` is remembered and wins). Accents, slides, rests and the playing step all have their own symbols, not just colours.
 
 ---
 

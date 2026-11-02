@@ -1,5 +1,7 @@
 // Building the frame.
+#include "actions.hpp"
 #include "app.hpp"
+#include "tb303/palette.hpp"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Render
@@ -158,7 +160,7 @@ Element App::build_knob_row() const {
             runs.push_back(StyledRun{off, 3,
                 maya::Style{}.with_fg(tb303::clr_muted())});
             size_t msg_off = txt.size();
-            txt += "Tab here to shape the voice  \xc2\xb7  \xe2\x86\x90\xe2\x86\x92 select knob, \xe2\x86\x91\xe2\x86\x93 turn it";
+            txt += "click a knob, or Tab here";
             runs.push_back(StyledRun{msg_off, txt.size() - msg_off,
                 maya::Style{}.with_fg(tb303::clr_muted())});
         }
@@ -267,8 +269,8 @@ Element App::build_fx_row() const {
                 maya::Style{}.with_fg(tb303::clr_accent()).with_bold()});
 
             size_t lbl_off = txt.size();
-            txt += g_fx_table[g_fx_sel].label;
-            runs.push_back(StyledRun{lbl_off, std::string_view(g_fx_table[g_fx_sel].label).size(),
+            txt += kFxLongName[g_fx_sel];
+            runs.push_back(StyledRun{lbl_off, std::string_view(kFxLongName[g_fx_sel]).size(),
                 maya::Style{}.with_fg(tb303::clr_accent()).with_bold()});
 
             txt += "  ";
@@ -282,7 +284,7 @@ Element App::build_fx_row() const {
             runs.push_back(StyledRun{off, 3,
                 maya::Style{}.with_fg(tb303::clr_muted())});
             size_t msg_off = txt.size();
-            txt += "Tab here for the FX rack  \xc2\xb7  \xe2\x86\x90\xe2\x86\x92 select, \xe2\x86\x91\xe2\x86\x93 turn";
+            txt += "click an effect, or Tab here";
             runs.push_back(StyledRun{msg_off, txt.size() - msg_off,
                 maya::Style{}.with_fg(tb303::clr_muted())});
         }
@@ -357,6 +359,56 @@ Element App::build_fx_row() const {
 }
 
 
+// One-line voice + FX strip for short terminals: "CUTOFF 141Hz  RES 75% …".
+// Each entry is its knob's hit target, so click, drag and wheel still work.
+Element App::build_knob_strip() const {
+    auto entry = [&](const char* label, std::string val, bool focused, HitId id) {
+        const Color lc = focused ? tb303::clr_accent() : tb303::clr_muted();
+        const Color vc = focused ? tb303::clr_accent() : tb303::clr_text();
+        std::string lbl = std::string(focused ? "\xe2\x96\xb8" : " ") + label + " ";
+        std::string txt = lbl + val + "  ";
+        std::vector<StyledRun> runs{
+            StyledRun{0, lbl.size(), Style{}.with_fg(lc)},
+            StyledRun{lbl.size(), txt.size() - lbl.size(), Style{}.with_fg(vc).with_bold()},
+        };
+        return (Element{TextElement{.content = std::move(txt), .style = {},
+                                    .wrap = TextWrap::NoWrap, .runs = std::move(runs)}}
+                | hit(id) | dsl::shrink(0)).build();
+    };
+    std::vector<Element> voice, fx;
+    // Short names so more fit on one line; the full name is in the hover text.
+    static constexpr const char* kKnobShort[] = {"TUNE", "WAVE", "CUT", "RES", "ENV", "DEC", "ACC", "DRV", "VOL"};
+    static constexpr const char* kFxShort[]   = {"OD", "DLY", "FB", "TIME", "REV", "SIZE", "DAMP"};
+    static_assert(sizeof(kKnobShort) / sizeof(*kKnobShort) == K_COUNT);
+    static_assert(sizeof(kFxShort) / sizeof(*kFxShort) == FX_COUNT);
+    // Start each strip at a knob that keeps the focused one in view.
+    const int k0 = g_focus == Section::Knobs ? std::max(0, g_knob_sel - 4) : 0;
+    const int f0 = g_focus == Section::FX    ? std::max(0, g_fx_sel - 3)   : 0;
+    for (int i = k0; i < K_COUNT; ++i)
+        voice.push_back(entry(kKnobShort[i], format_knob(i),
+                              g_focus == Section::Knobs && g_knob_sel == i,
+                              hit_id(tb303::kHitKnob, static_cast<std::uint32_t>(i))));
+    for (int i = f0; i < FX_COUNT; ++i)
+        fx.push_back(entry(kFxShort[i], format_fx(i),
+                           g_focus == Section::FX && g_fx_sel == i,
+                           hit_id(tb303::kHitFx, static_cast<std::uint32_t>(i))));
+    auto panel = [](const char* title, std::vector<Element> items, bool focused, Section s) {
+        return (dsl::hstack()
+            .border(BorderStyle::Round)
+            .border_color(focused ? tb303::clr_accent() : tb303::clr_panel_hi())
+            .border_text(title, BorderTextPos::Top)
+            .padding(0, 1, 0, 1)
+            .overflow(Overflow::Hidden)
+            .height(Dimension::fixed(3))
+            .min_width(Dimension::fixed(0))(std::move(items))
+            | hit(hit_id(tb303::kHitPanel, static_cast<std::uint32_t>(s)))).build();
+    };
+    return (dsl::h(
+        panel(" SYNTH ", std::move(voice), g_focus == Section::Knobs, Section::Knobs) | dsl::grow(3),
+        panel(" FX ", std::move(fx), g_focus == Section::FX, Section::FX) | dsl::grow(2)
+    ) | dsl::gap(1) | dsl::shrink(0)).build();
+}
+
 Element App::render_frame() const {
     // Transport state bundle
     std::vector<tb303::PresetSummary> preset_summaries;
@@ -388,6 +440,7 @@ Element App::render_frame() const {
         .midi_out       = g_midi_out,
         .midi_sync      = g_midi_sync,
     };
+    ts.compact = g_term_h > 0 && g_term_h < kCompactRows;
 
     auto knob_row   = build_knob_row();
     auto fx_row     = build_fx_row();
@@ -413,12 +466,12 @@ Element App::render_frame() const {
 
     // Drums sit in a fill() so the panel can shrink on short terminals and
     // clip the bottom voices instead of pushing the layout taller.
-    auto drums_component = dsl::fill([this](int, int) -> Element {
+    auto drums_component = dsl::fill([this](int w, int) -> Element {
         return tb303::build_drums(g_drums, g_drum_voice_mute,
                                   g_drum_voice_sel, g_drum_step_sel,
                                   g_playing ? g_current_step : -1,
                                   g_drum_master,
-                                  g_focus == Section::Drums);
+                                  g_focus == Section::Drums, w);
     }, /*min_w=*/0, /*min_h=*/kDrumVoices + 2);
 
     auto drum_panel = dsl::vstack()
@@ -432,15 +485,19 @@ Element App::render_frame() const {
         .padding(0, 1, 0, 1)(std::move(drums_component))
         | hit(hit_id(tb303::kHitPanel, static_cast<std::uint32_t>(Section::Drums)));
 
-    // Middle row hosts three stacked panels side by side: scope/filter (left),
-    // transport (centre), drums (right). voice_row (below) is given shrink(1)
-    // so on short terminals the knob row compresses first and middle_row keeps
-    // enough height to render the 16-voice drum grid unclipped.
-    auto middle_row = (dsl::h(
-        std::move(left_col)   | dsl::grow(3) | hit(hit_id(tb303::kHitScope)),
-        std::move(transport)  | dsl::grow(2) | hit(hit_id(tb303::kHitTransport)),
-        std::move(drum_panel) | dsl::grow(2)
-    ) | dsl::gap(1) | dsl::grow(1)).build();
+    // Middle row: scope/filter (left), transport (centre), drums (right). On
+    // short terminals the analysis column goes and drums get more width.
+    const bool compact = g_term_h > 0 && g_term_h < kCompactRows;
+    Element middle_row = compact
+        ? (dsl::h(
+              std::move(transport)  | dsl::grow(2) | hit(hit_id(tb303::kHitTransport)),
+              std::move(drum_panel) | dsl::grow(3)
+          ) | dsl::gap(1) | dsl::grow(1)).build()
+        : (dsl::h(
+              std::move(left_col)   | dsl::grow(3) | hit(hit_id(tb303::kHitScope)),
+              std::move(transport)  | dsl::grow(2) | hit(hit_id(tb303::kHitTransport)),
+              std::move(drum_panel) | dsl::grow(2)
+          ) | dsl::gap(1) | dsl::grow(1)).build();
 
     auto seq = tb303::build_sequencer(g_steps, g_pattern_length, g_step_sel,
                                       g_playing ? g_current_step : -1);
@@ -455,9 +512,10 @@ Element App::render_frame() const {
         .padding(0, 1, 0, 1)(std::move(seq))
         | hit(hit_id(tb303::kHitPanel, static_cast<std::uint32_t>(Section::Sequencer)));
 
-    int help_auto = static_cast<int>(g_help_bar_auto_t / kHelpBarChipDur);
-    auto help_bar = tb303::build_help_bar(g_focus, g_help_open,
-                                          g_help_bar_scroll, g_term_w, help_auto)
+    // Bottom line: what you're hovering, or the keys for where you are.
+    std::string mode_note;
+    if (g_jam_mode) mode_note = "\xe2\x99\xac JAM: z\xe2\x80\x93m q\xe2\x80\x93u play \xc2\xb7 \xe2\x86\x90\xe2\x86\x92 octave \xc2\xb7 k stop";
+    auto help_bar = tb303::build_help_bar(g_focus, g_hover_text, mode_note, g_term_w)
                   | hit(hit_id(tb303::kHitHelpBar));
 
     // Title bar: a compact brand strip with a pulse-colored dot that flips
@@ -554,7 +612,7 @@ Element App::render_frame() const {
     if (g_help_open) {
         return (dsl::v(
             std::move(title_bar),
-            tb303::build_help_overlay(g_help_ov_scroll) | dsl::grow(1)
+            tb303::build_help_overlay(scope_of(g_help_from), g_help_query, g_help_ov_scroll) | dsl::grow(1)
                 | hit(hit_id(tb303::kHitHelpOverlay)),
             std::move(help_bar)
         ) | dsl::gap(0)).build();
@@ -582,24 +640,33 @@ Element App::render_frame() const {
             std::move(seq_panel) | dsl::grow(1)
         );
 
-    // Synth voice + FX rack on one row — the voice panel is ~8 knobs wide, FX
-    // is ~6, so together they fill a wide terminal in one glance (signal flow
-    // reads left → right: voice → FX chain). Stretch keeps the shorter panel's
-    // border flush with the taller one's height. shrink(0) pins this row to
-    // its natural height when the terminal is resized — only middle_row flexes.
-    auto voice_row = dsl::hstack()
-        .gap(1)
-        .align_items(Align::Stretch)
-        .shrink(1)(
-            std::move(knob_row) | dsl::grow(8),
-            std::move(fx_row)   | dsl::grow(6)
-        );
+    // Short terminals: the tall knob meters don't fit, so the voice and FX
+    // become one-line value strips. Everything stays reachable.
+    Element voice_row = compact
+        ? build_knob_strip()
+        : dsl::hstack()
+              .gap(1)
+              .align_items(Align::Stretch)
+              .shrink(0)(
+                  std::move(knob_row) | dsl::grow(8),
+                  std::move(fx_row)   | dsl::grow(6));
 
-    return (dsl::v(
+    Element main = (dsl::v(
         std::move(title_bar),
         std::move(voice_row),
         std::move(middle_row),
         std::move(step_row),
         std::move(help_bar)
     ) | dsl::gap(0)).build();
+
+    // Overlays float over the workspace, which stays visible around them.
+    if (g_palette_open) {
+        const int rows = std::max(3, (g_term_h > 0 ? g_term_h : 40) / 2 - 6);
+        return dsl::zstack({std::move(main),
+            dsl::vstack().align_items(Align::Center).padding(3, 0, 0, 0)(
+                tb303::build_palette(g_palette_query, palette_matches(), g_palette_sel, rows))});
+    }
+    if (g_first_run)
+        return dsl::zstack({std::move(main), dsl::center()(tb303::build_welcome())});
+    return main;
 }

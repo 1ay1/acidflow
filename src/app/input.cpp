@@ -1,4 +1,5 @@
 // Keyboard and mouse handling.
+#include "actions.hpp"
 #include "app.hpp"
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -76,7 +77,7 @@ int App::jam_key_semi(char c) {
 
 // Pretty-print a MIDI note as "C3", "F#4", etc. — shown in the jam HUD so the
 // user can read the last-played pitch at a glance.
-std::string App::midi_note_name(int midi) {
+std::string App::midi_note_name(int midi) const {
     static constexpr const char* n[12] = {
         "C","C#","D","D#","E","F","F#","G","G#","A","A#","B",
     };
@@ -133,14 +134,66 @@ HitZone App::hit_test(int col, int row) {
         case tb303::kHitDrumRow: {
             int rel = rel_x();
             if (rel < 0) return {};
+            // Cells adapt to the panel width (3, 2 or 1 columns); the tagged
+            // row is exactly label + 16 cells, so its width gives the size.
+            const auto r = maya::hit_rect(*id);
+            const int cw = r ? std::clamp((r->w - tb303::kDrumCellX0) / 16, 1, 3)
+                             : tb303::kDrumCellW;
             // The label ("BD: ") selects the whole voice via step = -1.
-            int step = rel < tb303::kDrumCellX0
-                     ? -1 : (rel - tb303::kDrumCellX0) / tb303::kDrumCellW;
+            int step = rel < tb303::kDrumCellX0 ? -1 : (rel - tb303::kDrumCellX0) / cw;
             if (step >= 16) return {};
             return {HitZone::DrumCell, step, idx};
         }
         default: return {};
     }
+}
+
+// ── Hover ───────────────────────────────────────────────────────────────────
+// What the thing under the mouse is and how to use it, for the bottom bar.
+std::string App::describe_at(int col, int row) const {
+    const auto id = maya::hit_test(col - 1, row - 1);
+    if (!id) return {};
+    const int idx = static_cast<int>(maya::hit_index(*id));
+    switch (maya::hit_kind(*id)) {
+        case tb303::kHitKnob:
+            if (idx >= 0 && idx < K_COUNT)
+                return std::string(g_knob_table[idx].label) + " " + format_knob(idx) + "  \xe2\x80\x94  "
+                     + g_knob_table[idx].caption + "   \xc2\xb7 drag or scroll to turn, right-click resets";
+            break;
+        case tb303::kHitFx:
+            if (idx >= 0 && idx < FX_COUNT)
+                return std::string(kFxLongName[idx]) + " " + format_fx(idx) + "  \xe2\x80\x94  "
+                     + g_fx_table[idx].caption + "   \xc2\xb7 scroll to turn, right-click resets";
+            break;
+        case tb303::kHitSeqRow: {
+            const HitZone z = const_cast<App*>(this)->hit_test(col, row);   // reads only
+            if (z.kind == HitZone::Step && z.idx >= 0 && z.idx < 16) {
+                const auto& s = g_steps[static_cast<size_t>(z.idx)];
+                std::string d = "step " + std::to_string(z.idx + 1) + ": ";
+                d += s.rest ? std::string("rest") : midi_note_name(s.note);
+                if (!s.rest && s.accent) d += ", accent";
+                if (!s.rest && s.slide)  d += ", slide";
+                if (s.prob < 100) d += ", " + std::to_string(s.prob) + "% chance";
+                return d + "   \xc2\xb7 click to select, scroll for pitch, right-click for rest";
+            }
+            break;
+        }
+        case tb303::kHitDrumRow: {
+            static constexpr const char* kNames[] = {
+                "kick", "snare", "closed hat", "open hat", "clap", "low tom", "high tom",
+                "rimshot", "cowbell", "shaker", "tambourine", "conga", "mid tom",
+                "crash", "ride", "bongo"};
+            if (idx >= 0 && idx < kDrumVoices)
+                return std::string(kNames[idx]) + "   \xc2\xb7 click a cell to add or remove a hit";
+            break;
+        }
+        case tb303::kHitTransport:
+            return "transport \xe2\x80\x94 tempo, swing and presets   \xc2\xb7 scroll to change preset";
+        case tb303::kHitScope:
+            return "the filter's response and the waveform you're hearing";
+        default: break;
+    }
+    return {};
 }
 
 // Which section a hover over this target should focus, if any.
@@ -190,8 +243,9 @@ void App::handle_mouse(const MouseEvent& m) {
     // hovering a border, padding cell, or empty gutter still counts; the
     // user's intent on hover is "this panel", not "this exact knob".
     if (m.kind == MouseEventKind::Move) {
-        if (g_help_open) return;
+        if (g_help_open || g_palette_open) return;
         if (auto s = hover_section(col, row)) g_focus = *s;
+        g_hover_text = describe_at(col, row);
         return;
     }
 
@@ -234,7 +288,7 @@ void App::handle_mouse(const MouseEvent& m) {
                 g_focus = Section::Transport;
                 // Scroll-down feels like "next preset" — invert dir so wheel-down
                 // advances the list even though our logical "dir" is +1 for up.
-                push_undo();
+                push_undo("preset change");
                 load_preset(g_preset_index - dir);
                 return;
             case HitZone::ScopeArea:
@@ -370,8 +424,8 @@ void App::handle_mouse(const MouseEvent& m) {
 
 void App::handle_event(const Event& ev) {
     // Resize — keep terminal size in sync for mouse hit-tests.
-    int rw = 0;
-    if (resized(ev, &rw, nullptr)) { g_term_w = rw; return; }
+    int rw = 0, rh = 0;
+    if (resized(ev, &rw, &rh)) { g_term_w = rw; g_term_h = rh; return; }
     if (const MouseEvent* m = as_mouse(ev)) { handle_mouse(*m); return; }
 
     // ── Take picker modal ────────────────────────────────────────────────────
@@ -395,7 +449,7 @@ void App::handle_event(const Event& ev) {
         }
         if (key(ev, SpecialKey::Enter)) {
             if (!g_takes_entries.empty()) {
-                push_undo();
+                push_undo("take load");
                 auto& p = g_takes_entries[static_cast<size_t>(g_takes_sel)];
                 std::string stem = p.stem().string();           // "live_<ts>"
                 std::string lbl  = "take " + stem;
@@ -407,25 +461,44 @@ void App::handle_event(const Event& ev) {
         return;                                                  // swallow all other keys
     }
 
-    // ── Global keys ──────────────────────────────────────────────────────────
+    // ── Global keys ──────────────────────────────────────────────────────────────────────────
+    // Overlays own the keyboard while open.
+    if (handle_palette_key(ev)) return;
+    if (handle_help_key(ev)) return;
+    if (as_key(ev)) g_hover_text.clear();
+
+    if (key(ev, ':') || ctrl(ev, 'k')) { open_palette(); return; }
+    if (key(ev, '?')) {
+        g_help_open = true;
+        g_help_from = g_focus;
+        g_help_query.clear();
+        g_help_ov_scroll = 0;
+        g_first_run = false;
+        return;
+    }
+    // The welcome card: Enter or Space starts playing, anything else just
+    // dismisses it and does its usual job.
+    if (g_first_run) {
+        g_first_run = false;
+        if (key(ev, SpecialKey::Enter)) { start_playback(); return; }
+    }
+
     if (key(ev, 'q') || key(ev, 'Q') || key(ev, SpecialKey::Escape)) {
-        if (g_help_open) { g_help_open = false; g_help_ov_scroll = 0; return; }
         // Escape also exits jam mode without quitting — otherwise the user
         // can't get out except by typing `k` (which would trigger a note).
         if (g_jam_mode) {
-            g_jam_mode = false;
-            acid_note_off();
-            g_jam_gate_s = 0.0f;
-            g_jam_last_midi = -1;
-            set_toast("jam off");
+            toggle_jam();
+            return;
+        }
+        // Esc alone never quits: it's the "get me out of here" key in every
+        // other app, so it shouldn't end the session. q quits.
+        if (key(ev, SpecialKey::Escape)) {
+            set_toast("q to quit  \xc2\xb7  : for commands  \xc2\xb7  ? for help");
             return;
         }
         g_quit_requested = true;
         return;
     }
-    if (key(ev, '?')) { g_help_open = !g_help_open; g_help_ov_scroll = 0; return; }
-    // While help is open we only accept Esc/? to close — everything else is no-op.
-    if (g_help_open) return;
     if (key(ev, 'Y')) { open_take_picker(); return; }
 
     // ── Jam mode ────────────────────────────────────────────────────────────
@@ -435,14 +508,7 @@ void App::handle_event(const Event& ev) {
     // sequencer can layer (sequencer rides through jam; pattern runs in the
     // background and jam adds a lead on top).
     if (g_jam_mode) {
-        if (key(ev, 'k')) {
-            g_jam_mode = false;
-            acid_note_off();
-            g_jam_gate_s = 0.0f;
-            g_jam_last_midi = -1;
-            set_toast("jam off");
-            return;
-        }
+        if (key(ev, 'k')) { toggle_jam(); return; }
         if (key(ev, SpecialKey::Tab) || key(ev, SpecialKey::BackTab)) {
             cycle_focus(key(ev, SpecialKey::BackTab) ? -1 : +1);
             return;
@@ -487,19 +553,10 @@ void App::handle_event(const Event& ev) {
     // only ("randomize what I'm looking at"); uppercase `R` dice-rolls
     // everything (knobs + pattern) for a full fresh patch + groove combo.
     // The sequencer's previous per-step rest toggle moved to `m` (mute).
-    if (key(ev, 'r')) {
-        push_undo();
-        switch (g_focus) {
-            case Section::Knobs:     randomize_knobs();     break;
-            case Section::FX:        randomize_fx();        break;
-            case Section::Sequencer: randomize_pattern();   break;
-            case Section::Drums:     randomize_drums();     break;
-            case Section::Transport: randomize_transport(); break;
-        }
-        return;
-    }
-    if (key(ev, 'R')) { push_undo(); randomize_everything(); return; }
-    if (key(ev, 'M')) { push_undo(); mutate_pattern(); return; }
+    if (key(ev, 'r')) { randomize_focused(); return; }
+    if (key(ev, 'R')) { push_undo("randomize everything"); randomize_everything();
+                        toast_undoable("\xe2\x9a\x84 everything randomized"); return; }
+    if (key(ev, 'M')) { push_undo("evolve"); mutate_pattern(); return; }
     // Shift+A — one-press auto-arrangement. Overwrites slots 1..9 (with .bak
     // rotation) and boots into song mode so a ~10-minute coherent track
     // plays end-to-end. The intermediate slots are real save files so the
@@ -507,63 +564,26 @@ void App::handle_event(const Event& ev) {
     if (key(ev, 'A')) { auto_arrange(); return; }
     if (key(ev, 'u')) { do_undo(); return; }
     if (key(ev, 'U')) { do_redo(); return; }
-    if (key(ev, 'T')) {
-        tb303::cycle_theme();
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "\xe2\x97\x86 theme: %s",
-                      tb303::active_theme().name);
-        set_toast(buf);
-        return;
-    }
+    if (key(ev, 'T')) { next_theme(); return; }
     if (key(ev, 'e')) { export_wav(); return; }
     if (key(ev, 'E')) { export_mid(); return; }
     if (key(ev, 'W')) { toggle_live_record(); return; }
     if (key(ev, 'p')) { export_pattern_text(); return; }
-    if (key(ev, 'P')) { push_undo(); import_pattern_text(); return; }
+    if (key(ev, 'P')) { push_undo("import pattern"); import_pattern_text(); return; }
     // Jam mode toggle — take over the keyboard for live two-octave playing.
     // Pattern playback keeps running under jam, so the user can lay a lead
     // line over an already-running sequence.
-    if (key(ev, 'k')) {
-        g_jam_mode = true;
-        g_jam_gate_s = 0.0f;
-        g_jam_last_midi = -1;
-        char buf[48];
-        std::snprintf(buf, sizeof(buf),
-            "\xe2\x99\xac jam mode  \xe2\x86\x90\xe2\x86\x92 octave  k/Esc exit");
-        set_toast(buf);
-        return;
-    }
+    if (key(ev, 'k')) { toggle_jam(); return; }
     // MIDI output toggle — emit notes + drum hits + clock to the ALSA seq
     // port. On the first enable, tell the user how to hook it up; aconnect -lo
     // shows the port and a DAW/softsynth can subscribe.
-    if (key(ev, 'O')) {
-        g_midi_out = !g_midi_out;
-        acid_midi_set_out_enabled(g_midi_out ? 1 : 0);
-        set_toast(g_midi_out
-            ? "\xe2\x99\xaa MIDI out on  (connect 'acidflow:out' via aconnect)"
-            : "MIDI out off");
-        return;
-    }
+    if (key(ev, 'O')) { toggle_midi_out(); return; }
     // MIDI clock input sync — follow an external master's tempo + transport.
     // Incoming notes still trigger the bass voice regardless; this switch
     // controls only the tempo-slaving path.
-    if (key(ev, 'I')) {
-        g_midi_sync = !g_midi_sync;
-        acid_midi_set_sync_in(g_midi_sync ? 1 : 0);
-        set_toast(g_midi_sync
-            ? "\xe2\x99\xaa MIDI sync on  (waiting for clock/start)"
-            : "MIDI sync off");
-        return;
-    }
+    if (key(ev, 'I')) { toggle_midi_sync(); return; }
     // Ableton Link: share tempo and bar phase with other apps on the network.
-    if (key(ev, 'K')) {
-        const bool on = !acid_link_enabled();
-        acid_link_enable(on ? 1 : 0);
-        g_link_bpm_sent = g_bpm;
-        if (on && !acid_link_enabled()) set_toast("Link isn't in this build (-DACIDFLOW_LINK=ON)");
-        else set_toast(on ? "\xe2\x97\x8e Link on" : "Link off");
-        return;
-    }
+    if (key(ev, 'K')) { toggle_link(); return; }
     // MIDI learn: `l` arms the focused knob or FX; the next CC binds to it.
     // `l` again while armed cancels.
     if (key(ev, 'l') && (g_focus == Section::Knobs || g_focus == Section::FX)) {
@@ -583,30 +603,7 @@ void App::handle_event(const Event& ev) {
     // Song mode chain: step through saved slots 1..9 on each pattern wrap.
     // Toggling ON boots straight into the first saved slot so the user hears
     // immediate feedback; toggling OFF leaves the current pattern loaded.
-    if (key(ev, 'n')) {
-        if (g_song_mode) {
-            g_song_mode = false;
-            set_toast("song mode off");
-        } else {
-            int first = song_next_slot(0);
-            if (first == 0) {
-                set_toast("\xe2\x9c\x97 no saved slots");
-            } else {
-                g_song_mode = true;
-                g_song_slot = first;
-                int bars = g_song_bars[static_cast<size_t>(first)];
-                if (bars <= 0) bars = kDefaultSongBars;
-                g_song_bars_left = bars;
-                load_pattern_slot(first, /*quiet=*/true);
-                char buf[48];
-                std::snprintf(buf, sizeof(buf),
-                              "\xe2\x99\xaa song \xe2\x86\x92 slot %d  \xc2\xb7 %d bars",
-                              first, bars);
-                set_toast(buf);
-            }
-        }
-        return;
-    }
+    if (key(ev, 'n')) { toggle_song_mode(); return; }
     // Save slots: Shift+digit saves, digit alone loads. Slot 0 is a bottom-of-
     // the-stack auto-slot (no binding); users address slots 1..9.
     {
@@ -627,7 +624,7 @@ void App::handle_event(const Event& ev) {
                 if (c >= '1' && c <= '9' && k->mods.none()
                     && g_focus != Section::Drums) {
                     int slot = c - '0';
-                    push_undo();
+                    push_undo("slot load");
                     load_pattern_slot(slot);
                     // Keep song mode in sync: manual jumps should advance
                     // from the slot the user just picked, not from wherever
@@ -654,7 +651,8 @@ void App::handle_event(const Event& ev) {
             if (key(ev, SpecialKey::Down))  { adjust_knob(g_knob_sel, -0.05f); return; }
             if (key(ev, ']'))               { adjust_knob(g_knob_sel, +0.10f); return; }
             if (key(ev, '['))               { adjust_knob(g_knob_sel, -0.10f); return; }
-            if (key(ev, '0'))               { reset_knob(g_knob_sel); return; }
+            if (key(ev, '0'))               { reset_knob(g_knob_sel);
+                                              set_toast(std::string(g_knob_table[g_knob_sel].label) + " reset to " + format_knob(g_knob_sel)); return; }
             if (key(ev, 'w'))               { g_wave = 1 - g_wave; return; }
             // `.` toggles write-mode automation on the currently-focused
             // knob. Only cutoff / res / env / accent have p-lock slots in
@@ -683,11 +681,7 @@ void App::handle_event(const Event& ev) {
                 set_toast(buf);
                 return;
             }
-            if (key(ev, 'm')) {
-                g_synth_mute = !g_synth_mute;
-                set_toast(g_synth_mute ? "synth muted" : "synth live");
-                return;
-            }
+            if (key(ev, 'm')) { toggle_synth_mute(); return; }
             break;
         }
         case Section::FX: {
@@ -697,12 +691,9 @@ void App::handle_event(const Event& ev) {
             if (key(ev, SpecialKey::Down))  { adjust_fx(g_fx_sel, -0.05f); return; }
             if (key(ev, ']'))               { adjust_fx(g_fx_sel, +0.10f); return; }
             if (key(ev, '['))               { adjust_fx(g_fx_sel, -0.10f); return; }
-            if (key(ev, '0'))               { reset_fx(g_fx_sel); return; }
-            if (key(ev, 'm')) {
-                g_synth_mute = !g_synth_mute;
-                set_toast(g_synth_mute ? "synth muted" : "synth live");
-                return;
-            }
+            if (key(ev, '0'))               { reset_fx(g_fx_sel);
+                                              set_toast(std::string(kFxLongName[g_fx_sel]) + " reset to " + format_fx(g_fx_sel)); return; }
+            if (key(ev, 'm')) { toggle_synth_mute(); return; }
             break;
         }
         case Section::Sequencer: {
@@ -713,8 +704,10 @@ void App::handle_event(const Event& ev) {
             if (key(ev, SpecialKey::Down))  { s.note = std::max(s.note - 1, 12); s.rest = false; return; }
             if (key(ev, '<') || key(ev, ',')) { s.note = std::max(s.note - 12, 12); return; }
             if (key(ev, '>') || key(ev, '.')) { s.note = std::min(s.note + 12, 96); return; }
-            if (key(ev, 'a')) { s.accent = !s.accent; s.rest = false; return; }
-            if (key(ev, 's')) { s.slide  = !s.slide;  s.rest = false; return; }
+            if (key(ev, 'a')) { s.accent = !s.accent; s.rest = false;
+                                set_toast(std::string("step ") + std::to_string(g_step_sel + 1) + (s.accent ? " accented" : " accent off")); return; }
+            if (key(ev, 's')) { s.slide  = !s.slide;  s.rest = false;
+                                set_toast(std::string("step ") + std::to_string(g_step_sel + 1) + (s.slide ? " slides into the next" : " slide off")); return; }
             // `m` mutates the sequence in place — one small weighted change
             // per press so the new line sits musically next to the old one
             // (accent flip / pitch nudge / rotate / etc). push_undo() before
@@ -722,7 +715,7 @@ void App::handle_event(const Event& ev) {
             // "walks" the pattern and `u` rewinds step-by-step up to 32
             // presses (kUndoMax). Rest-toggle on a step is still available
             // via `x` (which wipes the step to an explicit rest).
-            if (key(ev, 'm')) { push_undo(); mutate_pattern(); return; }
+            if (key(ev, 'm')) { push_undo("evolve"); mutate_pattern(); return; }
             // Probability cycles 100→75→50→25→100; ratchet cycles 1→2→3→4→1.
             // Keeps the "always/half/quarter" musical feel without an extra
             // continuous-value knob row.
@@ -761,7 +754,7 @@ void App::handle_event(const Event& ev) {
             // whole step; `L` is the lighter-touch option that preserves the
             // note + flags but wipes p-locks.
             if (key(ev, 'L')) {
-                push_undo();
+                push_undo("clear locks");
                 s.lock_mask = 0;
                 return;
             }
@@ -783,7 +776,7 @@ void App::handle_event(const Event& ev) {
             }
             // `.` also means "clear" when the step is already at an octave boundary
             // (conflict with octave-up) — use `x` as the unambiguous clear key.
-            if (key(ev, 'x')) { push_undo(); s = StepData{}; s.rest = true; return; }
+            if (key(ev, 'x')) { push_undo("clear step"); s = StepData{}; s.rest = true; toast_undoable("step cleared"); return; }
             break;
         }
         case Section::Drums: {
@@ -818,14 +811,14 @@ void App::handle_event(const Event& ev) {
             // `c` clears the focused row; `C` clears the entire kit. Mirrors
             // the sequencer's `x = clear step` ergonomics at the row level.
             if (key(ev, 'c')) {
-                push_undo();
+                push_undo("clear drum row");
                 for (auto& c : g_drums[static_cast<size_t>(g_drum_voice_sel)]) c = false;
                 return;
             }
             if (key(ev, 'C')) {
-                push_undo();
+                push_undo("clear drums");
                 for (auto& row : g_drums) for (auto& c : row) c = false;
-                set_toast("drums cleared");
+                toast_undoable("drums cleared");
                 return;
             }
             // Number-row 1..0 = quick-toggle steps 1..10 on the current voice.
@@ -853,18 +846,18 @@ void App::handle_event(const Event& ev) {
             break;
         }
         case Section::Transport: {
-            if (key(ev, SpecialKey::Up))   { push_undo(); load_preset(g_preset_index - 1); return; }
-            if (key(ev, SpecialKey::Down)) { push_undo(); load_preset(g_preset_index + 1); return; }
-            if (key(ev, '[')) { g_bpm = std::max(40.0f,  g_bpm - 2.0f); return; }
-            if (key(ev, ']')) { g_bpm = std::min(220.0f, g_bpm + 2.0f); return; }
+            if (key(ev, SpecialKey::Up))   { push_undo("preset change"); load_preset(g_preset_index - 1); return; }
+            if (key(ev, SpecialKey::Down)) { push_undo("preset change"); load_preset(g_preset_index + 1); return; }
+            if (key(ev, '[')) { nudge_bpm(-2.0f); return; }
+            if (key(ev, ']')) { nudge_bpm(+2.0f); return; }
             if (key(ev, '{')) { g_pattern_length = std::max(4, g_pattern_length - 1); return; }
             if (key(ev, '}')) { g_pattern_length = std::min(16, g_pattern_length + 1); return; }
             // Swing: 0.50 straight → 0.75 hard shuffle. Step is 2% so three
             // taps from centre lands on the canonical MPC-56/58/60/62 feels.
-            if (key(ev, '-')) { g_swing = std::max(0.50f, g_swing - 0.02f); return; }
-            if (key(ev, '=')) { g_swing = std::min(0.75f, g_swing + 0.02f); return; }
-            if (key(ev, ',')) { push_undo(); load_preset(g_preset_index - 1); return; }
-            if (key(ev, '.')) { push_undo(); load_preset(g_preset_index + 1); return; }
+            if (key(ev, '-')) { nudge_swing(-0.02f); return; }
+            if (key(ev, '=')) { nudge_swing(+0.02f); return; }
+            if (key(ev, ',')) { push_undo("preset change"); load_preset(g_preset_index - 1); return; }
+            if (key(ev, '.')) { push_undo("preset change"); load_preset(g_preset_index + 1); return; }
             // ( / ) — shrink/grow how long the current song-mode slot
             // holds before the chain advances. Cycle: 1 → 2 → 4 → 8 → 16
             // → 32 → 64 (bars). No-op when song mode is off or no slot
@@ -895,15 +888,67 @@ void App::handle_event(const Event& ev) {
                 set_toast(buf);
                 return;
             }
-            if (key(ev, 'm')) {
-                // Master mute: if either bus is live, silence both; otherwise unmute both.
-                bool any_live = !g_synth_mute || !g_drums_mute;
-                g_synth_mute = any_live;
-                g_drums_mute = any_live;
-                set_toast(any_live ? "all muted" : "all live");
-                return;
-            }
+            if (key(ev, 'm')) { toggle_all_mute(); return; }
             break;
         }
     }
 }
+
+// ── Actions shared by keys and the command palette ──────────────────────────
+void App::next_theme() {
+    tb303::cycle_theme();
+    g_theme_chosen = true;
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "\xe2\x97\x86 theme: %s",
+                  tb303::active_theme().name);
+    set_toast(buf);
+}
+
+void App::toggle_midi_out() {
+    g_midi_out = !g_midi_out;
+    acid_midi_set_out_enabled(g_midi_out ? 1 : 0);
+    set_toast(g_midi_out
+        ? "\xe2\x99\xaa MIDI out on  (connect 'acidflow:out' via aconnect)"
+        : "MIDI out off");
+}
+
+void App::toggle_midi_sync() {
+    g_midi_sync = !g_midi_sync;
+    acid_midi_set_sync_in(g_midi_sync ? 1 : 0);
+    set_toast(g_midi_sync
+        ? "\xe2\x99\xaa MIDI sync on  (waiting for clock/start)"
+        : "MIDI sync off");
+}
+
+void App::toggle_link() {
+    const bool on = !acid_link_enabled();
+    acid_link_enable(on ? 1 : 0);
+    g_link_bpm_sent = g_bpm;
+    if (on && !acid_link_enabled()) set_toast("Link isn't in this build (-DACIDFLOW_LINK=ON)");
+    else set_toast(on ? "\xe2\x97\x8e Link on" : "Link off");
+}
+
+void App::toggle_song_mode() {
+    if (g_song_mode) {
+        g_song_mode = false;
+        set_toast("song mode off");
+    } else {
+        int first = song_next_slot(0);
+        if (first == 0) {
+            set_toast("\xe2\x9c\x97 no saved slots");
+        } else {
+            g_song_mode = true;
+            g_song_slot = first;
+            int bars = g_song_bars[static_cast<size_t>(first)];
+            if (bars <= 0) bars = kDefaultSongBars;
+            g_song_bars_left = bars;
+            load_pattern_slot(first, /*quiet=*/true);
+            char buf[48];
+            std::snprintf(buf, sizeof(buf),
+                          "\xe2\x99\xaa song \xe2\x86\x92 slot %d  \xc2\xb7 %d bars",
+                          first, bars);
+            set_toast(buf);
+        }
+    }
+}
+

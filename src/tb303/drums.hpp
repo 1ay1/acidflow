@@ -25,8 +25,20 @@ inline constexpr int kDrumGridVoices = 16;
     int step_sel,
     int playing_step,
     float master_gain,
-    bool focused)
+    bool focused,
+    int avail_w = 52)
 {
+    // Cells are 3 wide (" █ ") when there's room, 2 ("█ ") or 1 ("█")
+    // when there isn't, so the drum names always fit on the left.
+    const int cw = avail_w >= kDrumCellX0 + 16 * 3 ? 3 : avail_w >= kDrumCellX0 + 16 * 2 ? 2 : 1;
+    auto cell_txt = [cw](const char* glyph3) {
+        // glyph3 is " X " (space, glyph, space); trim to the cell width.
+        std::string g(glyph3);
+        if (cw == 3) return g;
+        g = g.substr(1, g.size() - 2);   // glyph alone
+        if (cw == 2) g += " ";
+        return g;
+    };
     static constexpr const char* kLabels[kDrumGridVoices] = {
         "BD","SD","CH","OH","CL","LT","HT","RS","CB","SH","TB","CG",
         "MT","CY","RD","BG"
@@ -69,14 +81,15 @@ inline constexpr int kDrumGridVoices = 16;
         for (int i = 0; i < 16; ++i) {
             size_t s = txt.size();
             char b[4];
-            if (i % 4 == 0) std::snprintf(b, sizeof(b), "%2d ", i + 1);
-            else            std::snprintf(b, sizeof(b), " . ");
+            if (cw == 3) std::snprintf(b, sizeof(b), i % 4 == 0 ? "%2d " : " . ", i + 1);
+            else if (cw == 2) std::snprintf(b, sizeof(b), i % 4 == 0 ? "%-2d" : ". ", i + 1);
+            else std::snprintf(b, sizeof(b), "%s", i % 4 == 0 ? "|" : ".");
             txt += b;
             Style st = Style{}.with_fg(
                 (i == step_sel && focused) ? clr_accent() :
                 (i == playing_step)        ? clr_hot()    :
                 (i % 4 == 0)               ? clr_muted()  : clr_dim());
-            runs.push_back(StyledRun{s, 3, st});
+            runs.push_back(StyledRun{s, txt.size() - s, st});
         }
         rows.push_back(Element{TextElement{
             .content = std::move(txt),
@@ -119,7 +132,7 @@ inline constexpr int kDrumGridVoices = 16;
             else                      { glyph = " \xc2\xb7 ";     fg = clr_dim(); }
 
             size_t s = txt.size();
-            txt += glyph;
+            txt += cell_txt(glyph);
             Style st = Style{}.with_fg(fg);
             if (cell) st = st.with_bold();
             runs.push_back(StyledRun{s, txt.size() - s, st});
@@ -136,12 +149,13 @@ inline constexpr int kDrumGridVoices = 16;
             .style   = {},
             .wrap    = TextWrap::NoWrap,
             .runs    = std::move(runs),
-        }} | dsl::hit(hit_id(kHitDrumRow, static_cast<std::uint32_t>(v)))).build());
+        }} | dsl::hit(hit_id(kHitDrumRow, static_cast<std::uint32_t>(v)))
+           | dsl::width(kDrumCellX0 + 16 * cw)).build());
     }
 
     {
         char b[64];
-        std::snprintf(b, sizeof(b), "    bus %3d%%  [ / ] adjust",
+        std::snprintf(b, sizeof(b), cw == 3 ? "    bus %3d%%  [ / ] adjust" : "    bus %3d%%",
                       static_cast<int>(std::round(master_gain * 100.0f)));
         rows.push_back(Element{TextElement{
             .content = b,
@@ -150,9 +164,8 @@ inline constexpr int kDrumGridVoices = 16;
         }});
     }
 
-    return (dsl::v(std::move(rows))
-            | dsl::gap(0)
-            | dsl::align(Align::Center)).build();
+    // Left-aligned: centering a grid wider than the panel cut the names off.
+    return (dsl::v(std::move(rows)) | dsl::gap(0)).build();
 }
 
 } // namespace tb303

@@ -1,150 +1,156 @@
 #pragma once
-// Full-screen-ish modal shown when user presses ?. Mouse-free and scannable.
+// Help screen. Built from the action table, so every key it lists is a key
+// that works. Opens on the panel you were in; type to search everything;
+// Tab flips between panels. A short "words" section explains the 303 jargon
+// the knobs use.
 
+#include <algorithm>
+#include <cctype>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include <maya/maya.hpp>
 
+#include "../app/actions.hpp"
 #include "theme.hpp"
 
 namespace tb303 {
 
 using namespace maya;
 
-[[nodiscard]] inline Element build_help_overlay(int scroll_offset = 0) {
-    auto heading = [](const char* s) {
-        return Element{TextElement{
-            .content = s,
-            .style   = Style{}.with_fg(clr_accent()).with_bold(),
-        }};
+struct HelpTerm { const char* word; const char* meaning; };
+
+// Plain-English glossary for the words on the panels.
+inline constexpr HelpTerm kHelpTerms[] = {
+    {"CUTOFF", "How bright the sound is. Low = dark and round, high = buzzy."},
+    {"RES",    "Resonance. Adds a whistle at the cutoff. Turn it up for the acid squelch."},
+    {"ENVMOD", "How far each note sweeps the cutoff up. More = more 'wow'."},
+    {"DECAY",  "How fast that sweep falls back. Short = plucky, long = vowel-like."},
+    {"ACCENT", "How much harder accented steps hit. Accents also sweep the filter more."},
+    {"Slide",  "The note glides into the next one instead of re-starting. Key to the 303 sound."},
+    {"Chance", "A step's probability of playing each time round."},
+    {"Ratchet","Play a step 2-4 times quickly, like a drum roll."},
+    {"P-lock", "A knob value saved on one step only, so one note can sound different."},
+    {"Swing",  "Every second 16th note is pushed late, for groove."},
+};
+
+namespace help_detail {
+
+inline std::string lower(std::string_view s) {
+    std::string o(s);
+    for (auto& c : o) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return o;
+}
+inline bool contains(std::string_view hay, const std::string& q) {
+    return lower(hay).find(q) != std::string::npos;
+}
+
+}  // namespace help_detail
+
+// `from` is the panel help was opened from; `query` is the search text.
+[[nodiscard]] inline Element build_help_overlay(Scope from, const std::string& query,
+                                                int scroll_offset) {
+    using help_detail::contains;
+    const std::string q = help_detail::lower(query);
+
+    auto heading = [](std::string s, Color c) {
+        return Element{TextElement{.content = std::move(s),
+                                   .style = Style{}.with_fg(c).with_bold()}};
     };
-    auto row = [](const char* k, const char* d) {
+    auto blank = [] { return Element{TextElement{.content = ""}}; };
+    // Pad to a fixed column count (our glyphs are all one cell wide).
+    auto pad = [](std::string s, int w) {
+        int cols = 0;
+        for (unsigned char c : s) if ((c & 0xC0) != 0x80) ++cols;
+        if (cols < w) s.append(static_cast<size_t>(w - cols), ' ');
+        return s;
+    };
+    // keys | name | description, as one row of runs so the columns line up
+    // and the description wraps under itself.
+    auto row = [&](const Action& a) {
+        const std::string k = pad(std::string("  ") + a.keys, 16);
+        const std::string n = pad(a.name, 28);
         return (dsl::h(
-            dsl::text(k) | dsl::Bold | dsl::fgc(clr_text()) | dsl::width(14),
-            dsl::text(d) | dsl::fgc(clr_muted())
+            dsl::text(k) | dsl::Bold | dsl::fgc(clr_accent()) | dsl::shrink(0),
+            dsl::text(n) | dsl::Bold | dsl::fgc(clr_text())   | dsl::shrink(0),
+            dsl::text(a.help) | dsl::fgc(clr_muted()) | dsl::grow(1) | dsl::shrink(1)
         )).build();
     };
 
-    std::vector<Element> children;
-    children.push_back(heading("KEYBOARD REFERENCE"));
-    children.push_back(Element{TextElement{.content = ""}});
+    std::vector<Element> body;
 
-    children.push_back(heading("Global"));
-    children.push_back(row("Tab / S-Tab",  "cycle focus between sections"));
-    children.push_back(row("Space",        "play / pause"));
-    children.push_back(row("r",            "randomize current section (knobs OR pattern)"));
-    children.push_back(row("R",            "randomize everything (knobs AND pattern)"));
-    children.push_back(row("M  (S-m)",     "evolve pattern — one small mutation per press"));
-    children.push_back(row("u / U",        "undo / redo last destructive action (32-deep)"));
-    children.push_back(row("W  (S-w)",     "start/stop live recording (take \xe2\x86\x92 live_<ts>.wav+.txt)"));
-    children.push_back(row("Y  (S-y)",     "open take picker (load any live_<ts>.txt recording)"));
-    children.push_back(row("T  (S-t)",     "cycle colour theme (classic / cyber / moss / ice / mono)"));
-    children.push_back(row("e",            "export pattern as WAV (4 loops)"));
-    children.push_back(row("E  (S-e)",     "export pattern as MIDI file (.mid)"));
-    children.push_back(row("p",            "export pattern as shareable text (pattern.txt)"));
-    children.push_back(row("P  (S-p)",     "import pattern from pattern.txt"));
-    children.push_back(row("!..(  (S-1..9)","save pattern to slot 1..9"));
-    children.push_back(row("1..9",         "load pattern from slot 1..9"));
-    children.push_back(row("n",            "song mode (chain saved slots on wrap)"));
-    children.push_back(row("A  (S-a)",     "auto-arrange \xe2\x86\x92 9-slot ~10-min song (+song mode)"));
-    children.push_back(row("k",            "jam mode (two-octave live piano)"));
-    children.push_back(row("O  (S-o)",     "toggle MIDI out (notes + drums + clock)"));
-    children.push_back(row("I  (S-i)",     "toggle MIDI sync (follow external clock)"));
-    children.push_back(row("?",            "toggle this help"));
-    children.push_back(row("q / Esc",      "quit"));
-    children.push_back(Element{TextElement{.content = ""}});
-
-    children.push_back(heading("Knobs"));
-    children.push_back(row("\xe2\x86\x90 / \xe2\x86\x92",  "select knob"));
-    children.push_back(row("\xe2\x86\x91 / \xe2\x86\x93",  "adjust by 5%"));
-    children.push_back(row("[ / ]",        "coarse adjust by 10%"));
-    children.push_back(row("0",            "reset to default"));
-    children.push_back(row("w",            "toggle waveform (saw / square)"));
-    children.push_back(row(".",            "arm/disarm write-mode automation (cutoff/res/env/acc)"));
-    children.push_back(Element{TextElement{.content = ""}});
-
-    children.push_back(heading("FX Rack"));
-    children.push_back(row("\xe2\x86\x90 / \xe2\x86\x92",  "select FX knob"));
-    children.push_back(row("\xe2\x86\x91 / \xe2\x86\x93",  "adjust  (DLY TIME steps 1/16\xe2\x86\x92" "1/8d)"));
-    children.push_back(row("0",            "reset FX knob"));
-    children.push_back(Element{TextElement{.content = ""}});
-
-    children.push_back(heading("Sequencer"));
-    children.push_back(row("\xe2\x86\x90 / \xe2\x86\x92",  "select step"));
-    children.push_back(row("\xe2\x86\x91 / \xe2\x86\x93",  "transpose semitone"));
-    children.push_back(row("< / >",        "octave down / up"));
-    children.push_back(row("a",            "toggle accent on step"));
-    children.push_back(row("s",            "toggle slide into next step"));
-    children.push_back(row("m",            "mutate pattern (small musical change; u to undo)"));
-    children.push_back(row("v",            "cycle probability (100/75/50/25)"));
-    children.push_back(row("j",            "cycle ratchet (1/2/3/4 hits per step)"));
-    children.push_back(row("F  (S-f)",     "p-lock cutoff (snapshot current knob)"));
-    children.push_back(row("G  (S-g)",     "p-lock resonance"));
-    children.push_back(row("H  (S-h)",     "p-lock env mod"));
-    children.push_back(row("J  (S-j)",     "p-lock accent amt"));
-    children.push_back(row("L  (S-l)",     "clear all p-locks on step"));
-    children.push_back(row("x",            "clear step (note + flags)"));
-    children.push_back(row("c d e f g a b","set root pitch at current octave"));
-    children.push_back(Element{TextElement{.content = ""}});
-
-    children.push_back(heading("Drums"));
-    children.push_back(row("\xe2\x86\x90 / \xe2\x86\x92",  "select step"));
-    children.push_back(row("\xe2\x86\x91 / \xe2\x86\x93",  "select voice (BD / SD / CH / OH / CL …)"));
-    children.push_back(row("space / x",    "toggle hit on selected cell"));
-    children.push_back(row("s",            "mute / unmute selected voice (shown as BDM)"));
-    children.push_back(row("m",            "mute / unmute entire drum bus"));
-    children.push_back(row("1..9, 0",      "quick-toggle step 1..10 on current voice"));
-    children.push_back(row("[ / ]",        "drum bus master send"));
-    children.push_back(row("c",            "clear current voice row"));
-    children.push_back(row("C  (S-c)",     "clear entire kit"));
-    children.push_back(Element{TextElement{.content = ""}});
-
-    children.push_back(heading("Jam mode"));
-    children.push_back(row("k",            "enter jam mode (Esc to leave)"));
-    children.push_back(row("z s x d c v g b h n j m", "lower-octave piano (C..B)"));
-    children.push_back(row("q 2 w 3 e r 5 t 6 y 7 u", "upper-octave piano"));
-    children.push_back(row("\xe2\x86\x90 / \xe2\x86\x92",  "octave down / up"));
-    children.push_back(row("'",            "toggle accent for next notes"));
-    children.push_back(row(";",            "toggle slide for next notes"));
-    children.push_back(Element{TextElement{.content = ""}});
-
-    children.push_back(heading("Transport"));
-    children.push_back(row("\xe2\x86\x91 / \xe2\x86\x93",  "previous / next preset"));
-    children.push_back(row(", / .",        "previous / next preset (alt)"));
-    children.push_back(row("[ / ]",        "bpm -/+ 2"));
-    children.push_back(row("{ / }",        "pattern length"));
-    children.push_back(row("- / =",        "swing (50% straight \xe2\x86\x92 75% hard shuffle)"));
-    children.push_back(row("( / )",        "song-slot bars: 1/2/4/8/16/32/64 (hold length)"));
-    children.push_back(Element{TextElement{.content = ""}});
-
-    children.push_back(heading("Mouse"));
-    children.push_back(row("click knob",   "focus + select"));
-    children.push_back(row("drag knob",    "adjust (vertical motion)"));
-    children.push_back(row("scroll knob",  "adjust by 5%"));
-    children.push_back(row("right-click",  "reset knob to default"));
-    children.push_back(row("click step",   "select step to edit"));
-    children.push_back(row("scroll step",  "transpose by semitone"));
-    children.push_back(row("right-click",  "toggle rest on step"));
-    children.push_back(row("click title",  "play / pause"));
-    children.push_back(row("scroll title", "nudge bpm"));
-    children.push_back(row("scroll right", "browse presets"));
-
-    // Apply vertical scroll by dropping N children from the top. The parent
-    // passes the offset in; hit-test code clamps it when the wheel fires.
-    if (scroll_offset > 0) {
-        int skip = std::min<int>(scroll_offset, static_cast<int>(children.size()));
-        children.erase(children.begin(), children.begin() + skip);
+    // Search box line.
+    {
+        std::string line = query.empty()
+            ? "  \xe2\x8c\x95 type to search \xc2\xb7 Tab: other panels \xc2\xb7 \xe2\x86\x91\xe2\x86\x93 scroll \xc2\xb7 Esc: close"
+            : "  \xe2\x8c\x95 " + query + "\xe2\x96\x8f   (Esc clears)";
+        body.push_back(Element{TextElement{
+            .content = std::move(line),
+            .style = Style{}.with_fg(query.empty() ? clr_muted() : clr_text())}});
+        body.push_back(blank());
     }
 
+    int shown = 0;
+    auto section = [&](Scope s, bool first) {
+        std::vector<const Action*> rows;
+        for (const auto& a : actions())
+            if (a.scope == s && (q.empty() || contains(a.name, q) || contains(a.help, q) || contains(a.keys, q)))
+                rows.push_back(&a);
+        if (rows.empty()) return;
+        std::string title = scope_name(s);
+        if (first && q.empty()) title = "\xe2\x96\xb8 " + title + "  (where you are)";
+        body.push_back(heading(std::move(title), first ? clr_accent() : clr_text()));
+        for (const Action* a : rows) { body.push_back(row(*a)); ++shown; }
+        body.push_back(blank());
+    };
+
+    // The panel you came from first, then everywhere-keys, then the rest.
+    section(from, true);
+    if (from != Scope::Global) section(Scope::Global, false);
+    for (Scope s : {Scope::Knobs, Scope::FX, Scope::Sequencer, Scope::Drums, Scope::Transport})
+        if (s != from) section(s, false);
+
+    // Glossary.
+    std::vector<const HelpTerm*> terms;
+    for (const auto& t : kHelpTerms)
+        if (q.empty() || contains(t.word, q) || contains(t.meaning, q)) terms.push_back(&t);
+    if (!terms.empty()) {
+        body.push_back(heading("What the words mean", clr_text()));
+        for (const HelpTerm* t : terms) {
+            body.push_back((dsl::h(
+                dsl::text(pad(std::string("  ") + t->word, 16)) | dsl::Bold | dsl::fgc(clr_slide()) | dsl::shrink(0),
+                dsl::text(t->meaning) | dsl::fgc(clr_muted()) | dsl::grow(1) | dsl::shrink(1)
+            )).build());
+            ++shown;
+        }
+        body.push_back(blank());
+    }
+
+    if (q.empty()) {
+        body.push_back(heading("Mouse", clr_text()));
+        body.push_back(dsl::text("  Click a step or drum cell to edit it \xc2\xb7 drag a knob up/down \xc2\xb7 "
+                                 "scroll to fine-tune \xc2\xb7 right-click to reset or clear \xc2\xb7 "
+                                 "hover anything to see what it does") | dsl::fgc(clr_muted()));
+        body.push_back(blank());
+        body.push_back(dsl::text("  Your session is saved when you quit. Files live in ~/.config/acidflow/.")
+                       | dsl::fgc(clr_dim()));
+    } else if (shown == 0) {
+        body.push_back(dsl::text("  Nothing matches \"" + query + "\". Try a word like tempo, slide, save or random.")
+                       | dsl::fgc(clr_muted()));
+    }
+
+    const int skip = std::clamp(scroll_offset, 0, std::max(0, static_cast<int>(body.size()) - 3));
+    std::vector<Element> visible(body.begin() + skip, body.end());
+
     return dsl::vstack()
-        .border(BorderStyle::Double)
+        .border(BorderStyle::Round)
         .border_color(clr_accent())
-        .border_text(" HELP — press ? or Esc to close (scroll to read more) ",
-                     BorderTextPos::Top)
-        .align_self(Align::Stretch)      // fill cross-axis (width) of parent
-        .grow(1.0f)                      // fill remaining vertical space
-        .overflow(Overflow::Hidden)      // let narrow windows clip cleanly
-        .padding(1, 3, 1, 3)(std::move(children));
+        .border_text(" HELP ", BorderTextPos::Top)
+        .align_self(Align::Stretch)
+        .grow(1.0f)
+        .overflow(Overflow::Hidden)
+        .padding(1, 2, 0, 2)(std::move(visible));
 }
 
 } // namespace tb303

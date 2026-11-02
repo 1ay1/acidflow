@@ -38,6 +38,7 @@ struct TransportState {
     std::span<const StepData>   steps;            // currently-loaded 16 steps
     bool                        focused;
     bool                        song_mode = false; // Phase 4.1: chain saved slots
+    bool                        compact   = false; // short terminal: skip the contour preview
     int                         song_slot = 0;     // active slot (1..9, 0 = none)
     bool                        jam_mode  = false; // Phase 4.2: live keyboard
     int                         jam_octave = 3;
@@ -244,15 +245,18 @@ struct RichText {
                 Style{}.with_fg(playing ? clr_hot() : clr_muted()).with_bold());
 
             return rt.build();
-        }).grow(1);
+        }).grow(0).height(Dimension::fixed(1));
 
     // ── Row 3: pattern preview (pitch contour + accent/slide markers) ───────
     // Mini piano-roll. Each step is one column; height of the block bar
     // encodes the pitch relative to the pattern's range. Rest steps are a
     // single dim dot. The currently-playing step is drawn in red, accents
     // get a red ● under the bar, slides get a cyan / glyph.
-    auto pattern_preview = [&]() -> Element {
+    auto pattern_preview = dsl::adapt([t](int avail_w) -> Element {
         using detail::RichText;
+        // 3 columns per step when it fits, else 2, else 1.
+        const int CELL_W = avail_w >= 3 * t.pattern_length ? 3
+                         : avail_w >= 2 * t.pattern_length ? 2 : 1;
 
         // find pitch range across non-rest steps in the active pattern length
         int lo =  1000, hi = -1000;
@@ -267,7 +271,6 @@ struct RichText {
         if (hi - lo < 6) hi = lo + 6;             // keep a minimum range
 
         constexpr int ROWS   = 4;                  // pitch rows
-        constexpr int CELL_W = 3;                  // step block is 3 cells wide
         static constexpr const char* blocks[] = {
             " ",
             "\xe2\x96\x81", "\xe2\x96\x82", "\xe2\x96\x83", "\xe2\x96\x84",
@@ -310,13 +313,17 @@ struct RichText {
                     fg = clr_panel_hi();
                 }
 
-                // repeat the block 3 times to give each step visual width
+                // repeat the block to give each step visual width
                 for (int k = 0; k < CELL_W; ++k) {
                     rt.push(glyph, Style{}.with_fg(fg).with_bold());
                 }
             }
             out.push_back(rt.build());
         }
+
+        // Accent/slide markers need 3 columns per step to read; skip them
+        // when the panel is narrow (the bar colours still show both).
+        if (CELL_W < 3) return (dsl::v(std::move(out)) | dsl::gap(0)).build();
 
         // thin separator row with per-step marker glyphs (a/s/·)
         RichText marks;
@@ -348,7 +355,7 @@ struct RichText {
         out.push_back(marks.build());
 
         return (dsl::v(std::move(out)) | dsl::gap(0)).build();
-    }();
+    });
 
     // ── Row 4: full-length preset list with mini-contour previews ────────────
     // Every preset gets its own row, showing:
@@ -371,7 +378,7 @@ struct RichText {
         .render = [presets    = t.presets,
                    pattern_ix = t.pattern_index,
                    focused    = t.focused]
-            (int /*w*/, int h) -> Element
+            (int w, int h) -> Element
         {
             int n = static_cast<int>(presets.size());
             int cv = pattern_ix;
@@ -409,10 +416,14 @@ struct RichText {
             hdr.push(more_below ? "\xe2\x96\xbc" : "\xc2\xb7",             // ▼ / ·
                 Style{}.with_fg(more_below ? clr_accent() : clr_dim()).with_bold());
             hdr.push("  ", Style{});
-            hdr.push("\xe2\x86\x91\xe2\x86\x93 browse",                    // ↑↓ browse
-                Style{}.with_fg(focused ? clr_accent() : clr_dim()));
-            char cnt[16];
-            std::snprintf(cnt, sizeof(cnt), "   %d/%d", cv + 1, n);
+            // "↑↓ browse" is a hint; the count matters more, so it goes first
+            // when the panel is narrow.
+            if (w >= 32)
+                hdr.push("\xe2\x86\x91\xe2\x86\x93 browse",                // ↑↓ browse
+                    Style{}.with_fg(focused ? clr_accent() : clr_dim()));
+            char cnt[24];
+            if (cv >= 0) std::snprintf(cnt, sizeof(cnt), "   %d/%d", cv + 1, n);
+            else         std::snprintf(cnt, sizeof(cnt), "   custom");
             hdr.push(cnt, Style{}.with_fg(clr_muted()));
             rows.push_back(hdr.build());
 
@@ -514,14 +525,19 @@ struct RichText {
         .layout = FlexStyle{.grow = 1.0f, .shrink = 1.0f},
     }};
 
-    auto body = dsl::vstack().gap(0)(
-        status.build(),
-        Element{std::move(playhead_el)},
-        Element{TextElement{.content = ""}},
-        std::move(pattern_preview),
-        Element{TextElement{.content = ""}},
-        std::move(preset_list)
-    );
+    // Status, playhead, contour preview, then the preset list, which takes
+    // whatever height is left (and scrolls). Padding is light so the list
+    // shows on short terminals.
+    std::vector<Element> parts;
+    parts.push_back(status.build());
+    parts.push_back(Element{std::move(playhead_el)});
+    parts.push_back(Element{TextElement{.content = ""}});
+    if (!t.compact) {
+        parts.push_back((std::move(pattern_preview) | dsl::shrink(0)).build());
+        parts.push_back(Element{TextElement{.content = ""}});
+    }
+    parts.push_back(std::move(preset_list));
+    auto body = dsl::vstack().gap(0)(std::move(parts));
 
     return dsl::vstack()
         .border(BorderStyle::Round)
@@ -530,7 +546,7 @@ struct RichText {
         .basis(Dimension::fixed(0))
         .min_width(Dimension::fixed(0))
         .overflow(Overflow::Hidden)
-        .padding(1, 2, 1, 2)(std::move(body));
+        .padding(0, 1, 0, 1)(std::move(body));
 }
 
 } // namespace tb303

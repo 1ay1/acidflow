@@ -67,6 +67,9 @@ inline constexpr float kDrumDefaultGain[kDrumVoices] = {
 };
 inline constexpr float kToastDur = 1.5f;
 inline constexpr float kHelpBarChipDur = 1.2f;
+// Below this many rows the full layout (tall knob meters, scope, filter
+// chart) doesn't fit, so a compact one is used.
+inline constexpr int kCompactRows = 38;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Undo / redo — destructive operations (randomize, mutate, preset/slot load,
@@ -92,6 +95,8 @@ struct Snapshot {
     // FX.
     float od_amt, delay_mix, delay_fb, rev_mix, rev_size, rev_damp;
     int   delay_div;
+    // What the change was, for the undo toast ("randomize pattern").
+    std::string label;
 };
 
 inline constexpr size_t kUndoMax = 32;
@@ -127,11 +132,16 @@ enum FxIdx {
 };
 
 struct FxDesc {
-    const char* label;
+    const char* label;           // short, under the knob (the group says which effect)
     float*      value;           // nullptr for FX_DTIME (discrete)
     float       default_v;
     const char* tech;
     const char* caption;
+};
+// Full names for toasts, captions and MIDI learn ("delay mix", not "MIX").
+inline constexpr const char* kFxLongName[] = {
+    "OVERDRIVE", "DELAY MIX", "DELAY FEEDBACK", "DELAY TIME",
+    "REVERB MIX", "REVERB SIZE", "REVERB DAMPING",
 };
 
 inline const char* const kDlyDivNames[4] = {"1/16", "1/16d", "1/8", "1/8d"};
@@ -462,7 +472,7 @@ struct App {
     // Push the current state onto the undo stack before running a destructive
     // action. Clears the redo stack — a new branch of history invalidates any
     // pending redos, matching what users expect from text editors.
-    void push_undo();
+    void push_undo(const char* what = nullptr);
 
     void do_undo();
 
@@ -494,19 +504,19 @@ struct App {
     };
 
     FxDesc g_fx_table[FX_COUNT] = {
-    {"O-DRIVE",  &g_od_amt,     0.0f,  "OD",
+    {"DRIVE",    &g_od_amt,     0.0f,  "OD",
         "pre-filter overdrive  [0 = clean, 1 = '303 into fuzz pedal']"},
-    {"DLY MIX",  &g_delay_mix,  0.0f,  "w/d",
+    {"MIX",      &g_delay_mix,  0.0f,  "w/d",
         "delay wet/dry send  [0 = bypass, 1 = full echo tail]"},
-    {"DLY FB",   &g_delay_fb,   0.35f, "fb",
+    {"FDBK",     &g_delay_fb,   0.35f, "fb",
         "delay feedback  [0 = single tap, 1 = self-oscillating regen]"},
-    {"DLY TIME", nullptr,       0.0f,  "\xe2\x99\xaa",  // ♪
+    {"TIME",     nullptr,       0.0f,  "\xe2\x99\xaa",  // ♪
         "delay time  [tempo-synced: 1/16, 1/16d, 1/8, 1/8d]"},
-    {"REV MIX",  &g_rev_mix,    0.0f,  "w/d",
+    {"MIX",      &g_rev_mix,    0.0f,  "w/d",
         "plate reverb send  [0 = bypass, 1 = full plate ambience]"},
-    {"REV SIZE", &g_rev_size,   0.55f, "RT",
+    {"SIZE",     &g_rev_size,   0.55f, "RT",
         "plate size / decay  [room \xe2\x86\x92 hall \xe2\x86\x92 cathedral]"},
-    {"REV DAMP", &g_rev_damp,   0.35f, "HF",
+    {"DAMP",     &g_rev_damp,   0.35f, "HF",
         "plate HF damping  [bright plate \xe2\x86\x92 dark dub chamber]"},
     };
     int           g_midi_learn_wait = -1;   // param we're waiting on, for the toast
@@ -786,7 +796,7 @@ struct App {
 
     // Pretty-print a MIDI note as "C3", "F#4", etc. — shown in the jam HUD so the
     // user can read the last-played pitch at a glance.
-    std::string midi_note_name(int midi);
+    std::string midi_note_name(int midi) const;
 
     // map a typed letter (c, d, e, f, g, a, b) to a MIDI semitone (0=C .. 11=B)
     int letter_to_semitone(char c);
@@ -828,8 +838,56 @@ struct App {
         return static_cast<std::uint64_t>(g_help_bar_auto_t / kHelpBarChipDur) & 0xFFFF;
     }
 
-    App() { load_preset(0); load_midi_map(); }
+    App() { load_preset(0); load_midi_map(); load_session(); }
     App(const App&)            = delete;
     App& operator=(const App&) = delete;
+    ~App() { save_session(); }
+
+    // ── Discoverability ───────────────────────────────────────────────────────────────────────
+    // Command palette: `:` or Ctrl-K opens it; typing filters every action.
+    bool        g_palette_open = false;
+    std::string g_palette_query;
+    int         g_palette_sel  = 0;
+    // Help: opens on the focused panel; typing searches all of it.
+    std::string g_help_query;
+    Section     g_help_from = Section::Sequencer;   // panel help was opened from
+    // First run: a welcome card until the user plays or opens help/palette.
+    bool        g_first_run = true;
+    // Hover tooltip from the mouse (knob / step / drum description).
+    std::string g_hover_text;
+    // How many more times the "u to undo" hint is appended to toasts.
+    int         g_undo_hints_left = 4;
+    std::string g_last_undo_label;
+    // Terminal rows (for the compact layout); set from ResizeEvent.
+    int         g_term_h = 0;
+    bool        g_theme_chosen = false;   // saved to prefs only once picked
+
+    void toast_undoable(const std::string& what);
+    Element build_knob_strip() const;
+    std::string describe_at(int col, int row) const;
+    // Palette / help helpers.
+    std::vector<const struct Action*> palette_matches() const;
+    void open_palette();
+    void run_action(const struct Action& a);
+    bool handle_palette_key(const Event& ev);
+    bool handle_help_key(const Event& ev);
+    // Actions the palette can run (wrappers over the existing key code).
+    void randomize_focused();
+    void toggle_jam();
+    void toggle_song_mode();
+    void toggle_midi_out();
+    void toggle_midi_sync();
+    void toggle_link();
+    void next_theme();
+    void toggle_synth_mute();
+    void toggle_drums_mute();
+    void toggle_all_mute();
+    void nudge_bpm(float d)   { g_bpm = std::clamp(g_bpm + d, 40.0f, 220.0f);
+                                set_toast("\xe2\x99\xa9 " + std::to_string(static_cast<int>(g_bpm)) + " BPM"); }
+    void nudge_swing(float d) { g_swing = std::clamp(g_swing + d, 0.50f, 0.75f);
+                                set_toast("swing " + std::to_string(static_cast<int>(g_swing * 100 + 0.5f)) + "%"); }
+    // Session: knobs, pattern, drums, theme, focus. Saved on quit.
+    void save_session();
+    void load_session();
 
 };

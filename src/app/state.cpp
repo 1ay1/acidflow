@@ -44,32 +44,51 @@ void App::apply_snapshot(const Snapshot& s) {
 }
 
 // Push the current state onto the undo stack before running a destructive
-// action. Clears the redo stack — a new branch of history invalidates any
-// pending redos, matching what users expect from text editors.
-void App::push_undo() {
-    g_undo_past.push_back(capture_snapshot());
+// action. Clears the redo stack. The label is what the undo toast names.
+void App::push_undo(const char* what) {
+    Snapshot s = capture_snapshot();
+    s.label = what ? what : "change";
+    g_undo_past.push_back(std::move(s));
     if (g_undo_past.size() > kUndoMax) g_undo_past.pop_front();
     g_undo_future.clear();
+    g_last_undo_label = g_undo_past.back().label;
+}
+
+// Toast for a change that can be undone: say what happened, then how to
+// take it back. Teaches `u` the first few times without nagging forever.
+void App::toast_undoable(const std::string& what) {
+    if (g_undo_hints_left > 0) {
+        --g_undo_hints_left;
+        set_toast(what + "  \xc2\xb7  u to undo");
+    } else {
+        set_toast(what);
+    }
 }
 
 
 void App::do_undo() {
     if (g_undo_past.empty()) { set_toast("nothing to undo"); return; }
-    g_undo_future.push_back(capture_snapshot());
+    Snapshot now = capture_snapshot();
+    now.label = g_undo_past.back().label;
+    g_undo_future.push_back(std::move(now));
     if (g_undo_future.size() > kUndoMax) g_undo_future.pop_front();
+    const std::string what = g_undo_past.back().label;
     apply_snapshot(g_undo_past.back());
     g_undo_past.pop_back();
-    set_toast("\xe2\x86\xb6 undo");
+    set_toast("\xe2\x86\xb6 undid " + what + "  \xc2\xb7  U to redo");
 }
 
 
 void App::do_redo() {
     if (g_undo_future.empty()) { set_toast("nothing to redo"); return; }
-    g_undo_past.push_back(capture_snapshot());
+    Snapshot now = capture_snapshot();
+    now.label = g_undo_future.back().label;
+    g_undo_past.push_back(std::move(now));
     if (g_undo_past.size() > kUndoMax) g_undo_past.pop_front();
+    const std::string what = g_undo_future.back().label;
     apply_snapshot(g_undo_future.back());
     g_undo_future.pop_back();
-    set_toast("\xe2\x86\xb7 redo");
+    set_toast("\xe2\x86\xb7 redid " + what);
 }
 
 

@@ -85,31 +85,39 @@ MSVC doesn't advertise `cxx_std_26` to CMake, so the script sets C++23 there and
 
 ## Quickstart
 
+You don't need to learn the keys first. Three of them get you everywhere:
+
 ```
-Tab      cycle focus (Knobs → FX → Sequencer → Drums → Transport)
-Space    play / pause
-? / Esc  open / close the keyboard reference
-r / R    randomize current section / everything
-M        evolve pattern — one small mutation per press
-u / U    undo / redo (32 steps deep, covers every destructive action)
-W        start/stop live recording — take is saved to live_<timestamp>.wav
-         alongside a matching .txt so the session state is recoverable
-T        cycle colour theme
+Space    play / stop
+:        search every action by name and run it  (also Ctrl-K)
+?        help for the panel you're in; type to search it
+```
+
+The first time you start it, a short welcome card shows the rest of the basics. The bottom line always shows the keys for the panel you're in, and hovering anything with the mouse says what it is. Every change can be undone with `u`, and your session (knobs, pattern, drums, theme) is saved when you quit and comes back next time.
+
+The everyday keys:
+
+```
+Tab      move between panels (the orange box)
+arrows   change what's in the box
+r / R    randomize this panel / everything
+M        evolve the pattern a little
+u / U    undo / redo
+W        record a live take
+e / E    bounce WAV + stems / export MIDI
 n / k    song mode / jam mode
-O / I    toggle MIDI out / MIDI sync
-K        toggle Ableton Link (when built with it)
-e / E    bounce WAV + stems / export MIDI (.mid)
-p / P    export / import pattern.txt  (compact base64 for sharing)
 q        quit
 ```
 
 In the **Knobs** section: `← →` selects, `↑ ↓` adjusts by 5%, `[ ]` by 10%, `0` resets, `w` toggles waveform, `l` MIDI learn, `m` mutes the synth voice.
-In the **FX** section: `← →` selects, `↑ ↓` adjusts (DLY TIME steps through the divisions), `0` resets, `l` MIDI learn, `m` mutes the bus.
+In the **FX** section: `← →` selects, `↑ ↓` adjusts (TIME steps through the divisions), `0` resets, `l` MIDI learn, `m` mutes the bus.
 In the **Sequencer**: `← →` selects step, `↑ ↓` semitone, `< >` octave, `a` accent, `s` slide, `m` rest, `v` cycle probability, `j` cycle ratchet, `F/G/H/J` p-lock cutoff/res/env/accent, `L` clear locks, `x` clear step, `c d e f g a b` set root pitch.
 In the **Drums**: `← →` step, `↑ ↓` voice (16 voices, BD → BG), `Space`/`x` toggle hit, `s` mute current voice, `1..9 0` quick-toggle step 1..10 on the selected voice, `[ ]` drum-bus master, `c` clear row, `C` clear kit. You can also click a voice label on the left edge to select it, or right-click a label to clear that row.
 In **Transport**: `↑ ↓` browse presets, `[ ]` BPM ±2, `{ }` pattern length, `- =` swing.
 
-The full keyboard map (and every mouse interaction) is one `?` away inside the app, and lives in the **[Manual](MANUAL.md)**.
+The full keyboard map is one `?` away inside the app (and in the **[Manual](MANUAL.md)**). Help and the command palette are built from the same table as the key handler, so what they say is what the keys do.
+
+On a small terminal (under 38 rows, like the default 80×24) acidflow switches to a compact layout: the knobs become a one-line value strip and the scope and filter chart step aside, so everything still fits.
 
 ## How it sounds
 

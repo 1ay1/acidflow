@@ -190,7 +190,7 @@ void App::apply_midi_cc(int param, float v01) {
 std::string App::midi_param_name(int param) {
     if (param >= 0 && param < K_COUNT) return g_knob_table[param].label;
     const int fx = param - kMidiFxBase;
-    if (fx >= 0 && fx < FX_COUNT) return g_fx_table[fx].label;
+    if (fx >= 0 && fx < FX_COUNT) return kFxLongName[fx];
     return "?";
 }
 
