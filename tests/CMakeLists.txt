@@ -4,6 +4,10 @@ add_test(NAME dsp COMMAND dsp_test)
 
 add_executable(engine_test engine_test.cpp)
 target_link_libraries(engine_test PRIVATE acid_engine acid_warnings)
+# The 303 voice measured against the hardware.
+add_executable(voice_test voice_test.cpp)
+target_link_libraries(voice_test PRIVATE acid_engine acid_warnings)
+add_test(NAME voice COMMAND voice_test)
 # The real-time check asserts on speed, which flakes on loaded CI runners, so
 # it runs as its own `perf`-labelled test (ctest -LE perf skips it).
 add_test(NAME engine COMMAND engine_test --skip headroom)

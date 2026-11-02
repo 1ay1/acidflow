@@ -15,12 +15,18 @@ inline double rms(const float* x, size_t n) {
 inline double db(double v) { return 20.0 * std::log10(v + 1e-30); }
 
 // Magnitude spectrum of x (Hann-windowed, length rounded down to a power of 2).
-inline std::vector<double> spectrum(const std::vector<float>& x) {
+// `bh` = 4-term Blackman-Harris instead: ~-92 dB sidelobes, for measuring
+// aliasing far below what a Hann window's leakage lets you see.
+inline std::vector<double> spectrum(const std::vector<float>& x, bool bh = false) {
     size_t n = 1;
     while (n * 2 <= x.size()) n *= 2;
     std::vector<std::complex<double>> a(n);
-    for (size_t i = 0; i < n; ++i)
-        a[i] = x[i] * (0.5 - 0.5 * std::cos(2 * M_PI * double(i) / double(n)));
+    for (size_t i = 0; i < n; ++i) {
+        const double t = 2 * M_PI * double(i) / double(n);
+        const double w = bh ? 0.35875 - 0.48829 * std::cos(t) + 0.14128 * std::cos(2 * t) - 0.01168 * std::cos(3 * t)
+                            : 0.5 - 0.5 * std::cos(t);
+        a[i] = x[i] * w;
+    }
     for (size_t i = 1, j = 0; i < n; ++i) {
         size_t bit = n >> 1;
         for (; j & bit; bit >>= 1) j ^= bit;

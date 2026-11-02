@@ -167,11 +167,11 @@ float    g_drift_oct  = 0.0f;      // final octave offset applied to pitch
 
 // Oscillator
 float g_phase    = 0.0f;
-float g_osc_prev = 0.0f;           // for 2x upsample linear interp
+float g_sq_shape = 0.0f;           // square edge rounding (one-pole)
 
 // VCF: 303 diode ladder at 2×, between half-band up/down samplers.
 dsp::DiodeLadder   g_vcf;
-dsp::Upsampler2x   g_os_up;
+dsp::FeedbackHP    g_vcf_fbhp;         // the 303's feedback coupling cap
 dsp::Downsampler2x g_os_dn;
 int                g_rev_hold = 0;     // samples to keep the plate running
 // ADAA saturators: pre-filter overdrive (at 1×) and output drive (at 2×).
@@ -182,11 +182,13 @@ dsp::TanhADAA      g_drive_sat;
 float g_fc_sm  = 200.0f;           // smoothed base cutoff in Hz
 float g_res_sm = 0.0f;             // smoothed feedback gain k
 float g_mvol_sm= 0.0f;             // smoothed master volume
+bool  g_smooth_primed = false;     // smoothers jump to target on the first block
 
 // Envelopes (all exponential)
 float g_meg     = 0.0f;            // filter envelope (0..1, triggered on note-on)
 float g_veg     = 0.0f;            // amp envelope (0..1)
-float g_acc_env = 0.0f;            // persistent accent cap voltage (0..1)
+float g_acc_env = 0.0f;            // accent sweep cap voltage (0..1)
+float g_acc_vca = 0.0f;            // accent VCA boost after its RC
 
 // VCA attack ramp. The real 303 has a ~2 ms RC on the VEG rise, and digital
 // simulations that snap from 0→1 instantly click audibly. This phase ramps
@@ -279,6 +281,11 @@ std::atomic<uint32_t> g_sync_beat_seq {0};
 uint32_t              g_sync_beat_seen = 0;
 bool   g_seq_prev_rest   = true;        // for slide-after-rest suppression
 bool   g_seq_was_playing = false;
+// Gate timing (Whittle, 303-slide.html): each 16th is 6 clock pulses and the
+// gate is high for 3.5 of them. A step marked SLIDE keeps its gate high
+// through to the next step instead. g_seq_gate_off is the step-clock sample
+// at which this step's gate falls, or < 0 when it doesn't.
+double g_seq_gate_off    = -1.0;
 
 // Ratchet sub-triggers: when a step has ratchet > 1 we re-fire the same
 // (midi, accent) at regular sub-intervals across the step's duration. First
@@ -618,20 +625,26 @@ double             g_midi_clock_sum    = 0.0;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-// PolyBLEP residual for a waveform discontinuity at phase wrap.
-// `t` is phase in [0,1), `dt` is phase increment per sample.
-// For a saw: subtract this at phase=0; for a square: add at the rising edge,
-// subtract at the falling edge.
-float poly_blep(float t, float dt) {
-    if (t < dt) {
-        float x = t / dt;
-        return x + x - x * x - 1.0f;
-    } else if (t > 1.0f - dt) {
-        float x = (t - 1.0f) / dt;
-        return x * x + x + x + 1.0f;
-    }
-    return 0.0f;
+// 4-point BLEP from the cubic B-spline: the band-limited unit step is the
+// spline's integral, and this returns (that step − the ideal step) for a
+// rising edge of height 1. Nonzero within two samples of the edge, so it is
+// smoother than the 2-point form and aliases ~20 dB less.
+// `t` is phase in [0,1), `dt` the phase increment per sample.
+float poly_blep4(float t, float dt) {
+    float x;   // signed distance to the edge in samples (< 0 just before it)
+    if (t < 2.0f * dt)              x = t / dt;
+    else if (t > 1.0f - 2.0f * dt)  x = (t - 1.0f) / dt;
+    else                            return 0.0f;
+    auto inner = [](float u) { return (2.0f / 3.0f) * u - u * u * u / 3.0f + u * u * u * u / 8.0f; };
+    if (x < -1.0f) { const float u = x + 2.0f; return u * u * u * u / 24.0f; }
+    if (x <  0.0f) return 0.5f - inner(-x);
+    if (x <  1.0f) return -(0.5f - inner(x));
+    const float u = 2.0f - x;
+    return -(u * u * u * u / 24.0f);
 }
+// Saw and square edges are 2 units high (−1 → +1); callers subtract this for
+// the saw's falling wrap and add/subtract it at the square's edges.
+float poly_blep(float t, float dt) { return 2.0f * poly_blep4(t, dt); }
 
 // Exponential knob → Hz. 13 Hz at 0, 5 kHz at 1. Matches measured 303 range.
 float cutoff_knob_to_hz(float knob) {
@@ -691,10 +704,10 @@ void note_commit_on(float freq, bool accent, bool slide) {
         g_gate         = true;
     }
     g_note_accented = accent;
-    if (accent) {
-        float acc = g_params.accent_amt.load();
-        g_acc_env = std::min(1.0f, g_acc_env + 0.45f * acc);
-    }
+    // The accent sweep is driven by the MEG itself (see the sample loop), so
+    // nothing is added here: retriggering the MEG on an accented note is
+    // what charges the sweep capacitor.
+    if (accent && is_slide) g_meg = std::max(g_meg, 1.0f);   // a slid accent still fires the MEG
 }
 
 void note_commit_off() {
@@ -711,6 +724,7 @@ void set_sample_rate(int sr) {
     g_sample_rate = sr > 0 ? sr : kDefaultSampleRate;
     g_plate->set_sample_rate(g_sample_rate);
     g_limiter.set_sample_rate(static_cast<float>(g_sample_rate));
+    g_vcf_fbhp.set(2.0f * static_cast<float>(g_sample_rate));
     g_delay->reset();
 }
 Core() { set_sample_rate(kDefaultSampleRate); }
@@ -865,6 +879,10 @@ void render(float* out, int frames) {
                             g_seq_rat_acc  = acc;
                         }
                         g_seq_prev_rest = false;
+                        // Gate length: 3.5/6 of the step (or of one ratchet
+                        // hit), or held into the next step when it slides.
+                        const double gate_span = step_samples(g_seq_step) / static_cast<double>(rat);
+                        g_seq_gate_off = (sld && rat == 1) ? -1.0 : gate_span * (3.5 / 6.0);
                     } else {
                         // Rest (or rolled-out). Mark so the next step can't
                         // slide into silence.
@@ -873,6 +891,9 @@ void render(float* out, int frames) {
                             g_midi_last_bass_note = 0;
                         }
                         g_seq_prev_rest = true;
+                        g_seq_gate_off  = -1.0;
+                        // A rest closes any gate a slide held open.
+                        note_commit_off();
                     }
                     g_seq_current_step.store(g_seq_step, std::memory_order_relaxed);
                     // Drum lanes: each voice's 16-bit mask picks which of the
@@ -911,20 +932,40 @@ void render(float* out, int frames) {
                     midi_push(1, kMidiBassChan, mv, g_seq_rat_acc ? 127 : 96);
                     g_midi_last_bass_note = mv;
                     g_seq_rat_left -= 1;
+                    // This hit's own gate; the last hit of a slid step holds.
+                    const bool slid = ((g_seq_steps[g_seq_step].load(std::memory_order_relaxed) >> 8) & 4) != 0;
+                    g_seq_gate_off = (slid && g_seq_rat_left == 0)
+                                   ? -1.0 : g_seq_rat_next + g_seq_rat_inc * (3.5 / 6.0);
                     g_seq_rat_next += g_seq_rat_inc;
+                    continue;
+                }
+                // Gate falls 3.5/6 of the way into a non-slid step.
+                if (g_seq_gate_off >= 0.0 && g_seq_clock >= g_seq_gate_off) {
+                    g_seq_gate_off = -1.0;
+                    note_commit_off();
+                    if (g_midi_last_bass_note) {
+                        midi_push(2, kMidiBassChan, g_midi_last_bass_note, 64);
+                        g_midi_last_bass_note = 0;
+                    }
                     continue;
                 }
                 break;
             }
         }
 
-        // How many frames until the next step boundary or ratchet sub-trigger?
+        // How many frames until the next step boundary, ratchet sub-trigger
+        // or gate release? Sub-blocks never straddle any of them, so each
+        // lands on its exact sample.
         int n;
         if (sp_on && g_seq_step >= 0) {
             double remaining = step_samples(g_seq_step) - g_seq_clock;
             if (g_seq_rat_left > 0) {
                 double rr = g_seq_rat_next - g_seq_clock;
                 if (rr > 0.0 && rr < remaining) remaining = rr;
+            }
+            if (g_seq_gate_off >= 0.0) {
+                double gr = g_seq_gate_off - g_seq_clock;
+                if (gr > 0.0 && gr < remaining) remaining = gr;
             }
             int fu = (remaining <= 1.0) ? 1 : static_cast<int>(remaining);
             n = std::min(frames_left, fu);
@@ -970,16 +1011,30 @@ void render(float* out, int frames) {
     const float meg_tau  = g_note_accented ? 0.2f : decay_knob_to_seconds(decay_k);
     const float meg_dec  = std::exp(-dt_s / meg_tau);
 
-    // VEG: hold while gated, snap-off after release. ~3 s when held matches
-    // the fixed VEG RC in the real unit (we don't expose this knob).
-    const float veg_tau  = g_gate ? 3.0f : 0.008f;
-    const float veg_dec  = std::exp(-dt_s / veg_tau);
+    // VEG: the amp envelope. Held, it decays with the 303's fixed RC, about
+    // 1.2 s (Open303 measures 1230 ms); after the gate falls it closes in a
+    // few ms. Both coefficients are kept, and the right one is picked per
+    // sample, so a release that lands mid-block takes effect on that sample.
+    const float veg_dec_held = std::exp(-dt_s / 1.23f);
+    const float veg_dec_rel  = std::exp(-dt_s / 0.008f);
 
-    // Accent cap discharge: τ ≈ 200 ms (C13 = 1 µF / R stock values).
-    const float acc_dec  = std::exp(-dt_s / 0.20f);
+    // Accent sweep circuit (Whittle, "303-unique"). On an accented note the
+    // MEG voltage goes through the ACCENT pot, then a diode and 47k into the
+    // RES pot's second section, which has a 1 µF cap on its far end and its
+    // wiper on the filter's summing node. So the cap charges through ~147k
+    // (τ ≈ 147 ms) when the MEG is above it, and drains through ~100k
+    // (τ ≈ 100 ms) otherwise; the RES pot mixes the raw MEG pulse (RES
+    // low) with the smoothed cap voltage (RES high). Stacked accents charge
+    // the cap higher each time: the rising "wow".
+    const float acc_chg  = 1.0f - std::exp(-dt_s / 0.147f);
+    const float acc_dis  = 1.0f - std::exp(-dt_s / 0.100f);
+    // VCA accent path: MEG through 47k / 33 nF (τ ≈ 1.5 ms) into the VCA.
+    const float acc_vca_coef = 1.0f - std::exp(-dt_s / 0.00155f);
 
-    // Slide: exponential RC on pitch CV, τ = 88 ms.
-    const float slide_coef = 1.0f - std::exp(-dt_s / 0.088f);
+    // Slide: the 303's slide is an RC on the pitch CV, which is in volts per
+    // octave, so it glides evenly in PITCH. 90% of the way in ~60 ms (Whittle;
+    // Open303 uses 60 ms) means τ = 60 / ln(10) ≈ 26 ms.
+    const float slide_coef = 1.0f - std::exp(-dt_s / 0.026f);
 
     // Resonance: map the knob onto the diode ladder's feedback. Self-
     // oscillation sits at DiodeLadder::kSelfOsc; the top of the knob goes a
@@ -991,18 +1046,23 @@ void render(float* out, int frames) {
     // measurements). Beyond that, the filter just screams.
     const float env_oct  = envmod_k * 4.0f;
 
-    // Accent contribution is on its own CV path — the accent cap feeds the
-    // filter summing node directly, bypassing the ENV MOD attenuator. Fixed
-    // max range (~2 octaves), cross-coupled with resonance (at low Q the
-    // accent is largely shunted in the stock schematic).
-    const float acc_oct_max = 2.0f;
-    const float acc_coup    = 0.5f + 0.5f * res_knob;
+    // Accent sweep's reach on the filter, in octaves at full ACCENT. Scaled
+    // so a single full accent at high RES lifts the cutoff ~2 octaves, a
+    // stack of them up to ~3.
+    const float acc_oct_max = 3.0f;
 
     // Base cutoff target (in Hz) — smoothed per-sample to kill zipper noise on
     // discrete knob jumps. 15 ms time constant is short enough to feel
     // instant under the finger but long enough to smear a ≥5% knob step into
     // inaudibility.
     const float fc_base_target  = cutoff_knob_to_hz(fc_knob);
+    // Fresh engine: start the knob smoothers where the knobs are, rather than
+    // gliding in from a default the user never set.
+    if (!g_smooth_primed) {
+        g_fc_sm  = fc_base_target;
+        g_res_sm = k_res;
+        g_smooth_primed = true;
+    }
     const float smooth_coef     = 1.0f - std::exp(-dt_s / 0.015f);
 
     // Precomputed duty cycle (doesn't need to track micro pitch changes). For
@@ -1128,8 +1188,9 @@ void render(float* out, int frames) {
 
     // ── Sample loop (inner — runs for `n` frames of this sub-block) ─────
     for (int i = 0; i < n; i++) {
-        // Slide: exponential approach to target pitch (single-pole LPF)
-        g_current_freq += slide_coef * (g_target_freq - g_current_freq);
+        // Slide: exponential approach to the target in log-frequency.
+        g_current_freq = std::exp2(std::log2(g_current_freq)
+                                   + slide_coef * (std::log2(g_target_freq) - std::log2(g_current_freq)));
 
         // Analog drift: generate a filtered random walk, scale to ±3 cents,
         // apply as a V/oct offset. Freq is recomputed from this offset below.
@@ -1137,26 +1198,7 @@ void render(float* out, int frames) {
         g_drift_lp  += drift_coef * (dn - g_drift_lp);
         g_drift_oct  = g_drift_lp * drift_depth_oct;
         const float freq_with_drift = g_current_freq * std::exp2(g_drift_oct);
-
-        // Oscillator
-        const float phase_inc = freq_with_drift / sr;
-        g_phase += phase_inc;
-        if (g_phase >= 1.0f) g_phase -= 1.0f;
-
-        float osc;
-        if (wf == 0) {
-            // Band-limited saw: naive ramp minus PolyBLEP at the wrap.
-            float naive = 2.0f * g_phase - 1.0f;
-            osc = naive - poly_blep(g_phase, phase_inc);
-        } else {
-            // Band-limited square with pitch-dependent duty. DC-centered.
-            osc = (g_phase < duty) ? 1.0f : -1.0f;
-            osc += poly_blep(g_phase, phase_inc);                // rising edge
-            float tf = g_phase - duty;
-            if (tf < 0.0f) tf += 1.0f;
-            osc -= poly_blep(tf, phase_inc);                     // falling edge
-            osc -= square_dc;
-        }
+        const float phase_inc = freq_with_drift / sr;   // per output sample
 
         // Parameter smoothing (per-sample, one-pole).
         g_fc_sm   += smooth_coef * (fc_base_target - g_fc_sm);
@@ -1165,8 +1207,18 @@ void render(float* out, int frames) {
 
         // Envelope updates (exponential decay — multiply by pre-computed factor)
         g_meg     *= meg_dec;
-        g_veg     *= veg_dec;
-        g_acc_env *= acc_dec;
+        g_veg     *= g_gate ? veg_dec_held : veg_dec_rel;
+
+        // Accent sweep: the MEG (only on accented notes, scaled by ACCENT)
+        // charges the cap through the diode, which then drains.
+        const float acc_drive = g_note_accented ? acc_amt * g_meg : 0.0f;
+        if (acc_drive > g_acc_env) g_acc_env += acc_chg * (acc_drive - g_acc_env);
+        else                       g_acc_env -= acc_dis * g_acc_env;
+        // What reaches the filter: the RES pot crossfades the raw pulse
+        // (fully anticlockwise) and the smoothed cap (fully clockwise).
+        const float acc_cv = (1.0f - res_knob) * acc_drive * (100.0f / 147.0f) + res_knob * g_acc_env;
+        // The VCA's accent boost, softened by its 47k / 33 nF RC.
+        g_acc_vca += acc_vca_coef * (acc_drive - g_acc_vca);
 
         // Fast linear attack ramp for the VCA. Takes max(veg, atk) so an
         // existing tail (from a slide or stacked notes) is never pulled down.
@@ -1177,34 +1229,59 @@ void render(float* out, int frames) {
 
         // Exponential cutoff modulation (V/oct). MEG rides the ENV MOD knob;
         // accent is on its own fixed-range CV path (resonance-coupled).
-        float oct_shift = env_oct * g_meg + acc_oct_max * acc_coup * g_acc_env;
+        float oct_shift = env_oct * g_meg + acc_oct_max * acc_cv;
         float fc_hz     = g_fc_sm * std::exp2(oct_shift);
         fc_hz = std::clamp(fc_hz, 20.0f, std::min(10000.0f, 0.45f * sr));
 
-        // Pre-warped integrator gain is computed with the oversampled rate
-        // just below (fc is already clamped well under it).
-
-        // Pre-filter overdrive with ADAA. Gain-compensated so level stays
-        // close to the input as OD sweeps; OD=0 is near-transparent.
-        const float osc_od = g_od_sat.process(osc * od_pre) * od_norm;
-
-        // 2× through half-band FIRs: filter + output drive at 2·sr.
+        // ── 2× section: oscillator, overdrive, filter, VCA, drive ───────────
+        // The oscillator runs at the doubled rate with a 4-point BLEP, so
+        // edges are band-limited against 2·sr and the half-band decimator
+        // removes what's left above sr/2. Two sub-samples per output sample.
         const float g_vcf_c = std::tan(static_cast<float>(M_PI) * fc_hz * fc_to_stage / sr2);
         // The diode ladder's passband drops as k rises; compensate partly.
         const float makeup  = 1.0f + res_makeup_k * (g_res_sm / dsp::DiodeLadder::kSelfOsc);
 
-        // VCA: VEG × (accent boost on accented notes) × smoothed master.
-        float amp = g_veg;
-        if (g_note_accented) amp *= (1.0f + acc_amt);
+        // VCA: VEG plus the accent's MEG-driven boost, times the master.
+        float amp = g_veg * (1.0f + g_acc_vca);
         amp *= g_mvol_sm;
 
-        float up_e, up_o;
-        g_os_up.process(osc_od, up_e, up_o);
-        float ov[2] = {up_e, up_o};
+        const float inc2 = phase_inc * 0.5f;
+        // Square shaping: a lowpass that tracks the pitch, ~30x the note
+        // (kept under the 2x Nyquist), so every note's square has the same
+        // softened edge rather than one fixed brightness.
+        const float sq_fc = std::min(30.0f * freq_with_drift, 0.4f * sr2);
+        const float sq_shape_coef = 1.0f - std::exp(-2.0f * static_cast<float>(M_PI) * sq_fc / sr2);
+        float ov[2];
         for (float& s : ov) {
+            g_phase += inc2;
+            if (g_phase >= 1.0f) g_phase -= 1.0f;
+            float osc;
+            if (wf == 0) {
+                osc = (2.0f * g_phase - 1.0f) - poly_blep(g_phase, inc2);
+            } else {
+                // The 303's square comes from the saw through a transistor,
+                // with a pitch-dependent duty cycle (~71% low, ~45% high).
+                // Its rounded corners come from the shaper stage after the
+                // oscillator (g_sq_shape), not a waveshaper here, which would
+                // undo the band-limiting.
+                osc = (g_phase < duty) ? 1.0f : -1.0f;
+                osc += poly_blep(g_phase, inc2);
+                float tf = g_phase - duty;
+                if (tf < 0.0f) tf += 1.0f;
+                osc -= poly_blep(tf, inc2);
+                osc -= square_dc;
+                // One-pole lowpass at ~3x the note: the transistor's rounding
+                // of the edges, which takes the upper harmonics down.
+                g_sq_shape += sq_shape_coef * (osc - g_sq_shape);
+                osc = g_sq_shape;
+            }
+            // Pre-filter overdrive with ADAA. Gain-compensated so level stays
+            // close to the input as OD sweeps; OD=0 is near-transparent.
+            const float od = g_od_sat.process(osc * od_pre) * od_norm;
             // Input level into the ladder sets how hard its tanh works; 0.6
-            // keeps it in the warm region at OD=0.
-            float yv = g_vcf.process(s * 0.6f, g_vcf_c, g_res_sm) * (makeup / 0.6f);
+            // keeps it in the warm region at OD=0. A highpass on the
+            // feedback (the 303's coupling cap) softens low-cutoff resonance.
+            float yv = g_vcf.process_fb(od * 0.6f, g_vcf_c, g_res_sm, g_vcf_fbhp) * (makeup / 0.6f);
             yv *= amp;
             // Post-VCA drive (the BA662 compressing before the rail), ADAA.
             s = g_drive_sat.process(yv * drive_pre) * drive_norm;

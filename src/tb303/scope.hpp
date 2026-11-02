@@ -41,13 +41,17 @@ struct ScopeState {
             if (pulled[i] >= 0.01f && pulled[i - 1] < -0.01f) { start = i; break; }
         newest = (newest + 1) % kHistory;
         traces[static_cast<size_t>(newest)].assign(pulled + start, pulled + start + kSamples);
-        // Auto-gain: fit the trace to ~85% of the height. Fast to shrink,
-        // slow to grow, capped so silence doesn't blow noise up.
+        // Auto-gain: fit the loudest recent trace to ~85% of the height.
+        // It follows a peak that holds for about half a second, so the
+        // silent gaps between gated notes don't pump the gain up and make
+        // the next note clip.
         float mx = 0.0f;
         for (int i = 0; i < kSamples; ++i) mx = std::max(mx, std::fabs(pulled[start + i]));
-        const float want = std::clamp(0.85f / std::max(mx, 1e-3f), 1.0f, 8.0f);
+        level = std::max(mx, level * 0.94f);   // ~0.5 s hold at 30 Hz
+        const float want = std::clamp(0.85f / std::max(level, 1e-3f), 1.0f, 8.0f);
         gain += (want < gain ? 0.5f : 0.05f) * (want - gain);
     }
+    float level = 0.0f;                    // recent peak the gain is fitted to
 };
 
 namespace scope_detail {

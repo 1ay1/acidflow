@@ -110,9 +110,84 @@ class DiodeLadder {
 
     float last() const { return y_; }
 
+    // Same filter with a highpass in the feedback path, as in the 303: the
+    // coupling capacitor on the feedback means low frequencies don't feed
+    // back, so resonance fades as the cutoff drops (Stinchcombe's transfer
+    // function, whose shape fits an ~8 Hz one-pole highpass).
+    template <class HP>
+    float process_fb(float x, float g, float k, HP& hp) {
+        // The highpass sits on y4 before it is subtracted. One step of
+        // prediction from the last output keeps the loop delay-free for the
+        // linear part; the HP's own state advances with the committed y4.
+        const float kh = k * hp.gain_at_state();
+        const float y = process_with_offset(x, g, kh, k * hp.offset());
+        hp.commit(y);
+        return y;
+    }
+
+  private:
+    // process() with the feedback written as k·y4 + c, where c is the part
+    // of the highpassed feedback that doesn't depend on this sample's y4.
+    float process_with_offset(float x, float g, float k, float c) {
+        const float a  = g;
+        const float i2 = 1.0f / (1.0f + 2.0f * a);
+        const float G  = a * i2;
+        const float d4   = s_[3] * i2;
+        const float den3 = 1.0f / (1.0f - G * G);
+        const float e3   = G * den3,  f3 = (G * d4 + s_[2] * i2) * den3;
+        const float den2 = 1.0f / (1.0f - G * e3);
+        const float e2   = G * den2,  f2 = (G * f3 + s_[1] * i2) * den2;
+        const float i1   = 1.0f / (1.0f + a);
+        const float G1   = a * i1;
+        const float den1 = 1.0f / (1.0f - G1 * e2);
+        const float e1   = G1 * den1, f1 = (G1 * f2 + s_[0] * i1) * den1;
+        const float A = G * e3 * e2 * e1;
+        const float B = G * (e3 * (e2 * f1 + f2) + f3) + d4;
+        float u = std::clamp((x - k * B - c) / (1.0f + k * A), -3.0f, 3.0f);
+        for (int it = 0; it < 3; ++it) {
+            const float t  = std::tanh(x - k * (A * u + B) - c);
+            const float dr = 1.0f + k * A * (1.0f - t * t);
+            u -= (u - t) / dr;
+        }
+        const float y1 = e1 * u  + f1;
+        const float y2 = e2 * y1 + f2;
+        const float y3 = e3 * y2 + f3;
+        const float y4 = G  * y3 + d4;
+        s_[0] = 2.0f * y1 - s_[0];
+        s_[1] = 2.0f * y2 - s_[1];
+        s_[2] = 2.0f * y3 - s_[2];
+        s_[3] = 2.0f * y4 - s_[3];
+        y_ = y4;
+        return y4;
+    }
+
   private:
     float s_[4] = {};
     float y_    = 0.0f;
+};
+
+// Feedback highpass for DiodeLadder::process_fb: a TPT one-pole HP written
+// so its output is affine in this sample's input (y = gain·x + offset),
+// which keeps the ladder's feedback solve exact.
+struct FeedbackHP {
+    float s = 0.0f;      // integrator state
+    float G = 0.0f;      // g / (1 + g)
+    // Corner ~8 Hz: fitted to how Stinchcombe's measured TB-303 transfer
+    // function loses resonance as the cutoff drops (Open303's 150 Hz removes
+    // far too much below ~400 Hz).
+    void set(float fs, float fc = 8.0f) {
+        const float g = std::tan(kPi * fc / fs);
+        G = g / (1.0f + g);
+    }
+    // HP = x - LP, LP = G·x + (1-G)·s  ⇒  HP = (1-G)·x - (1-G)·s
+    float gain_at_state() const { return 1.0f - G; }
+    float offset() const        { return -(1.0f - G) * s; }
+    void commit(float x) {
+        const float v = G * (x - s);
+        const float lp = v + s;
+        s = lp + v;
+    }
+    void reset() { s = 0.0f; }
 };
 
 // ── 2× oversampling: half-band polyphase FIR ─────────────────────────────────
