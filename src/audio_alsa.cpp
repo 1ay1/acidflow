@@ -22,7 +22,7 @@ std::atomic<bool> g_run{false};
 void audio_thread() {
     std::vector<float> buf(static_cast<size_t>(acid::kBufFrames) * acid::kChannels);
     while (g_run.load(std::memory_order_relaxed)) {
-        acid::render(buf.data(), acid::kBufFrames);
+        acid::render_live(buf.data(), acid::kBufFrames);
         snd_pcm_sframes_t w = snd_pcm_writei(g_pcm, buf.data(), acid::kBufFrames);
         if (w < 0 && snd_pcm_recover(g_pcm, static_cast<int>(w), 1) < 0) break;
     }

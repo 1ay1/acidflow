@@ -479,8 +479,11 @@ Element App::render_frame() const {
         .style   = Style{}.with_fg(brand_col).with_bold(),
         .wrap    = TextWrap::NoWrap,
     }};
+    std::string sub = std::string("  acid bass simulator  \xc2\xb7  ") + acid_audio_driver();
+    if (acid_link_enabled())
+        sub += "  \xc2\xb7  link " + std::to_string(acid_link_peers());
     auto brand_sub = Element{TextElement{
-        .content = std::string("  acid bass simulator  \xc2\xb7  ") + acid_audio_driver(),
+        .content = std::move(sub),
         .style   = Style{}.with_fg(tb303::clr_muted()),
         .wrap    = TextWrap::NoWrap,
     }};

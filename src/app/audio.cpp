@@ -42,7 +42,14 @@ void App::push_params() {
                                 s.lock_env,    s.lock_accent);
     }
     acid_seq_set_pattern_length(g_pattern_length);
-    acid_seq_set_bpm(g_bpm);
+    if (acid_link_enabled()) {
+        // Link owns the tempo. A local BPM edit goes to the session; otherwise
+        // follow whatever the session says.
+        if (g_bpm != g_link_bpm_sent) { acid_link_set_tempo(g_bpm); g_link_bpm_sent = g_bpm; }
+        else { g_bpm = acid_current_bpm(); g_link_bpm_sent = g_bpm; }
+    } else {
+        acid_seq_set_bpm(g_bpm);
+    }
     acid_seq_set_swing(g_swing);
 
     // Drum lanes: pack each row's 16 bool cells into a uint16 mask, then push

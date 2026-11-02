@@ -273,6 +273,10 @@ std::atomic<float>    g_seq_step_phase           {0.0f};
 
 double g_seq_clock       = 0.0;         // samples into the current step
 int    g_seq_step        = -1;          // playing step (-1 = idle)
+// Beat position posted by an external clock (Link); seq bumps per post.
+std::atomic<double>   g_sync_beat     {0.0};
+std::atomic<uint32_t> g_sync_beat_seq {0};
+uint32_t              g_sync_beat_seen = 0;
 bool   g_seq_prev_rest   = true;        // for slide-after-rest suppression
 bool   g_seq_was_playing = false;
 
@@ -772,6 +776,30 @@ void render(float* out, int frames) {
         g_seq_step_phase.store(0.0f,  std::memory_order_relaxed);
     }
     g_seq_was_playing = sp_on;
+
+    // External beat sync (Ableton Link): if a target beat was posted, move the
+    // step clock to it. Small drift is nudged out over a few blocks; a big
+    // jump (joining a session, tempo leap) snaps.
+    if (sp_on && g_sync_beat_seq.load(std::memory_order_acquire) != g_sync_beat_seen) {
+        g_sync_beat_seen = g_sync_beat_seq.load(std::memory_order_relaxed);
+        const double beat = g_sync_beat.load(std::memory_order_relaxed);
+        // 4 sixteenths per beat. Position within the pattern, in steps.
+        const double steps = std::fmod(std::max(0.0, beat) * 4.0, static_cast<double>(plen));
+        const int    want_step = static_cast<int>(steps);
+        const double want_clock = (steps - want_step) * step_samples(want_step);
+        // Where we are now, in the same units.
+        double have = g_seq_step < 0 ? 0.0 : g_seq_step + g_seq_clock / step_samples(g_seq_step);
+        double err = steps - have;
+        if (err >  plen / 2.0) err -= plen;
+        if (err < -plen / 2.0) err += plen;
+        if (g_seq_step < 0 || std::fabs(err) > 0.5) {
+            // Snap: land just before the wanted step so it fires on time.
+            g_seq_step  = (want_step + plen - 1) % plen;
+            g_seq_clock = step_samples(g_seq_step) + want_clock - 1.0;
+        } else {
+            g_seq_clock += err * 0.25 * step_samples(std::max(0, g_seq_step));
+        }
+    }
 
     // ── Sub-block loop ─────────────────────────────────────────────────────
     // Slice the audio block at step boundaries so note_on fires on the exact
@@ -1565,6 +1593,10 @@ void copy_settings(const Core& from, Core& to) {
 void set_sample_rate(int sr)          { g_core->set_sample_rate(sr); }
 int  sample_rate()                    { return g_core->sample_rate(); }
 void render(float* out, int frames)   { g_core->render(out, frames); }
+void render_live(float* out, int frames) {
+    acid_link_tick(frames, g_core->sample_rate());
+    g_core->render(out, frames);
+}
 float cutoff_knob_hz(float k) {
     return 13.0f * std::pow(5000.0f / 13.0f, std::clamp(k, 0.0f, 1.0f));
 }
@@ -1878,6 +1910,15 @@ void acid_midi_note_off_ext(int /*midi_note*/) {
 // Current BPM the engine is acting on — clock-out pacing derives from this.
 float acid_current_bpm(void) {
     return acid::cur()->g_seq_bpm.load(std::memory_order_relaxed);
+}
+
+// Align the sequencer to an external beat position (Ableton Link). Call per
+// audio block with the beat at the block's first sample.
+void acid_seq_sync_beat(double beat, float bpm) {
+    acid::Core* c = acid::cur();
+    if (bpm > 0.0f) c->g_seq_bpm.store(bpm, std::memory_order_relaxed);
+    c->g_sync_beat.store(beat, std::memory_order_relaxed);
+    c->g_sync_beat_seq.fetch_add(1, std::memory_order_release);
 }
 int acid_is_playing(void) {
     return acid::cur()->g_seq_playing.load(std::memory_order_relaxed) ? 1 : 0;

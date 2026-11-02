@@ -293,6 +293,7 @@ struct App {
     std::mt19937 rng_{std::random_device{}()};
     tb303::ScopeState       g_scope;
     tb303::SpectrumSnapshot g_spectrum;
+    float                   g_link_bpm_sent = 0.0f;   // last BPM we pushed to Link
 
     // ─────────────────────────────────────────────────────────────────────────────
     // State

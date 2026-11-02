@@ -29,7 +29,7 @@ constexpr UInt32 kFrameBytes = sizeof(float) * acid::kChannels;
 
 void render_cb(void* /*user*/, AudioQueueRef q, AudioQueueBufferRef buf) {
     float* out = static_cast<float*>(buf->mAudioData);
-    acid::render(out, acid::kBufFrames);
+    acid::render_live(out, acid::kBufFrames);
     buf->mAudioDataByteSize = acid::kBufFrames * kFrameBytes;
     AudioQueueEnqueueBuffer(q, buf, 0, nullptr);
 }

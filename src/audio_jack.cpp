@@ -74,7 +74,7 @@ int process(jack_nframes_t n, void*) {
     jack_nframes_t done = 0;
     while (done < n) {
         const int chunk = static_cast<int>(std::min<jack_nframes_t>(n - done, acid::kBufFrames));
-        acid::render(g_scratch.data(), chunk);
+        acid::render_live(g_scratch.data(), chunk);
         for (int i = 0; i < chunk; ++i) {
             l[done + i] = g_scratch[2 * i];
             r[done + i] = g_scratch[2 * i + 1];

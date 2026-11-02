@@ -555,6 +555,15 @@ void App::handle_event(const Event& ev) {
             : "MIDI sync off");
         return;
     }
+    // Ableton Link: share tempo and bar phase with other apps on the network.
+    if (key(ev, 'K')) {
+        const bool on = !acid_link_enabled();
+        acid_link_enable(on ? 1 : 0);
+        g_link_bpm_sent = g_bpm;
+        if (on && !acid_link_enabled()) set_toast("Link isn't in this build (-DACIDFLOW_LINK=ON)");
+        else set_toast(on ? "\xe2\x97\x8e Link on" : "Link off");
+        return;
+    }
     // MIDI learn: `l` arms the focused knob or FX; the next CC binds to it.
     // `l` again while armed cancels.
     if (key(ev, 'l') && (g_focus == Section::Knobs || g_focus == Section::FX)) {

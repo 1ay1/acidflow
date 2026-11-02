@@ -67,7 +67,7 @@ void audio_thread() {
         while (done < avail) {
             UINT32 chunk = std::min<UINT32>(avail - done,
                                             static_cast<UINT32>(acid::kBufFrames));
-            acid::render(lr.data(), static_cast<int>(chunk));
+            acid::render_live(lr.data(), static_cast<int>(chunk));
             // Stereo into the first two channels (mono devices get the sum),
             // any surround channels stay silent.
             for (UINT32 i = 0; i < chunk; ++i) {

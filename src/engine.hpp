@@ -19,6 +19,8 @@ inline constexpr int kChannels          = 2;
 void set_sample_rate(int sr);
 int  sample_rate();
 void render(float* out, int frames);
+// What device backends call: syncs to Ableton Link (if on), then renders.
+void render_live(float* out, int frames);
 
 // The CUTOFF knob's base frequency in Hz (before envelope and accent).
 float cutoff_knob_hz(float knob01);
