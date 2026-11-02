@@ -83,8 +83,17 @@ if(ACIDFLOW_BUILD_APP)
         message(FATAL_ERROR "Unsupported platform: no audio backend available")
     endif()
 
+    # The UI (everything but main and the device backends), shared by the
+    # app and the headless UI tests.
+    add_library(acid_app STATIC
+        src/app/state.cpp src/app/presets.cpp src/app/randomize.cpp src/app/persist.cpp
+        src/app/song.cpp src/app/export.cpp src/app/audio.cpp src/app/input.cpp
+        src/app/view.cpp)
+    target_include_directories(acid_app PUBLIC src)
+    target_link_libraries(acid_app PUBLIC acid_engine maya::app)
+
     add_executable(acidflow src/main.cpp ${ACIDFLOW_PLATFORM_SOURCES})
-    target_link_libraries(acidflow PRIVATE acid_engine maya::app ${ACIDFLOW_PLATFORM_LIBS})
+    target_link_libraries(acidflow PRIVATE acid_app ${ACIDFLOW_PLATFORM_LIBS})
     if(UNIX)
         find_package(Threads REQUIRED)
         target_link_libraries(acidflow PRIVATE Threads::Threads)
