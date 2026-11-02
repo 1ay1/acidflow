@@ -10,6 +10,9 @@ extern "C" {
 
 void acid_start(void);
 void acid_stop(void);
+// Name of the running audio driver: "jack", "alsa", "coreaudio", "wasapi"
+// or "none".
+const char* acid_audio_driver(void);
 
 // All knobs take normalised 0..1 float, except set_waveform (0=saw,1=square)
 // and set_tuning_semi which is ±12 semitones.

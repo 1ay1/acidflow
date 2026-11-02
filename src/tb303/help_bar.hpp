@@ -48,6 +48,7 @@ inline int u8cols(const char* s) {
             items.push_back({"[  ]", "coarse"});
             items.push_back({"0",    "reset"});
             items.push_back({"w",    "wave"});
+            items.push_back({"l",    "midi learn"});
             items.push_back({"m",    "mute"});
             break;
         case Section::FX:
@@ -55,6 +56,7 @@ inline int u8cols(const char* s) {
             items.push_back({"\xe2\x86\x91\xe2\x86\x93", "value"});
             items.push_back({"[  ]", "coarse"});
             items.push_back({"0",    "reset"});
+            items.push_back({"l",    "midi learn"});
             items.push_back({"m",    "mute"});
             break;
         case Section::Sequencer:

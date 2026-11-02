@@ -14,6 +14,7 @@
 //   * `?` brings up a full keyboard reference.
 
 #include "audio.hpp"
+#include "midi_core.hpp"
 #include "widgets.hpp"
 
 #include <algorithm>
@@ -399,6 +400,17 @@ static FxDesc g_fx_table[FX_COUNT] = {
 };
 
 static const char* kDlyDivNames[4] = {"1/16", "1/16d", "1/8", "1/8d"};
+
+// ── MIDI learn ──────────────────────────────────────────────────────────────────
+// Param ids: knobs are 0..K_COUNT-1, FX are kMidiFxBase + idx. CC values are
+// applied on the UI tick so knob state stays owned here.
+static constexpr int kMidiFxBase = 16;
+static int           g_midi_learn_wait = -1;   // param we're waiting on, for the toast
+static std::array<uint32_t, acid::midi::kMaxParams> g_midi_cc_seen{};
+
+static void apply_midi_cc(int param, float v01);
+static void save_midi_map();
+static void poll_midi_cc();
 
 static std::string format_fx(int idx) {
     char buf[32];
@@ -2169,6 +2181,7 @@ static bool export_wav() {
     if (ec) return false;
 
     auto path = config_dir() / "bounce.wav";
+    (void)path;
     // Pack each step into the 32-bit layout acid_render_wav → acid_seq_set_step
     // unpacks: midi in the low byte, flags at bit 8 (rest=1|acc=2|slide=4),
     // prob at bit 11 (7 bits), ratchet-1 at bit 18 (2 bits).
@@ -2186,18 +2199,15 @@ static bool export_wav() {
                  | ((p     & 0x7F) << 11)
                  | ((r     & 0x3)  << 18);
     }
-    // Stop live audio so we don't race the engine's global state.
-    bool was_playing = g_playing;
-    stop_playback();
-    acid_stop();
+    // The bounce runs on a private engine (copying the live knobs), so the
+    // audio thread keeps playing. Stems are the dry synth and drum buses.
+    const auto dir = config_dir();
+    int rc = acid_render_stems((dir / "bounce.wav").string().c_str(),
+                               (dir / "bounce_synth.wav").string().c_str(),
+                               (dir / "bounce_drums.wav").string().c_str(),
+                               notes, g_pattern_length, g_bpm, g_swing, /*loops=*/4);
 
-    int rc = acid_render_wav(path.string().c_str(), notes,
-                             g_pattern_length, g_bpm, g_swing, /*loops=*/4);
-
-    acid_start();                        // restart the live audio thread
-    if (was_playing) start_playback();
-
-    set_toast(rc == 0 ? "\xe2\x9c\x93 wav \xe2\x86\x92 bounce.wav"
+    set_toast(rc == 0 ? "\xe2\x9c\x93 wav \xe2\x86\x92 bounce.wav + stems"
                       : "\xe2\x9c\x97 wav failed");
     return rc == 0;
 }
@@ -2739,6 +2749,7 @@ static void push_params() {
 }
 
 static void tick(float dt) {
+    poll_midi_cc();
     push_params();
 
     // Toast fade runs whether or not playback is active.
@@ -2833,6 +2844,68 @@ static void stop_playback() {
     g_playing = false;
     g_current_step = -1;
     acid_seq_stop();
+}
+
+// ── MIDI learn / CC ──────────────────────────────────────────────────────────────
+
+static void apply_midi_cc(int param, float v01) {
+    if (param >= 0 && param < K_COUNT) {
+        if (param == K_WAVE) { g_wave = v01 >= 0.5f ? 1 : 0; return; }
+        *g_knob_table[param].value = v01;
+        return;
+    }
+    const int fx = param - kMidiFxBase;
+    if (fx < 0 || fx >= FX_COUNT) return;
+    if (fx == FX_DTIME) { g_delay_div = std::clamp(static_cast<int>(v01 * 4.0f), 0, 3); return; }
+    *g_fx_table[fx].value = v01;
+}
+
+static std::string midi_param_name(int param) {
+    if (param >= 0 && param < K_COUNT) return g_knob_table[param].label;
+    const int fx = param - kMidiFxBase;
+    if (fx >= 0 && fx < FX_COUNT) return g_fx_table[fx].label;
+    return "?";
+}
+
+// Called from tick(): apply new CC values and report a finished learn.
+static void poll_midi_cc() {
+    auto& cc = acid::midi::cc();
+    for (int p = 0; p < acid::midi::kMaxParams; ++p) {
+        const uint32_t s = cc.seq[static_cast<size_t>(p)].load(std::memory_order_acquire);
+        if (s == g_midi_cc_seen[static_cast<size_t>(p)]) continue;
+        g_midi_cc_seen[static_cast<size_t>(p)] = s;
+        apply_midi_cc(p, cc.value[static_cast<size_t>(p)].load() / 127.0f);
+    }
+    if (g_midi_learn_wait >= 0 && cc.learn_param.load() < 0) {
+        const int got = cc.last_learned_cc.load();
+        if (got >= 0) {
+            set_toast("\xe2\x99\xaa CC " + std::to_string(got) + " \xe2\x86\x92 "
+                      + midi_param_name(g_midi_learn_wait));
+            save_midi_map();
+        }
+        g_midi_learn_wait = -1;
+    }
+}
+
+// One "cc param" pair per line in ~/.config/acidflow/midi_map.txt.
+static void save_midi_map() {
+    std::error_code ec;
+    std::filesystem::create_directories(config_dir(), ec);
+    std::ofstream f(config_dir() / "midi_map.txt");
+    auto& cc = acid::midi::cc();
+    for (int c = 0; c < acid::midi::kNumCC; ++c) {
+        const int p = cc.cc_to_param[static_cast<size_t>(c)].load();
+        if (p >= 0) f << c << ' ' << p << '\n';
+    }
+}
+
+static void load_midi_map() {
+    std::ifstream f(config_dir() / "midi_map.txt");
+    auto& cc = acid::midi::cc();
+    int c = 0, p = 0;
+    while (f >> c >> p)
+        if (c >= 0 && c < acid::midi::kNumCC && p >= 0 && p < acid::midi::kMaxParams)
+            cc.cc_to_param[static_cast<size_t>(c)].store(static_cast<int8_t>(p));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3427,6 +3500,22 @@ static void handle_event(const Event& ev) {
         set_toast(g_midi_sync
             ? "\xe2\x99\xaa MIDI sync on  (waiting for clock/start)"
             : "MIDI sync off");
+        return;
+    }
+    // MIDI learn: `l` arms the focused knob or FX; the next CC binds to it.
+    // `l` again while armed cancels.
+    if (key(ev, 'l') && (g_focus == Section::Knobs || g_focus == Section::FX)) {
+        auto& cc = acid::midi::cc();
+        const int param = g_focus == Section::Knobs ? g_knob_sel : kMidiFxBase + g_fx_sel;
+        if (cc.learn_param.load() == param) {
+            cc.learn_param.store(-1);
+            set_toast("MIDI learn cancelled");
+        } else {
+            cc.last_learned_cc.store(-1);
+            cc.learn_param.store(param);
+            g_midi_learn_wait = param;
+            set_toast("\xe2\x99\xaa MIDI learn: move a controller\xe2\x80\xa6");
+        }
         return;
     }
     // Song mode chain: step through saved slots 1..9 on each pattern wrap.
@@ -4236,7 +4325,7 @@ static Element render_frame() {
         .wrap    = TextWrap::NoWrap,
     }};
     auto brand_sub = Element{TextElement{
-        .content = "  acid bass simulator",
+        .content = std::string("  acid bass simulator  \xc2\xb7  ") + acid_audio_driver(),
         .style   = Style{}.with_fg(tb303::clr_muted()),
         .wrap    = TextWrap::NoWrap,
     }};
@@ -4439,6 +4528,7 @@ static_assert(maya::Program<Acidflow>);
 
 int main() {
     load_preset(0);
+    load_midi_map();
     acid_start();
     acid_midi_start();   // No-op on platforms without a MIDI backend.
 

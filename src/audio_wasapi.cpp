@@ -155,4 +155,6 @@ void acid_stop() {
     if (g_com_init) { CoUninitialize(); g_com_init = false; }
 }
 
+const char* acid_audio_driver(void) { return g_client ? "wasapi" : "none"; }
+
 }  // extern "C"
