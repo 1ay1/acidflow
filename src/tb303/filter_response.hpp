@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <cstdio>
 #include <string>
 #include <string_view>
@@ -17,14 +18,40 @@
 #include <maya/maya.hpp>
 
 #include "../audio.hpp"
+#include "../engine.hpp"
 #include "theme.hpp"
 
 namespace tb303 {
 
 using namespace maya;
 
-[[nodiscard]] inline Element build_filter_response(float cutoff01, float res01) {
-    float fc       = 80.0f + cutoff01 * 6000.0f;
+// The latest spectrum, filled in update (acid_fft_bins) so the view is pure.
+struct SpectrumSnapshot {
+    static constexpr int kBins = 1024;
+    std::vector<float> mags = std::vector<float>(kBins, 0.0f);
+    int bins = 0;
+    int sample_rate = 44100;
+    void advance() {
+        bins = acid_fft_bins(mags.data(), kBins);
+        sample_rate = acid_sample_rate();
+    }
+};
+
+// |H(jω)| of the 303 diode ladder in dsp.hpp with feedback k, as a function
+// of f / f_stage. Same linear model the engine solves, so the chart is the
+// filter you hear.
+inline float diode_ladder_mag(float f_over_stage, float k) {
+    const std::complex<float> s(0.0f, f_over_stage);
+    // Open loop: 1 / (s^4 + 7s^3 + 15s^2 + 10s + 1)
+    const auto s2 = s * s;
+    const auto d  = s2 * s2 + 7.0f * s2 * s + 15.0f * s2 + 10.0f * s + 1.0f;
+    const auto h  = 1.0f / d;
+    return std::abs(h / (1.0f + k * h));
+}
+
+[[nodiscard]] inline Element build_filter_response(float cutoff01, float res01,
+                                                    const SpectrumSnapshot& spec) {
+    float fc       = acid::cutoff_knob_hz(cutoff01);
     float live_fc  = acid_live_fc();         // post-envelope / post-accent
 
     char fc_buf[16];
@@ -46,7 +73,7 @@ using namespace maya;
         .wrap    = TextWrap::NoWrap,
     }};
 
-    auto chart = dsl::fill([cutoff01, res01, live_fc](int w, int h) -> Element {
+    auto chart = dsl::fill([fc, res01, live_fc, &spec](int w, int h) -> Element {
         // 8-level vertical block chars (empty..full). blocks[0] is a space so
         // the background in empty cells renders as pure background colour.
         static constexpr const char* blocks[] = {
@@ -60,9 +87,10 @@ using namespace maya;
         int chart_w   = std::max(4, w);
 
         float f_lo = 40.0f, f_hi = 12000.0f;
-        float fc = 80.0f + cutoff01 * 6000.0f;
-        float peak_gain = 1.0f + res01 * 3.5f;
-        float damp      = 0.9f - res01 * 0.7f;
+        // Same feedback mapping as the engine (res knob → k), and the stage
+        // frequency sits below the peak by the ladder's kResRatio.
+        const float k_fb    = res01 * 1.04f * 18.39f;
+        const float f_stage = fc / 1.1952286f;
 
         // ── Live FFT overlay ────────────────────────────────────────────────
         // Pull a magnitude spectrum from the engine and project each bin onto
@@ -71,10 +99,10 @@ using namespace maya;
         // now" sitting on top of "the shape the filter allows". When playing,
         // they should roughly coincide under the cutoff and duck above it —
         // which is exactly the resonance bump made visible.
-        constexpr int kFftBins = 1024;
-        static std::vector<float> fft_mags(kFftBins, 0.0f);
-        int got_bins = acid_fft_bins(fft_mags.data(), kFftBins);
-        int sr       = acid_sample_rate();
+        constexpr int kFftBins = SpectrumSnapshot::kBins;
+        const auto& fft_mags = spec.mags;
+        int got_bins = std::min(spec.bins, kFftBins);
+        int sr       = spec.sample_rate;
         std::vector<float> fft_col(static_cast<size_t>(chart_w), 0.0f);
         if (got_bins > 0 && sr > 0) {
             const float bin_hz = static_cast<float>(sr) / 2048.0f;
@@ -109,23 +137,18 @@ using namespace maya;
             fft_row[static_cast<size_t>(c)] = std::clamp(row, 0, chart_h - 1);
         }
 
-        // magnitude per column on a log frequency sweep
+        // |H(f)| of the ladder on a log frequency sweep, normalised to its max
+        // so the resonant peak sits at the top of the chart.
         std::vector<float> raw(static_cast<size_t>(chart_w));
         float mx = 0.0f;
         for (int i = 0; i < chart_w; ++i) {
             float t = static_cast<float>(i) / static_cast<float>(chart_w - 1);
             float f = f_lo * std::pow(f_hi / f_lo, t);
-            float r = f / fc;
-            float denom = std::sqrt((1.0f - r * r) * (1.0f - r * r)
-                                  + damp * damp * r * r);
-            float m = 1.0f / denom;
-            float peak = peak_gain * std::exp(
-                -std::pow((std::log(f) - std::log(fc)) / 0.25f, 2.0f));
-            m += peak * 0.25f;
+            float m = diode_ladder_mag(f / f_stage, std::min(k_fb, 18.0f));
             raw[static_cast<size_t>(i)] = m;
             mx = std::max(mx, m);
         }
-        if (mx < 1e-3f) mx = 1.0f;
+        if (mx < 1e-9f) mx = 1.0f;
 
         // convert to normalised 0..1 height on a -40..+3 dB axis
         std::vector<float> norm(static_cast<size_t>(chart_w));

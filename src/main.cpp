@@ -27,6 +27,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <random>
 #include <string>
@@ -39,56 +40,6 @@ using namespace maya::dsl;
 using tb303::Section;
 using tb303::StepData;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Global model
-// ─────────────────────────────────────────────────────────────────────────────
-// We use file-scope globals (as in maya's own music.cpp example) because the
-// simple run(event_fn, render_fn) API expects plain closures. For a synth
-// this also matches the reality that audio params really are global state.
-
-// Knobs — normalised 0..1 except k_tuning which is 0..1 mapped to ±12 semis
-// and k_wave which is an enum.
-//
-// Defaults roughly match a "classic acid" 303 knob photo: cutoff a little
-// under noon (~120 Hz so the envelope has room to scream up), resonance
-// three-quarters-right for Q without full self-osc, env-mod around noon,
-// decay toward the short end (~0.4 s sweep — quick squelch, not pads), and
-// a moderate accent so two stacked accents still have headroom.
-static float g_tune      = 0.50f;   // 0.5 → 0 semitones
-static float g_cutoff    = 0.40f;
-static float g_resonance = 0.75f;
-static float g_env_mod   = 0.65f;
-static float g_decay     = 0.30f;
-static float g_accent    = 0.65f;
-static float g_drive     = 0.20f;   // output tanh pre-gain
-static float g_volume    = 0.65f;
-static int   g_wave      = 0;       // 0 = saw, 1 = square
-
-// Sequencer
-static std::array<StepData, 16> g_steps{};
-static int   g_pattern_length = 16;
-static int   g_current_step   = -1;     // -1 while stopped
-static int   g_preset_index   = 0;
-static double g_step_clock    = 0.0;    // accumulated seconds within current step
-
-// Transport — 122 BPM lands between the canonical acid tempos: Phuture
-// "Acid Tracks" at 120, Josh Wink "Higher State" at 124, Adonis "No Way
-// Back" at 122. 128+ pushes into acid techno territory (Beltram, Hawtin).
-static bool  g_playing = false;
-static float g_bpm     = 122.0f;
-// Swing: 0.50 = straight 16ths, 0.62 ≈ classic MPC swing, 0.66 = hard
-// shuffle. Even-indexed steps (0,2,4…) play on the grid; odd-indexed steps
-// are delayed by (swing − 0.5) × one-pair duration so the pair still sums
-// to two 16ths. Applies uniformly to all steps so every pattern grooves.
-static float g_swing   = 0.50f;
-
-// Song mode (Phase 4.1). When enabled, the transport auto-advances through
-// saved pattern slots on each pattern wrap — classic hardware "chain" mode.
-// g_song_slot is the slot currently loaded (1..9, 0 = none). Wrap detection
-// piggy-backs on g_current_step going backwards between ticks, so no extra
-// audio-thread coupling is needed.
-static bool g_song_mode = false;
-static int  g_song_slot = 0;
 
 // Per-slot bar count for song mode. Each slot (1..9) holds for N bars (N
 // pattern wraps) before the chain advances. Defaults to 4 bars — one
@@ -97,55 +48,6 @@ static int  g_song_slot = 0;
 // values to shape a full song: intro 32 → build 32 → peak 64 → outro 16 etc.
 // Session-only; not persisted across restarts.
 static constexpr int kDefaultSongBars = 4;
-static std::array<int, 10> g_song_bars{
-    kDefaultSongBars, kDefaultSongBars, kDefaultSongBars, kDefaultSongBars,
-    kDefaultSongBars, kDefaultSongBars, kDefaultSongBars, kDefaultSongBars,
-    kDefaultSongBars, kDefaultSongBars
-};
-static int g_song_bars_left = 0;            // decrements each pattern wrap
-
-// Knob automation — arm a knob in DAW-style "write mode" while playing. Each
-// UI tick, the current global-knob value is written into the current step's
-// p-lock slot and the lock bit is set. Only cutoff/res/env/accent have
-// p-lock slots in the engine, so those are the only automatable knobs. To
-// clear a recorded sweep: press `L` in the sequencer (all-locks clear) on
-// the steps you want to unlock, or re-arm and walk through with the knob
-// held at the value you want.
-//   Index: 0=CUTOFF 1=RES 2=ENV 3=ACCENT.
-static std::array<bool, 4> g_auto_arm{};
-
-// Jam mode (Phase 4.2). When enabled, the sequencer is silenced and the
-// computer keyboard becomes a two-octave piano (tracker layout). Terminals
-// don't deliver key-release events, so each press retriggers a short gate
-// (g_jam_gate_s) that tick() closes with acid_note_off when it expires.
-// g_jam_last_midi drives the "PLAYING: C3" display; -1 means silent.
-static bool  g_jam_mode      = false;
-static int   g_jam_octave    = 3;      // C3 = MIDI 36 — classic bass starting octave
-static bool  g_jam_accent    = false;  // toggled with '
-static bool  g_jam_slide     = false;  // toggled with ;
-static float g_jam_gate_s    = 0.0f;
-static int   g_jam_last_midi = -1;
-
-// FX rack. Separate from the core voice knobs because the signal chain
-// splits clearly at the VCA output: everything before is "synth voice",
-// everything after is "effects". Order = (od pre-filter) → delay → reverb
-// so the FX row is read left-to-right as signal flow.
-static float g_od_amt     = 0.0f;          // pre-filter overdrive
-static float g_delay_mix  = 0.0f;          // 0 = bypass
-static float g_delay_fb   = 0.35f;
-static int   g_delay_div  = 2;             // 0=1/16, 1=1/16d, 2=1/8, 3=1/8d
-static float g_rev_mix    = 0.0f;
-static float g_rev_size   = 0.55f;
-static float g_rev_damp   = 0.35f;
-
-// MIDI I/O (Phase 5). Out = forward note events + drum hits + clock to the
-// MIDI backend port. In sync = slave our BPM + transport to incoming MIDI
-// clock / start / stop. Note-in (controller → bass voice) is always on when
-// the backend is up; these flags only gate the tempo-sync and event-output
-// paths so a user can have a keyboard plugged in without accidentally
-// broadcasting clock to everything downstream.
-static bool g_midi_out  = false;
-static bool g_midi_sync = false;
 
 // Drum machine (Phase 4.3). Flat bool grid — nine voices (rows) × 16 steps
 // (cols). Pushed into the engine each tick via acid_seq_set_drum_lane; the
@@ -156,11 +58,6 @@ static constexpr const char* kDrumLabels[kDrumVoices] = {
     "BD","SD","CH","OH","CL","LT","HT","RS","CB","SH","TB","CG",
     "MT","CY","RD","BG"
 };
-static std::array<std::array<bool, 16>, kDrumVoices> g_drums{};
-static int   g_drum_voice_sel = 0;     // which row (voice) is being edited
-static int   g_drum_step_sel  = 0;     // which step in that row
-static float g_drum_master    = 1.0f;  // drum-bus master send (0 = silent)
-static std::array<bool, kDrumVoices> g_drum_voice_mute{};  // per-voice mute (s key)
 // Default per-voice gains — match the engine's initial g_seq_drum_gain values.
 static constexpr float kDrumDefaultGain[kDrumVoices] = {
     0.95f, 0.70f, 0.35f, 0.40f, 0.60f,
@@ -168,65 +65,8 @@ static constexpr float kDrumDefaultGain[kDrumVoices] = {
     0.30f, 0.35f, 0.65f,
     0.78f, 0.50f, 0.32f, 0.55f
 };
-
-// Per-section mute toggles — `m` in any non-sequencer section flips the
-// relevant flag. Sequencer keeps `m` for its per-step rest toggle (each step
-// is its own "channel"). Mutes are applied right before pushing volumes to
-// the engine so the rest of the state stays intact.
-static bool  g_synth_mute  = false;    // silences the 303 voice (knobs/FX/seq)
-static bool  g_drums_mute  = false;    // silences the drum bus
-
-// UI focus
-static Section g_focus      = Section::Sequencer;
-static int     g_knob_sel   = 2;   // K_CUTOFF — the signature 303 knob
-static int     g_fx_sel     = 0;   // currently-focused FX knob
-static int     g_step_sel   = 0;
-static bool    g_help_open  = false;
-
-// Take picker modal — `Y` opens it, Up/Down move the cursor, Enter loads the
-// selected live_<timestamp>.txt into the live pattern state, Esc cancels.
-// Populated by refresh_takes() at open time; sorted newest-first so the take
-// the user just recorded is at the top.
-static bool                              g_takes_open = false;
-static int                               g_takes_sel  = 0;
-static std::vector<std::filesystem::path> g_takes_entries;
-
-// Beat-sync animation state. g_step_phase ramps 0..1 within the current step
-// (wraps each trigger) so the UI can fade flashes smoothly. g_toast is a
-// transient banner — whenever an action fires (randomize / save / load /
-// export) we set g_toast + g_toast_t and the title bar shows it, fading out
-// over ~1.5s.
-static float       g_step_phase = 0.0f;
-static std::string g_toast;
-static float       g_toast_t    = 0.0f;    // seconds remaining
 static constexpr float kToastDur = 1.5f;
-
-// Terminal size, from ResizeEvent (the help bar marquee needs the width).
-// Knob drag state: the value and row the drag started at.
-static int   g_term_w = 0;
-static int   g_knob_drag_idx = -1;   // -1 when not dragging
-static int   g_knob_drag_y0  = 0;
-static float g_knob_drag_v0  = 0.0f;
-
-// Set by the quit keys; the program's update turns it into Cmd::quit.
-static bool  g_quit_requested = false;
-
-// Scroll offsets for areas that may overflow the visible region:
-//   help_bar   — horizontal scroll (units of items), bumped by wheel on row H-1
-//   help_ov    — vertical scroll (line offset), bumped by wheel inside the
-//                help overlay modal
-static int   g_help_bar_scroll = 0;
-// Seconds accumulator for the help bar's marquee animation. Every
-// `kHelpBarChipDur` seconds the bar advances by one chip; the builder only
-// applies the rotation when the full chip set is wider than the terminal.
-static float g_help_bar_auto_t   = 0.0f;
 static constexpr float kHelpBarChipDur = 1.2f;
-static int   g_help_ov_scroll  = 0;
-
-static void set_toast(std::string s) {
-    g_toast   = std::move(s);
-    g_toast_t = kToastDur;
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Undo / redo — destructive operations (randomize, mutate, preset/slot load,
@@ -255,69 +95,6 @@ struct Snapshot {
 };
 
 static constexpr size_t kUndoMax = 32;
-static std::deque<Snapshot> g_undo_past;
-static std::deque<Snapshot> g_undo_future;
-
-static Snapshot capture_snapshot() {
-    Snapshot s;
-    s.steps            = g_steps;
-    s.pattern_length   = g_pattern_length;
-    s.preset_index     = g_preset_index;
-    s.drums            = g_drums;
-    s.drum_voice_mute  = g_drum_voice_mute;
-    s.drum_master      = g_drum_master;
-    s.tune = g_tune;     s.cutoff = g_cutoff; s.resonance = g_resonance;
-    s.env_mod = g_env_mod; s.decay = g_decay; s.accent = g_accent;
-    s.drive = g_drive;   s.volume = g_volume; s.wave = g_wave;
-    s.bpm = g_bpm;       s.swing = g_swing;
-    s.od_amt = g_od_amt; s.delay_mix = g_delay_mix; s.delay_fb = g_delay_fb;
-    s.rev_mix = g_rev_mix; s.rev_size = g_rev_size; s.rev_damp = g_rev_damp;
-    s.delay_div = g_delay_div;
-    return s;
-}
-
-static void apply_snapshot(const Snapshot& s) {
-    g_steps           = s.steps;
-    g_pattern_length  = s.pattern_length;
-    g_preset_index    = s.preset_index;
-    g_drums           = s.drums;
-    g_drum_voice_mute = s.drum_voice_mute;
-    g_drum_master     = s.drum_master;
-    g_tune = s.tune;     g_cutoff = s.cutoff; g_resonance = s.resonance;
-    g_env_mod = s.env_mod; g_decay = s.decay; g_accent = s.accent;
-    g_drive = s.drive;   g_volume = s.volume; g_wave = s.wave;
-    g_bpm = s.bpm;       g_swing = s.swing;
-    g_od_amt = s.od_amt; g_delay_mix = s.delay_mix; g_delay_fb = s.delay_fb;
-    g_rev_mix = s.rev_mix; g_rev_size = s.rev_size; g_rev_damp = s.rev_damp;
-    g_delay_div = s.delay_div;
-}
-
-// Push the current state onto the undo stack before running a destructive
-// action. Clears the redo stack — a new branch of history invalidates any
-// pending redos, matching what users expect from text editors.
-static void push_undo() {
-    g_undo_past.push_back(capture_snapshot());
-    if (g_undo_past.size() > kUndoMax) g_undo_past.pop_front();
-    g_undo_future.clear();
-}
-
-static void do_undo() {
-    if (g_undo_past.empty()) { set_toast("nothing to undo"); return; }
-    g_undo_future.push_back(capture_snapshot());
-    if (g_undo_future.size() > kUndoMax) g_undo_future.pop_front();
-    apply_snapshot(g_undo_past.back());
-    g_undo_past.pop_back();
-    set_toast("\xe2\x86\xb6 undo");
-}
-
-static void do_redo() {
-    if (g_undo_future.empty()) { set_toast("nothing to redo"); return; }
-    g_undo_past.push_back(capture_snapshot());
-    if (g_undo_past.size() > kUndoMax) g_undo_past.pop_front();
-    apply_snapshot(g_undo_future.back());
-    g_undo_future.pop_back();
-    set_toast("\xe2\x86\xb7 redo");
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Knob descriptor table — makes per-knob behaviour data-driven
@@ -339,31 +116,6 @@ struct KnobDesc {
     const char* caption;         // one-line description shown when focused
 };
 
-// Captions are written in present-tense "what this knob does" form, mixing a
-// short noun phrase with a bracketed sound-engineering cue so a newcomer can
-// learn the 303 vocabulary just by scanning between knobs. `tech` is the
-// schematic-style symbol that appears under each meter — f₀/fc/Q/τ etc.
-static KnobDesc g_knob_table[K_COUNT] = {
-    {"TUNE",   &g_tune,       0.50f, "f\xe2\x82\x80",
-        "oscillator pitch offset  [\xc2\xb1" "12 semitones]"},
-    {"WAVE",   nullptr,       0.0f,  "\xe2\x88\xbf",   // ∿
-        "oscillator shape  [saw = classic, square = reedy]"},
-    {"CUTOFF", &g_cutoff,     0.40f, "fc",
-        "filter frequency  [13 Hz \xe2\x80\x93 5 kHz, log]"},
-    {"RES",    &g_resonance,  0.75f, "Q",
-        "filter resonance  [squelch \xe2\x86\x92 self-osc at \xe2\x89\x88" "90%]"},
-    {"ENVMOD", &g_env_mod,    0.65f, "\xe2\x86\x92""fc",
-        "envelope \xe2\x86\x92 cutoff sweep range  [0\xe2\x80\x93" "4 oct]"},
-    {"DECAY",  &g_decay,      0.30f, "\xcf\x84",  // τ
-        "filter envelope length  [0.2 \xe2\x80\x93 2 s, bypassed on accent]"},
-    {"ACCENT", &g_accent,     0.65f, "C\xe2\x82\x81\xe2\x82\x83",  // C₁₃
-        "accent emphasis  [cap stacks across consecutive accents]"},
-    {"DRIVE",  &g_drive,      0.20f, "\xe2\x88\xab",   // ∫ (integrator / saturator glyph)
-        "output stage saturation  [clean \xe2\x86\x92 pedal-grit]"},
-    {"VOL",    &g_volume,     0.65f, "VCA",
-        "master output level"},
-};
-
 // ─────────────────────────────────────────────────────────────────────────────
 // FX rack descriptor table (Phase 1.1 = delay only; more effects land here)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -382,107 +134,12 @@ struct FxDesc {
     const char* caption;
 };
 
-static FxDesc g_fx_table[FX_COUNT] = {
-    {"O-DRIVE",  &g_od_amt,     0.0f,  "OD",
-        "pre-filter overdrive  [0 = clean, 1 = '303 into fuzz pedal']"},
-    {"DLY MIX",  &g_delay_mix,  0.0f,  "w/d",
-        "delay wet/dry send  [0 = bypass, 1 = full echo tail]"},
-    {"DLY FB",   &g_delay_fb,   0.35f, "fb",
-        "delay feedback  [0 = single tap, 1 = self-oscillating regen]"},
-    {"DLY TIME", nullptr,       0.0f,  "\xe2\x99\xaa",  // ♪
-        "delay time  [tempo-synced: 1/16, 1/16d, 1/8, 1/8d]"},
-    {"REV MIX",  &g_rev_mix,    0.0f,  "w/d",
-        "plate reverb send  [0 = bypass, 1 = full plate ambience]"},
-    {"REV SIZE", &g_rev_size,   0.55f, "RT",
-        "plate size / decay  [room \xe2\x86\x92 hall \xe2\x86\x92 cathedral]"},
-    {"REV DAMP", &g_rev_damp,   0.35f, "HF",
-        "plate HF damping  [bright plate \xe2\x86\x92 dark dub chamber]"},
-};
-
 static const char* kDlyDivNames[4] = {"1/16", "1/16d", "1/8", "1/8d"};
 
 // ── MIDI learn ──────────────────────────────────────────────────────────────────
 // Param ids: knobs are 0..K_COUNT-1, FX are kMidiFxBase + idx. CC values are
 // applied on the UI tick so knob state stays owned here.
 static constexpr int kMidiFxBase = 16;
-static int           g_midi_learn_wait = -1;   // param we're waiting on, for the toast
-static std::array<uint32_t, acid::midi::kMaxParams> g_midi_cc_seen{};
-
-static void apply_midi_cc(int param, float v01);
-static void save_midi_map();
-static void poll_midi_cc();
-
-static std::string format_fx(int idx) {
-    char buf[32];
-    switch (idx) {
-        case FX_OD:
-        case FX_DMIX:
-        case FX_DFB:
-        case FX_RMIX:
-        case FX_RSIZE:
-        case FX_RDAMP:
-            std::snprintf(buf, sizeof(buf), "%d%%",
-                static_cast<int>(std::round(*g_fx_table[idx].value * 100.0f)));
-            break;
-        case FX_DTIME:
-            std::snprintf(buf, sizeof(buf), "%s", kDlyDivNames[g_delay_div]);
-            break;
-        default:
-            buf[0] = 0;
-    }
-    return buf;
-}
-
-// format a knob's current value for display under the rail
-static std::string format_knob(int idx) {
-    char buf[32];
-    switch (idx) {
-        case K_TUNE: {
-            float semis = (g_tune - 0.5f) * 24.0f;  // ±12 semis
-            std::snprintf(buf, sizeof(buf), "%+.1f st", semis);
-            break;
-        }
-        case K_CUTOFF: {
-            // Matches engine's 13 Hz → 5 kHz log curve (measured TB-303 range).
-            float fc = 13.0f * std::pow(5000.0f / 13.0f,
-                                        std::clamp(g_cutoff, 0.0f, 1.0f));
-            if (fc >= 1000.0f)
-                std::snprintf(buf, sizeof(buf), "%.2f kHz", fc / 1000.0f);
-            else
-                std::snprintf(buf, sizeof(buf), "%.0f Hz", fc);
-            break;
-        }
-        case K_ENV: {
-            // Show in octaves of filter sweep — matches engine's env_oct
-            // scale (envmod * 4). Much more meaningful than "65%" for a
-            // musician thinking in octaves.
-            float oct = std::clamp(g_env_mod, 0.0f, 1.0f) * 4.0f;
-            std::snprintf(buf, sizeof(buf), "%.1f oct", oct);
-            break;
-        }
-        case K_DECAY: {
-            // Show actual filter-env length — engine maps via 0.2 * 10^k.
-            // Flip to ms under one second; keeps the readout compact.
-            float sec = 0.2f * std::pow(10.0f, std::clamp(g_decay, 0.0f, 1.0f));
-            if (sec < 1.0f) std::snprintf(buf, sizeof(buf), "%.0f ms", sec * 1000.0f);
-            else            std::snprintf(buf, sizeof(buf), "%.2f s",  sec);
-            break;
-        }
-        case K_RES:
-        case K_ACCENT:
-        case K_DRIVE:
-        case K_VOL:
-            std::snprintf(buf, sizeof(buf), "%d%%",
-                static_cast<int>(std::round(*g_knob_table[idx].value * 100.0f)));
-            break;
-        case K_WAVE:
-            std::snprintf(buf, sizeof(buf), "%s", g_wave == 0 ? "saw" : "square");
-            break;
-        default:
-            buf[0] = 0;
-    }
-    return buf;
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Presets
@@ -648,20 +305,6 @@ static std::array<Preset, 16> g_presets = {{
     }}},
 }};
 
-static void load_preset(int idx) {
-    idx = ((idx % static_cast<int>(g_presets.size())) + static_cast<int>(g_presets.size()))
-        % static_cast<int>(g_presets.size());
-    g_preset_index = idx;
-    g_steps        = g_presets[static_cast<size_t>(idx)].steps;
-    g_step_sel     = 0;
-}
-
-// Forward-declares — the save/export helpers need to reach into the audio
-// transport below, but we want to declare the pattern I/O up here where the
-// rest of the pattern management lives.
-static void start_playback();
-static void stop_playback();
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Vibe coordination — the top-level "roll everything" button picks one
 // overarching vibe and routes all five subsystems (knobs, FX, pattern, drums,
@@ -727,6 +370,445 @@ static const VibeSpec kVibes[static_cast<int>(Vibe::V_COUNT)] = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Auto-arrangement — one-press (Shift+A) generates a ~10 minute song as a
+// chain of 9 slots. Picks a Vibe so every slot shares the same key/tempo/
+// palette, then derives section-specific transforms (intro / build / peak /
+// break / drop / outro) from that base. Writes each variation to its slot
+// file, sets per-slot bar counts, and boots into song mode so playback
+// cycles through the sections end-to-end. Pair with `W` before pressing
+// Shift+A to capture the whole arrangement to a timestamped take.
+// ─────────────────────────────────────────────────────────────────────────────
+enum ArrSection {
+    SEC_INTRO,      // drums-only, no bass, low cutoff
+    SEC_BASS_IN,    // sparse bass on downbeats, minimal drums
+    SEC_BUILD,      // mutated bass, rising resonance, opening filter
+    SEC_PEAK_A,     // full mix, bright filter, mild drive
+    SEC_VARIATION,  // peak-like with 3 mutations on the bass
+    SEC_BREAK,      // drums drop to kick-only, echoed bass
+    SEC_DROP,       // full mix + crash on 1
+    SEC_PEAK_B,     // another mutated peak with open hats
+    SEC_OUTRO       // sparse, fading, drums off
+};
+
+struct ArrSlot {
+    ArrSection role;
+    int        bars;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Live recording — tap the running audio thread's output into
+// ~/.config/acidflow/live_<timestamp>.wav. Unlike the offline bounce
+// (export_wav) this captures knob tweaks, jammed notes, MIDI-in hits, and
+// pattern edits as they happen. Toggle with capital `W`; max 10 minutes per
+// take. Each take carries a timestamp in the filename so takes accumulate
+// instead of overwriting, and a companion .txt file is dropped next to the
+// wav holding the session state at stop-time (same format as slot files) so
+// the take can be reloaded later to keep tweaking from where it ended.
+// ─────────────────────────────────────────────────────────────────────────────
+static constexpr int kLiveRecordMaxSeconds = 600;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Mouse hit-testing & event handling
+// ─────────────────────────────────────────────────────────────────────────────
+// Layout is fixed-row at top and bottom, flex in the middle. Known heights:
+//
+//   row 0              title bar
+//   rows 1..12         voice_row = SYNTH VOICE (grow 8) | FX RACK (grow 6)
+//                       12 rows = 1 border + 1 header + 8 knobs + 1 caption + 1 border
+//   rows 13..H-15      middle_row (filter+scope on left, transport on right)
+//   rows H-14..H-2     step_row = SEQUENCER (grow 1) | DRUMS (grow 1)
+//                       13 rows = max(seq panel 10, drum panel 13) via align Stretch
+//                       — drum panel wants 1 border + 1 header + 9 voices +
+//                       1 bus caption + 1 border = 13, seq stretches to match.
+//   row H-1            help bar
+//
+// Content widths (what justify-center lines up inside each panel):
+//   synth strip  : 9 knobs × 8 + 8 gaps = 80
+//   fx strip     : 7 knobs × 8 + 6 gaps = 62
+//   sequencer    : 7-col label + 16 × 4-col cells + 1 trailing wall = 72
+//   drums        : 4-col label + 16 × 3-col glyphs = 52
+//
+// Panel widths are reconstructed by mirroring yoga's integer-safe flex
+// distribution (floor shares + hand remainder to the first grow-able item).
+// This matches yoga's output cell-for-cell instead of eyeballing 50/50 splits.
+
+struct HitZone {
+    enum Kind {
+        None,
+        Title,
+        Knob,
+        FxKnob,
+        Step,
+        DrumCell,
+        TransportArea,
+        ScopeArea,
+        HelpBar,
+        HelpOverlay,
+    };
+    Kind kind = None;
+    int  idx  = 0;      // knob idx / fx idx / step / drum step
+    int  idx2 = 0;      // drum voice (0..4)
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// App — all of acidflow's UI state and behaviour. One instance lives in the
+// jaal Model; on(), update() and view() reach it there.
+// ─────────────────────────────────────────────────────────────────────────────
+struct App {
+    std::mt19937 rng_{std::random_device{}()};
+    tb303::ScopeState       g_scope;
+    tb303::SpectrumSnapshot g_spectrum;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Global model
+// ─────────────────────────────────────────────────────────────────────────────
+// We use file-scope globals (as in maya's own music.cpp example) because the
+// simple run(event_fn, render_fn) API expects plain closures. For a synth
+// this also matches the reality that audio params really are global state.
+
+// Knobs — normalised 0..1 except k_tuning which is 0..1 mapped to ±12 semis
+// and k_wave which is an enum.
+//
+// Defaults roughly match a "classic acid" 303 knob photo: cutoff a little
+// under noon (~120 Hz so the envelope has room to scream up), resonance
+// three-quarters-right for Q without full self-osc, env-mod around noon,
+// decay toward the short end (~0.4 s sweep — quick squelch, not pads), and
+// a moderate accent so two stacked accents still have headroom.
+float g_tune      = 0.50f;   // 0.5 → 0 semitones
+float g_cutoff    = 0.40f;
+float g_resonance = 0.75f;
+float g_env_mod   = 0.65f;
+float g_decay     = 0.30f;
+float g_accent    = 0.65f;
+float g_drive     = 0.20f;   // output tanh pre-gain
+float g_volume    = 0.65f;
+int   g_wave      = 0;       // 0 = saw, 1 = square
+
+// Sequencer
+std::array<StepData, 16> g_steps{};
+int   g_pattern_length = 16;
+int   g_current_step   = -1;     // -1 while stopped
+int   g_preset_index   = 0;
+double g_step_clock    = 0.0;    // accumulated seconds within current step
+
+// Transport — 122 BPM lands between the canonical acid tempos: Phuture
+// "Acid Tracks" at 120, Josh Wink "Higher State" at 124, Adonis "No Way
+// Back" at 122. 128+ pushes into acid techno territory (Beltram, Hawtin).
+bool  g_playing = false;
+float g_bpm     = 122.0f;
+// Swing: 0.50 = straight 16ths, 0.62 ≈ classic MPC swing, 0.66 = hard
+// shuffle. Even-indexed steps (0,2,4…) play on the grid; odd-indexed steps
+// are delayed by (swing − 0.5) × one-pair duration so the pair still sums
+// to two 16ths. Applies uniformly to all steps so every pattern grooves.
+float g_swing   = 0.50f;
+
+// Song mode (Phase 4.1). When enabled, the transport auto-advances through
+// saved pattern slots on each pattern wrap — classic hardware "chain" mode.
+// g_song_slot is the slot currently loaded (1..9, 0 = none). Wrap detection
+// piggy-backs on g_current_step going backwards between ticks, so no extra
+// audio-thread coupling is needed.
+bool g_song_mode = false;
+int  g_song_slot = 0;
+std::array<int, 10> g_song_bars{
+    kDefaultSongBars, kDefaultSongBars, kDefaultSongBars, kDefaultSongBars,
+    kDefaultSongBars, kDefaultSongBars, kDefaultSongBars, kDefaultSongBars,
+    kDefaultSongBars, kDefaultSongBars
+};
+int g_song_bars_left = 0;            // decrements each pattern wrap
+
+// Knob automation — arm a knob in DAW-style "write mode" while playing. Each
+// UI tick, the current global-knob value is written into the current step's
+// p-lock slot and the lock bit is set. Only cutoff/res/env/accent have
+// p-lock slots in the engine, so those are the only automatable knobs. To
+// clear a recorded sweep: press `L` in the sequencer (all-locks clear) on
+// the steps you want to unlock, or re-arm and walk through with the knob
+// held at the value you want.
+//   Index: 0=CUTOFF 1=RES 2=ENV 3=ACCENT.
+std::array<bool, 4> g_auto_arm{};
+
+// Jam mode (Phase 4.2). When enabled, the sequencer is silenced and the
+// computer keyboard becomes a two-octave piano (tracker layout). Terminals
+// don't deliver key-release events, so each press retriggers a short gate
+// (g_jam_gate_s) that tick() closes with acid_note_off when it expires.
+// g_jam_last_midi drives the "PLAYING: C3" display; -1 means silent.
+bool  g_jam_mode      = false;
+int   g_jam_octave    = 3;      // C3 = MIDI 36 — classic bass starting octave
+bool  g_jam_accent    = false;  // toggled with '
+bool  g_jam_slide     = false;  // toggled with ;
+float g_jam_gate_s    = 0.0f;
+int   g_jam_last_midi = -1;
+
+// FX rack. Separate from the core voice knobs because the signal chain
+// splits clearly at the VCA output: everything before is "synth voice",
+// everything after is "effects". Order = (od pre-filter) → delay → reverb
+// so the FX row is read left-to-right as signal flow.
+float g_od_amt     = 0.0f;          // pre-filter overdrive
+float g_delay_mix  = 0.0f;          // 0 = bypass
+float g_delay_fb   = 0.35f;
+int   g_delay_div  = 2;             // 0=1/16, 1=1/16d, 2=1/8, 3=1/8d
+float g_rev_mix    = 0.0f;
+float g_rev_size   = 0.55f;
+float g_rev_damp   = 0.35f;
+
+// MIDI I/O (Phase 5). Out = forward note events + drum hits + clock to the
+// MIDI backend port. In sync = slave our BPM + transport to incoming MIDI
+// clock / start / stop. Note-in (controller → bass voice) is always on when
+// the backend is up; these flags only gate the tempo-sync and event-output
+// paths so a user can have a keyboard plugged in without accidentally
+// broadcasting clock to everything downstream.
+bool g_midi_out  = false;
+bool g_midi_sync = false;
+std::array<std::array<bool, 16>, kDrumVoices> g_drums{};
+int   g_drum_voice_sel = 0;     // which row (voice) is being edited
+int   g_drum_step_sel  = 0;     // which step in that row
+float g_drum_master    = 1.0f;  // drum-bus master send (0 = silent)
+std::array<bool, kDrumVoices> g_drum_voice_mute{};  // per-voice mute (s key)
+
+// Per-section mute toggles — `m` in any non-sequencer section flips the
+// relevant flag. Sequencer keeps `m` for its per-step rest toggle (each step
+// is its own "channel"). Mutes are applied right before pushing volumes to
+// the engine so the rest of the state stays intact.
+bool  g_synth_mute  = false;    // silences the 303 voice (knobs/FX/seq)
+bool  g_drums_mute  = false;    // silences the drum bus
+
+// UI focus
+Section g_focus      = Section::Sequencer;
+int     g_knob_sel   = 2;   // K_CUTOFF — the signature 303 knob
+int     g_fx_sel     = 0;   // currently-focused FX knob
+int     g_step_sel   = 0;
+bool    g_help_open  = false;
+
+// Take picker modal — `Y` opens it, Up/Down move the cursor, Enter loads the
+// selected live_<timestamp>.txt into the live pattern state, Esc cancels.
+// Populated by refresh_takes() at open time; sorted newest-first so the take
+// the user just recorded is at the top.
+bool                              g_takes_open = false;
+int                               g_takes_sel  = 0;
+std::vector<std::filesystem::path> g_takes_entries;
+
+// Beat-sync animation state. g_step_phase ramps 0..1 within the current step
+// (wraps each trigger) so the UI can fade flashes smoothly. g_toast is a
+// transient banner — whenever an action fires (randomize / save / load /
+// export) we set g_toast + g_toast_t and the title bar shows it, fading out
+// over ~1.5s.
+float       g_step_phase = 0.0f;
+std::string g_toast;
+float       g_toast_t    = 0.0f;    // seconds remaining
+
+// Terminal size, from ResizeEvent (the help bar marquee needs the width).
+// Knob drag state: the value and row the drag started at.
+int   g_term_w = 0;
+int   g_knob_drag_idx = -1;   // -1 when not dragging
+int   g_knob_drag_y0  = 0;
+float g_knob_drag_v0  = 0.0f;
+
+// Set by the quit keys; the program's update turns it into Cmd::quit.
+bool  g_quit_requested = false;
+
+// Scroll offsets for areas that may overflow the visible region:
+//   help_bar   — horizontal scroll (units of items), bumped by wheel on row H-1
+//   help_ov    — vertical scroll (line offset), bumped by wheel inside the
+//                help overlay modal
+int   g_help_bar_scroll = 0;
+// Seconds accumulator for the help bar's marquee animation. Every
+// `kHelpBarChipDur` seconds the bar advances by one chip; the builder only
+// applies the rotation when the full chip set is wider than the terminal.
+float g_help_bar_auto_t   = 0.0f;
+int   g_help_ov_scroll  = 0;
+
+void set_toast(std::string s) {
+    g_toast   = std::move(s);
+    g_toast_t = kToastDur;
+}
+std::deque<Snapshot> g_undo_past;
+std::deque<Snapshot> g_undo_future;
+
+Snapshot capture_snapshot() {
+    Snapshot s;
+    s.steps            = g_steps;
+    s.pattern_length   = g_pattern_length;
+    s.preset_index     = g_preset_index;
+    s.drums            = g_drums;
+    s.drum_voice_mute  = g_drum_voice_mute;
+    s.drum_master      = g_drum_master;
+    s.tune = g_tune;     s.cutoff = g_cutoff; s.resonance = g_resonance;
+    s.env_mod = g_env_mod; s.decay = g_decay; s.accent = g_accent;
+    s.drive = g_drive;   s.volume = g_volume; s.wave = g_wave;
+    s.bpm = g_bpm;       s.swing = g_swing;
+    s.od_amt = g_od_amt; s.delay_mix = g_delay_mix; s.delay_fb = g_delay_fb;
+    s.rev_mix = g_rev_mix; s.rev_size = g_rev_size; s.rev_damp = g_rev_damp;
+    s.delay_div = g_delay_div;
+    return s;
+}
+
+void apply_snapshot(const Snapshot& s) {
+    g_steps           = s.steps;
+    g_pattern_length  = s.pattern_length;
+    g_preset_index    = s.preset_index;
+    g_drums           = s.drums;
+    g_drum_voice_mute = s.drum_voice_mute;
+    g_drum_master     = s.drum_master;
+    g_tune = s.tune;     g_cutoff = s.cutoff; g_resonance = s.resonance;
+    g_env_mod = s.env_mod; g_decay = s.decay; g_accent = s.accent;
+    g_drive = s.drive;   g_volume = s.volume; g_wave = s.wave;
+    g_bpm = s.bpm;       g_swing = s.swing;
+    g_od_amt = s.od_amt; g_delay_mix = s.delay_mix; g_delay_fb = s.delay_fb;
+    g_rev_mix = s.rev_mix; g_rev_size = s.rev_size; g_rev_damp = s.rev_damp;
+    g_delay_div = s.delay_div;
+}
+
+// Push the current state onto the undo stack before running a destructive
+// action. Clears the redo stack — a new branch of history invalidates any
+// pending redos, matching what users expect from text editors.
+void push_undo() {
+    g_undo_past.push_back(capture_snapshot());
+    if (g_undo_past.size() > kUndoMax) g_undo_past.pop_front();
+    g_undo_future.clear();
+}
+
+void do_undo() {
+    if (g_undo_past.empty()) { set_toast("nothing to undo"); return; }
+    g_undo_future.push_back(capture_snapshot());
+    if (g_undo_future.size() > kUndoMax) g_undo_future.pop_front();
+    apply_snapshot(g_undo_past.back());
+    g_undo_past.pop_back();
+    set_toast("\xe2\x86\xb6 undo");
+}
+
+void do_redo() {
+    if (g_undo_future.empty()) { set_toast("nothing to redo"); return; }
+    g_undo_past.push_back(capture_snapshot());
+    if (g_undo_past.size() > kUndoMax) g_undo_past.pop_front();
+    apply_snapshot(g_undo_future.back());
+    g_undo_future.pop_back();
+    set_toast("\xe2\x86\xb7 redo");
+}
+
+// Captions are written in present-tense "what this knob does" form, mixing a
+// short noun phrase with a bracketed sound-engineering cue so a newcomer can
+// learn the 303 vocabulary just by scanning between knobs. `tech` is the
+// schematic-style symbol that appears under each meter — f₀/fc/Q/τ etc.
+KnobDesc g_knob_table[K_COUNT] = {
+    {"TUNE",   &g_tune,       0.50f, "f\xe2\x82\x80",
+        "oscillator pitch offset  [\xc2\xb1" "12 semitones]"},
+    {"WAVE",   nullptr,       0.0f,  "\xe2\x88\xbf",   // ∿
+        "oscillator shape  [saw = classic, square = reedy]"},
+    {"CUTOFF", &g_cutoff,     0.40f, "fc",
+        "filter frequency  [13 Hz \xe2\x80\x93 5 kHz, log]"},
+    {"RES",    &g_resonance,  0.75f, "Q",
+        "filter resonance  [squelch \xe2\x86\x92 self-osc at \xe2\x89\x88" "90%]"},
+    {"ENVMOD", &g_env_mod,    0.65f, "\xe2\x86\x92""fc",
+        "envelope \xe2\x86\x92 cutoff sweep range  [0\xe2\x80\x93" "4 oct]"},
+    {"DECAY",  &g_decay,      0.30f, "\xcf\x84",  // τ
+        "filter envelope length  [0.2 \xe2\x80\x93 2 s, bypassed on accent]"},
+    {"ACCENT", &g_accent,     0.65f, "C\xe2\x82\x81\xe2\x82\x83",  // C₁₃
+        "accent emphasis  [cap stacks across consecutive accents]"},
+    {"DRIVE",  &g_drive,      0.20f, "\xe2\x88\xab",   // ∫ (integrator / saturator glyph)
+        "output stage saturation  [clean \xe2\x86\x92 pedal-grit]"},
+    {"VOL",    &g_volume,     0.65f, "VCA",
+        "master output level"},
+};
+
+FxDesc g_fx_table[FX_COUNT] = {
+    {"O-DRIVE",  &g_od_amt,     0.0f,  "OD",
+        "pre-filter overdrive  [0 = clean, 1 = '303 into fuzz pedal']"},
+    {"DLY MIX",  &g_delay_mix,  0.0f,  "w/d",
+        "delay wet/dry send  [0 = bypass, 1 = full echo tail]"},
+    {"DLY FB",   &g_delay_fb,   0.35f, "fb",
+        "delay feedback  [0 = single tap, 1 = self-oscillating regen]"},
+    {"DLY TIME", nullptr,       0.0f,  "\xe2\x99\xaa",  // ♪
+        "delay time  [tempo-synced: 1/16, 1/16d, 1/8, 1/8d]"},
+    {"REV MIX",  &g_rev_mix,    0.0f,  "w/d",
+        "plate reverb send  [0 = bypass, 1 = full plate ambience]"},
+    {"REV SIZE", &g_rev_size,   0.55f, "RT",
+        "plate size / decay  [room \xe2\x86\x92 hall \xe2\x86\x92 cathedral]"},
+    {"REV DAMP", &g_rev_damp,   0.35f, "HF",
+        "plate HF damping  [bright plate \xe2\x86\x92 dark dub chamber]"},
+};
+int           g_midi_learn_wait = -1;   // param we're waiting on, for the toast
+std::array<uint32_t, acid::midi::kMaxParams> g_midi_cc_seen{};
+
+std::string format_fx(int idx) const {
+    char buf[32];
+    switch (idx) {
+        case FX_OD:
+        case FX_DMIX:
+        case FX_DFB:
+        case FX_RMIX:
+        case FX_RSIZE:
+        case FX_RDAMP:
+            std::snprintf(buf, sizeof(buf), "%d%%",
+                static_cast<int>(std::round(*g_fx_table[idx].value * 100.0f)));
+            break;
+        case FX_DTIME:
+            std::snprintf(buf, sizeof(buf), "%s", kDlyDivNames[g_delay_div]);
+            break;
+        default:
+            buf[0] = 0;
+    }
+    return buf;
+}
+
+// format a knob's current value for display under the rail
+std::string format_knob(int idx) const {
+    char buf[32];
+    switch (idx) {
+        case K_TUNE: {
+            float semis = (g_tune - 0.5f) * 24.0f;  // ±12 semis
+            std::snprintf(buf, sizeof(buf), "%+.1f st", semis);
+            break;
+        }
+        case K_CUTOFF: {
+            // Matches engine's 13 Hz → 5 kHz log curve (measured TB-303 range).
+            float fc = 13.0f * std::pow(5000.0f / 13.0f,
+                                        std::clamp(g_cutoff, 0.0f, 1.0f));
+            if (fc >= 1000.0f)
+                std::snprintf(buf, sizeof(buf), "%.2f kHz", fc / 1000.0f);
+            else
+                std::snprintf(buf, sizeof(buf), "%.0f Hz", fc);
+            break;
+        }
+        case K_ENV: {
+            // Show in octaves of filter sweep — matches engine's env_oct
+            // scale (envmod * 4). Much more meaningful than "65%" for a
+            // musician thinking in octaves.
+            float oct = std::clamp(g_env_mod, 0.0f, 1.0f) * 4.0f;
+            std::snprintf(buf, sizeof(buf), "%.1f oct", oct);
+            break;
+        }
+        case K_DECAY: {
+            // Show actual filter-env length — engine maps via 0.2 * 10^k.
+            // Flip to ms under one second; keeps the readout compact.
+            float sec = 0.2f * std::pow(10.0f, std::clamp(g_decay, 0.0f, 1.0f));
+            if (sec < 1.0f) std::snprintf(buf, sizeof(buf), "%.0f ms", sec * 1000.0f);
+            else            std::snprintf(buf, sizeof(buf), "%.2f s",  sec);
+            break;
+        }
+        case K_RES:
+        case K_ACCENT:
+        case K_DRIVE:
+        case K_VOL:
+            std::snprintf(buf, sizeof(buf), "%d%%",
+                static_cast<int>(std::round(*g_knob_table[idx].value * 100.0f)));
+            break;
+        case K_WAVE:
+            std::snprintf(buf, sizeof(buf), "%s", g_wave == 0 ? "saw" : "square");
+            break;
+        default:
+            buf[0] = 0;
+    }
+    return buf;
+}
+
+void load_preset(int idx) {
+    idx = ((idx % static_cast<int>(g_presets.size())) + static_cast<int>(g_presets.size()))
+        % static_cast<int>(g_presets.size());
+    g_preset_index = idx;
+    g_steps        = g_presets[static_cast<size_t>(idx)].steps;
+    g_step_sel     = 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Knob randomizer — a dice roll over the *correlated* acid parameter space.
 // We pick one of four character archetypes (classic / squelchy / driving /
 // dubby), each pre-baked with sensible inter-knob relationships, then jitter
@@ -740,9 +822,9 @@ static const VibeSpec kVibes[static_cast<int>(Vibe::V_COUNT)] = {
 // `arch_hint` forces a specific archetype (used by randomize_everything to
 // match the picked Vibe); default -1 leaves the helper to roll its own dice.
 // ─────────────────────────────────────────────────────────────────────────────
-static void randomize_knobs(int arch_hint = -1, bool square_bias = false,
+void randomize_knobs(int arch_hint = -1, bool square_bias = false,
                             bool silent = false) {
-    static std::mt19937 rng{std::random_device{}()};
+    auto& rng = rng_;
     auto u = [&](float lo, float hi) {
         return lo + (hi - lo) * std::uniform_real_distribution<float>(0.0f, 1.0f)(rng);
     };
@@ -828,8 +910,8 @@ static void randomize_knobs(int arch_hint = -1, bool square_bias = false,
 //
 // This is strictly better than a flat per-step dice roll, which produces
 // listless noise roughly 80% of the time.
-static void randomize_pattern(int arch_hint = -1, bool silent = false) {
-    static std::mt19937 rng{std::random_device{}()};
+void randomize_pattern(int arch_hint = -1, bool silent = false) {
+    auto& rng = rng_;
     auto U  = [&]() { return std::uniform_real_distribution<float>(0.0f,1.0f)(rng); };
     auto Ui = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo,hi)(rng); };
     auto chance = [&](float p) { return U() < p; };
@@ -1098,8 +1180,8 @@ static void randomize_pattern(int arch_hint = -1, bool silent = false) {
 // soaked delay), CAVERN (plate-reverb wash), DIRTY (overdrive-forward). We
 // pick archetype-friendly ranges so each roll is usable instead of mud.
 // ─────────────────────────────────────────────────────────────────────────────
-static void randomize_fx(int arch_hint = -1, bool silent = false) {
-    static std::mt19937 rng{std::random_device{}()};
+void randomize_fx(int arch_hint = -1, bool silent = false) {
+    auto& rng = rng_;
     auto u = [&](float lo, float hi) {
         return lo + (hi - lo) * std::uniform_real_distribution<float>(0.0f, 1.0f)(rng);
     };
@@ -1182,8 +1264,8 @@ static void randomize_fx(int arch_hint = -1, bool silent = false) {
 // Voice indices: 0=BD 1=SD 2=CH 3=OH 4=CL 5=LT 6=HT 7=RS 8=CB 9=SH 10=TB
 // 11=CG 12=MT 13=CY 14=RD 15=BG.
 // ─────────────────────────────────────────────────────────────────────────────
-static void randomize_drums(int arch_hint = -1, bool silent = false) {
-    static std::mt19937 rng{std::random_device{}()};
+void randomize_drums(int arch_hint = -1, bool silent = false) {
+    auto& rng = rng_;
     auto u01 = [&] {
         return std::uniform_real_distribution<float>(0.0f, 1.0f)(rng);
     };
@@ -1454,11 +1536,11 @@ static void randomize_drums(int arch_hint = -1, bool silent = false) {
 // 12/16-step patterns) rather than the full knob ranges, so a roll here
 // doesn't send the groove to 60 BPM or 7-step weirdness.
 // ─────────────────────────────────────────────────────────────────────────────
-static void randomize_transport(float bpm_center = 0.0f,
+void randomize_transport(float bpm_center = 0.0f,
                                 float bpm_spread = 0.0f,
                                 float swing_prob = -1.0f,
                                 bool  silent     = false) {
-    static std::mt19937 rng{std::random_device{}()};
+    auto& rng = rng_;
     auto u = [&](float lo, float hi) {
         return lo + (hi - lo) * std::uniform_real_distribution<float>(0.0f, 1.0f)(rng);
     };
@@ -1502,8 +1584,8 @@ static void randomize_transport(float bpm_center = 0.0f,
 // with four-on-the-floor drums, classic-squelch knobs, and slapback delay,
 // rather than the mismatched tempo/knobs/drums you'd get from five
 // independent dice rolls.
-static void randomize_everything() {
-    static std::mt19937 rng{std::random_device{}()};
+void randomize_everything() {
+    auto& rng = rng_;
     int vi = std::uniform_int_distribution<int>(
         0, static_cast<int>(Vibe::V_COUNT) - 1)(rng);
     const VibeSpec& v = kVibes[vi];
@@ -1527,8 +1609,8 @@ static void randomize_everything() {
 // design goal: after N presses the pattern is recognisably descended from
 // where it started, not pure noise.
 // ─────────────────────────────────────────────────────────────────────────────
-static void mutate_pattern() {
-    static std::mt19937 rng{std::random_device{}()};
+void mutate_pattern() {
+    auto& rng = rng_;
     auto urnd = [&]() {
         return std::uniform_real_distribution<float>(0.0f, 1.0f)(rng);
     };
@@ -1632,7 +1714,7 @@ static void mutate_pattern() {
 // "last", used for the quick-load round-trip.
 // ─────────────────────────────────────────────────────────────────────────────
 
-static std::filesystem::path config_dir() {
+std::filesystem::path config_dir() {
 #if defined(_WIN32)
     const char* appdata = std::getenv("APPDATA");
     std::filesystem::path base = appdata ? appdata : ".";
@@ -1646,7 +1728,7 @@ static std::filesystem::path config_dir() {
 
 // YYYYMMDD_HHMMSS in local time — a filename-safe timestamp so takes don't
 // collide and sort chronologically when the user lists the directory.
-static std::string timestamp_now() {
+std::string timestamp_now() {
     std::time_t now = std::time(nullptr);
     std::tm lt{};
 #if defined(_WIN32)
@@ -1661,7 +1743,7 @@ static std::string timestamp_now() {
     return buf;
 }
 
-static std::filesystem::path pattern_path(int slot) {
+std::filesystem::path pattern_path(int slot) {
     char buf[32];
     std::snprintf(buf, sizeof(buf), "slot_%d.txt", slot);
     return config_dir() / buf;
@@ -1673,7 +1755,7 @@ static std::filesystem::path pattern_path(int slot) {
 // Writes the current state to `path` in the v8 slot format. No toast, no
 // backup — just the raw write, so callers can reuse this for takes and
 // autosaves without surprise side effects.
-static bool save_slot_to(const std::filesystem::path& path) {
+bool save_slot_to(const std::filesystem::path& path) {
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
     if (ec) return false;
@@ -1722,7 +1804,7 @@ static bool save_slot_to(const std::filesystem::path& path) {
     return static_cast<bool>(f);
 }
 
-static bool save_pattern_slot(int slot) {
+bool save_pattern_slot(int slot) {
     auto path = pattern_path(slot);
 
     // One-deep .bak so an accidental Shift-N that clobbers a good slot can
@@ -1751,7 +1833,7 @@ static bool save_pattern_slot(int slot) {
 // and take picker loading (live_<timestamp>.txt files alongside wavs).
 // `label` appears in the "loaded X" toast when quiet is false — e.g. "slot 3"
 // or "take 20260421_153900".
-static bool load_slot_from_path(const std::filesystem::path& path,
+bool load_slot_from_path(const std::filesystem::path& path,
                                 const std::string& label,
                                 bool quiet)
 {
@@ -1880,7 +1962,7 @@ static bool load_slot_from_path(const std::filesystem::path& path,
 // Numbered-slot wrapper around `load_slot_from_path`. Used by digit keys and
 // song mode; the take picker calls `load_slot_from_path` directly with the
 // live-recording .txt path.
-static bool load_pattern_slot(int slot, bool quiet = false) {
+bool load_pattern_slot(int slot, bool quiet = false) {
     char lbl[24];
     std::snprintf(lbl, sizeof(lbl), "slot %d", slot);
     return load_slot_from_path(pattern_path(slot), lbl, quiet);
@@ -1889,7 +1971,7 @@ static bool load_pattern_slot(int slot, bool quiet = false) {
 // Scan the config dir for live_*.txt take files and sort newest-first so the
 // most recent recording sits at the top of the picker. Silent on I/O errors —
 // we treat a missing / unreadable dir as "no takes".
-static void refresh_takes() {
+void refresh_takes() {
     g_takes_entries.clear();
     std::error_code ec;
     auto dir = config_dir();
@@ -1917,7 +1999,7 @@ static void refresh_takes() {
     }
 }
 
-static void open_take_picker() {
+void open_take_picker() {
     refresh_takes();
     g_takes_sel = 0;
     if (g_takes_entries.empty()) {
@@ -1930,7 +2012,7 @@ static void open_take_picker() {
 // Song-mode helper — find the next saved slot after `after` (cyclic, 1..9).
 // Returns 0 when nothing is saved at all. When `after` is already saved and is
 // the only saved slot, it returns `after` so song mode loops the same pattern.
-static int song_next_slot(int after) {
+int song_next_slot(int after) {
     for (int step = 1; step <= 9; ++step) {
         int s = ((after - 1 + step) % 9) + 1;
         if (std::filesystem::exists(pattern_path(s))) return s;
@@ -1938,37 +2020,11 @@ static int song_next_slot(int after) {
     return 0;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Auto-arrangement — one-press (Shift+A) generates a ~10 minute song as a
-// chain of 9 slots. Picks a Vibe so every slot shares the same key/tempo/
-// palette, then derives section-specific transforms (intro / build / peak /
-// break / drop / outro) from that base. Writes each variation to its slot
-// file, sets per-slot bar counts, and boots into song mode so playback
-// cycles through the sections end-to-end. Pair with `W` before pressing
-// Shift+A to capture the whole arrangement to a timestamped take.
-// ─────────────────────────────────────────────────────────────────────────────
-enum ArrSection {
-    SEC_INTRO,      // drums-only, no bass, low cutoff
-    SEC_BASS_IN,    // sparse bass on downbeats, minimal drums
-    SEC_BUILD,      // mutated bass, rising resonance, opening filter
-    SEC_PEAK_A,     // full mix, bright filter, mild drive
-    SEC_VARIATION,  // peak-like with 3 mutations on the bass
-    SEC_BREAK,      // drums drop to kick-only, echoed bass
-    SEC_DROP,       // full mix + crash on 1
-    SEC_PEAK_B,     // another mutated peak with open hats
-    SEC_OUTRO       // sparse, fading, drums off
-};
-
-struct ArrSlot {
-    ArrSection role;
-    int        bars;
-};
-
-static void auto_arrange() {
+void auto_arrange() {
     push_undo();
     stop_playback();
 
-    static std::mt19937 rng{std::random_device{}()};
+    auto& rng = rng_;
 
     // Pick a coherent vibe — all 9 slots will sit inside the same tempo /
     // palette / drum genre, so the arrangement feels like one song rather
@@ -2175,7 +2231,7 @@ static void auto_arrange() {
 // WAV export — offline bounce the current pattern (4 loops) to
 // ~/.config/acidflow/bounce.wav via the engine's synchronous render path.
 // ─────────────────────────────────────────────────────────────────────────────
-static bool export_wav() {
+bool export_wav() {
     std::error_code ec;
     std::filesystem::create_directories(config_dir(), ec);
     if (ec) return false;
@@ -2212,25 +2268,11 @@ static bool export_wav() {
     return rc == 0;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Live recording — tap the running audio thread's output into
-// ~/.config/acidflow/live_<timestamp>.wav. Unlike the offline bounce
-// (export_wav) this captures knob tweaks, jammed notes, MIDI-in hits, and
-// pattern edits as they happen. Toggle with capital `W`; max 10 minutes per
-// take. Each take carries a timestamp in the filename so takes accumulate
-// instead of overwriting, and a companion .txt file is dropped next to the
-// wav holding the session state at stop-time (same format as slot files) so
-// the take can be reloaded later to keep tweaking from where it ended.
-// ─────────────────────────────────────────────────────────────────────────────
-static constexpr int kLiveRecordMaxSeconds = 600;
-
 // Set when recording begins — reused on stop so the paired wav + slot file
 // share the same timestamp.
-static std::string g_live_rec_stem;
+std::string g_live_rec_stem;
 
-static bool save_slot_to(const std::filesystem::path& path);
-
-static bool toggle_live_record() {
+bool toggle_live_record() {
     if (acid_is_recording()) {
         std::error_code ec;
         std::filesystem::create_directories(config_dir(), ec);
@@ -2267,7 +2309,7 @@ static bool toggle_live_record() {
 // DAWs render it as legato/portamento. One loop of the pattern is written —
 // a MIDI file can be looped natively by any host, unlike a WAV bounce.
 // ─────────────────────────────────────────────────────────────────────────────
-static bool export_mid() {
+bool export_mid() {
     std::error_code ec;
     std::filesystem::create_directories(config_dir(), ec);
     if (ec) { set_toast("\xe2\x9c\x97 mid failed"); return false; }
@@ -2449,7 +2491,7 @@ static bool export_mid() {
 // bit-exact encode/decode.
 // ─────────────────────────────────────────────────────────────────────────────
 
-static std::string base64_encode(const uint8_t* data, size_t n) {
+std::string base64_encode(const uint8_t* data, size_t n) {
     static constexpr char kAlpha[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     std::string out;
@@ -2466,7 +2508,7 @@ static std::string base64_encode(const uint8_t* data, size_t n) {
     return out;
 }
 
-static bool base64_decode(const std::string& s, std::vector<uint8_t>& out) {
+bool base64_decode(const std::string& s, std::vector<uint8_t>& out) {
     int8_t rev[256];
     for (int i = 0; i < 256; ++i) rev[i] = -1;
     static constexpr char kAlpha[] =
@@ -2502,7 +2544,7 @@ static bool base64_decode(const std::string& s, std::vector<uint8_t>& out) {
     return true;
 }
 
-static std::string pattern_encode_string() {
+std::string pattern_encode_string() {
     // 165 bytes of v3 header + 1 byte drum_master + kDrumVoices × 2 drum masks.
     constexpr size_t kN = 165 + 1 + kDrumVoices * 2;
     uint8_t buf[kN] = {};
@@ -2568,7 +2610,7 @@ static std::string pattern_encode_string() {
     return base64_encode(buf, kN);
 }
 
-static bool pattern_decode_string(const std::string& code) {
+bool pattern_decode_string(const std::string& code) {
     std::vector<uint8_t> buf;
     if (!base64_decode(code, buf)) return false;
     if (buf.size() < 53 || buf[0] < 1 || buf[0] > 6) return false;
@@ -2656,7 +2698,7 @@ static bool pattern_decode_string(const std::string& code) {
     return true;
 }
 
-static bool export_pattern_text() {
+bool export_pattern_text() {
     std::error_code ec;
     std::filesystem::create_directories(config_dir(), ec);
     if (ec) { set_toast("\xe2\x9c\x97 text failed"); return false; }
@@ -2671,7 +2713,7 @@ static bool export_pattern_text() {
     return true;
 }
 
-static bool import_pattern_text() {
+bool import_pattern_text() {
     auto path = config_dir() / "pattern.txt";
     std::ifstream f(path);
     if (!f) { set_toast("\xe2\x9c\x97 no pattern.txt"); return false; }
@@ -2690,7 +2732,7 @@ static bool import_pattern_text() {
 // Audio plumbing
 // ─────────────────────────────────────────────────────────────────────────────
 
-static float midi_to_hz(int note) {
+float midi_to_hz(int note) {
     return 440.0f * std::pow(2.0f, (static_cast<float>(note) - 69.0f) / 12.0f);
 }
 
@@ -2698,7 +2740,7 @@ static float midi_to_hz(int note) {
 // Cheap (atomics), and keeps everything in perfect sync with the UI with no
 // special plumbing. The sequencer itself lives on the audio thread now —
 // this just keeps it fed with up-to-date pattern/transport data.
-static void push_params() {
+void push_params() {
     acid_set_cutoff(g_cutoff);
     acid_set_resonance(g_resonance);
     acid_set_env_mod(g_env_mod);
@@ -2748,9 +2790,12 @@ static void push_params() {
     acid_seq_set_drum_master(g_drums_mute ? 0.0f : g_drum_master);
 }
 
-static void tick(float dt) {
+void tick(float dt) {
     poll_midi_cc();
     push_params();
+    // Visualiser state is advanced here so view() only reads it.
+    g_scope.advance();
+    g_spectrum.advance();
 
     // Toast fade runs whether or not playback is active.
     if (g_toast_t > 0.0f) g_toast_t = std::max(0.0f, g_toast_t - dt);
@@ -2834,13 +2879,13 @@ static void tick(float dt) {
     }
 }
 
-static void start_playback() {
+void start_playback() {
     g_playing = true;
     g_current_step = -1;
     acid_seq_play();
 }
 
-static void stop_playback() {
+void stop_playback() {
     g_playing = false;
     g_current_step = -1;
     acid_seq_stop();
@@ -2848,7 +2893,7 @@ static void stop_playback() {
 
 // ── MIDI learn / CC ──────────────────────────────────────────────────────────────
 
-static void apply_midi_cc(int param, float v01) {
+void apply_midi_cc(int param, float v01) {
     if (param >= 0 && param < K_COUNT) {
         if (param == K_WAVE) { g_wave = v01 >= 0.5f ? 1 : 0; return; }
         *g_knob_table[param].value = v01;
@@ -2860,7 +2905,7 @@ static void apply_midi_cc(int param, float v01) {
     *g_fx_table[fx].value = v01;
 }
 
-static std::string midi_param_name(int param) {
+std::string midi_param_name(int param) {
     if (param >= 0 && param < K_COUNT) return g_knob_table[param].label;
     const int fx = param - kMidiFxBase;
     if (fx >= 0 && fx < FX_COUNT) return g_fx_table[fx].label;
@@ -2868,7 +2913,7 @@ static std::string midi_param_name(int param) {
 }
 
 // Called from tick(): apply new CC values and report a finished learn.
-static void poll_midi_cc() {
+void poll_midi_cc() {
     auto& cc = acid::midi::cc();
     for (int p = 0; p < acid::midi::kMaxParams; ++p) {
         const uint32_t s = cc.seq[static_cast<size_t>(p)].load(std::memory_order_acquire);
@@ -2888,7 +2933,7 @@ static void poll_midi_cc() {
 }
 
 // One "cc param" pair per line in ~/.config/acidflow/midi_map.txt.
-static void save_midi_map() {
+void save_midi_map() {
     std::error_code ec;
     std::filesystem::create_directories(config_dir(), ec);
     std::ofstream f(config_dir() / "midi_map.txt");
@@ -2899,7 +2944,7 @@ static void save_midi_map() {
     }
 }
 
-static void load_midi_map() {
+void load_midi_map() {
     std::ifstream f(config_dir() / "midi_map.txt");
     auto& cc = acid::midi::cc();
     int c = 0, p = 0;
@@ -2912,7 +2957,7 @@ static void load_midi_map() {
 // Input handling
 // ─────────────────────────────────────────────────────────────────────────────
 
-static void adjust_knob(int idx, float delta) {
+void adjust_knob(int idx, float delta) {
     if (idx == K_WAVE) {
         // wave is special-cased; treat up/down as toggle
         if (delta > 0) g_wave = 1 - g_wave;
@@ -2923,14 +2968,14 @@ static void adjust_knob(int idx, float delta) {
     *v = std::clamp(*v + delta, 0.0f, 1.0f);
 }
 
-static void reset_knob(int idx) {
+void reset_knob(int idx) {
     if (idx == K_WAVE) { g_wave = 0; return; }
     *g_knob_table[idx].value = g_knob_table[idx].default_v;
 }
 
 // FX knob adjustment. FX_DTIME is a 4-way enum (1/16..1/8d) so ↑/↓ step
 // through the divisions rather than adjusting a continuous value.
-static void adjust_fx(int idx, float delta) {
+void adjust_fx(int idx, float delta) {
     if (idx == FX_DTIME) {
         int d = g_delay_div + (delta > 0 ? +1 : -1);
         g_delay_div = std::clamp(d, 0, 3);
@@ -2940,13 +2985,13 @@ static void adjust_fx(int idx, float delta) {
     *v = std::clamp(*v + delta, 0.0f, 1.0f);
 }
 
-static void reset_fx(int idx) {
+void reset_fx(int idx) {
     if (idx == FX_DTIME) { g_delay_div = 2; return; }
     *g_fx_table[idx].value = g_fx_table[idx].default_v;
 }
 
 // cycle focus forward (or backward)
-static void cycle_focus(int dir) {
+void cycle_focus(int dir) {
     // Section count follows Section enum — Knobs, FX, Sequencer, Drums, Transport.
     int n = 5;
     int cur = static_cast<int>(g_focus);
@@ -2958,7 +3003,7 @@ static void cycle_focus(int dir) {
 // the lower two QWERTY rows. Lower-case letters only; Shift is reserved for
 // section cycling. Returns semitones above the jam base octave, or -1 if the
 // key isn't part of the piano.
-static int jam_key_semi(char c) {
+int jam_key_semi(char c) {
     switch (c) {
         // Lower octave (z..m) — white on the bottom row, black on the row above
         case 'z': return 0;   case 's': return 1;
@@ -2982,7 +3027,7 @@ static int jam_key_semi(char c) {
 
 // Pretty-print a MIDI note as "C3", "F#4", etc. — shown in the jam HUD so the
 // user can read the last-played pitch at a glance.
-static std::string midi_note_name(int midi) {
+std::string midi_note_name(int midi) {
     static constexpr const char* n[12] = {
         "C","C#","D","D#","E","F","F#","G","G#","A","A#","B",
     };
@@ -2994,7 +3039,7 @@ static std::string midi_note_name(int midi) {
 }
 
 // map a typed letter (c, d, e, f, g, a, b) to a MIDI semitone (0=C .. 11=B)
-static int letter_to_semitone(char c) {
+int letter_to_semitone(char c) {
     switch (c) {
         case 'c': return 0;
         case 'd': return 2;
@@ -3007,53 +3052,10 @@ static int letter_to_semitone(char c) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Mouse hit-testing & event handling
-// ─────────────────────────────────────────────────────────────────────────────
-// Layout is fixed-row at top and bottom, flex in the middle. Known heights:
-//
-//   row 0              title bar
-//   rows 1..12         voice_row = SYNTH VOICE (grow 8) | FX RACK (grow 6)
-//                       12 rows = 1 border + 1 header + 8 knobs + 1 caption + 1 border
-//   rows 13..H-15      middle_row (filter+scope on left, transport on right)
-//   rows H-14..H-2     step_row = SEQUENCER (grow 1) | DRUMS (grow 1)
-//                       13 rows = max(seq panel 10, drum panel 13) via align Stretch
-//                       — drum panel wants 1 border + 1 header + 9 voices +
-//                       1 bus caption + 1 border = 13, seq stretches to match.
-//   row H-1            help bar
-//
-// Content widths (what justify-center lines up inside each panel):
-//   synth strip  : 9 knobs × 8 + 8 gaps = 80
-//   fx strip     : 7 knobs × 8 + 6 gaps = 62
-//   sequencer    : 7-col label + 16 × 4-col cells + 1 trailing wall = 72
-//   drums        : 4-col label + 16 × 3-col glyphs = 52
-//
-// Panel widths are reconstructed by mirroring yoga's integer-safe flex
-// distribution (floor shares + hand remainder to the first grow-able item).
-// This matches yoga's output cell-for-cell instead of eyeballing 50/50 splits.
-
-struct HitZone {
-    enum Kind {
-        None,
-        Title,
-        Knob,
-        FxKnob,
-        Step,
-        DrumCell,
-        TransportArea,
-        ScopeArea,
-        HelpBar,
-        HelpOverlay,
-    };
-    Kind kind = None;
-    int  idx  = 0;      // knob idx / fx idx / step / drum step
-    int  idx2 = 0;      // drum voice (0..4)
-};
-
 // Resolve a mouse position to a target via maya's hit registry. The widgets
 // tag their boxes with `| hit(...)`, so this always matches the painted frame.
 // SGR coordinates are 1-based; the registry is 0-based.
-static HitZone hit_test(int col, int row) {
+HitZone hit_test(int col, int row) {
     const int x = col - 1;
     const int y = row - 1;
     const auto id = maya::hit_test(x, y);
@@ -3093,7 +3095,7 @@ static HitZone hit_test(int col, int row) {
 }
 
 // Which section a hover over this target should focus, if any.
-static std::optional<Section> hover_section(int col, int row) {
+std::optional<Section> hover_section(int col, int row) {
     const auto id = maya::hit_test(col - 1, row - 1);
     if (!id) return std::nullopt;
     switch (maya::hit_kind(*id)) {
@@ -3108,7 +3110,7 @@ static std::optional<Section> hover_section(int col, int row) {
     }
 }
 
-static void handle_mouse(const MouseEvent& m) {
+void handle_mouse(const MouseEvent& m) {
     int col = m.x.raw();
     int row = m.y.raw();
 
@@ -3143,7 +3145,7 @@ static void handle_mouse(const MouseEvent& m) {
         return;
     }
 
-    HitZone z = ::hit_test(col, row);
+    HitZone z = hit_test(col, row);
 
     // ── Scroll wheel ───────────────────────────────────────────────────────
     if (m.button == MouseButton::ScrollUp || m.button == MouseButton::ScrollDown) {
@@ -3315,7 +3317,7 @@ static void handle_mouse(const MouseEvent& m) {
     }
 }
 
-static void handle_event(const Event& ev) {
+void handle_event(const Event& ev) {
     // Resize — keep terminal size in sync for mouse hit-tests.
     int rw = 0;
     if (resized(ev, &rw, nullptr)) { g_term_w = rw; return; }
@@ -3850,7 +3852,7 @@ static void handle_event(const Event& ev) {
 // Render
 // ─────────────────────────────────────────────────────────────────────────────
 
-static Element build_knob_row() {
+Element build_knob_row() const {
     // TB-303 signal-flow groups. Each knob gets a group colour so adjacent
     // knobs visually bind into their functional block — OSC/FILTER/ENV/AMP —
     // without needing a horizontal divider between them.
@@ -4055,7 +4057,7 @@ static Element build_knob_row() {
 // Keeps the same group-colour discipline as the voice strip so related FX
 // read together visually. Three groups in signal-flow order:
 //   OD (pre-filter, amber) → DELAY (warm orange) → REVERB (cool teal)
-static Element build_fx_row() {
+Element build_fx_row() const {
     auto group_color_for = [](int i) -> maya::Color {
         using maya::Color;
         switch (i) {
@@ -4202,7 +4204,7 @@ static Element build_fx_row() {
         | hit(hit_id(tb303::kHitPanel, static_cast<std::uint32_t>(Section::FX)))).build();
 }
 
-static Element render_frame() {
+Element render_frame() const {
     // Transport state bundle
     std::vector<tb303::PresetSummary> preset_summaries;
     preset_summaries.reserve(g_presets.size());
@@ -4236,8 +4238,8 @@ static Element render_frame() {
 
     auto knob_row   = build_knob_row();
     auto fx_row     = build_fx_row();
-    auto filter_box = tb303::build_filter_response(g_cutoff, g_resonance);
-    auto scope_box  = tb303::build_scope();
+    auto filter_box = tb303::build_filter_response(g_cutoff, g_resonance, g_spectrum);
+    auto scope_box  = tb303::build_scope(g_scope);
     auto transport  = tb303::build_transport(ts);
 
     // Left column stacks FILTER RESPONSE on top of SCOPE so the two visual
@@ -4258,7 +4260,7 @@ static Element render_frame() {
 
     // Drums sit in a fill() so the panel can shrink on short terminals and
     // clip the bottom voices instead of pushing the layout taller.
-    auto drums_component = dsl::fill([=](int, int) -> Element {
+    auto drums_component = dsl::fill([this](int, int) -> Element {
         return tb303::build_drums(g_drums, g_drum_voice_mute,
                                   g_drum_voice_sel, g_drum_step_sel,
                                   g_playing ? g_current_step : -1,
@@ -4450,21 +4452,28 @@ static Element render_frame() {
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ── Program ────────────────────────────────────────────────────────────────────────
-// The app state lives in the file-level globals above. on(), update() and
-// view() all run on jaal's loop thread, so that stays single-threaded; the
-// audio and MIDI threads only talk to the engine through atomics.
-
 // True when nothing on screen is moving, so the tick can slow right down.
-static bool ui_idle() {
+bool ui_idle() const {
     return !g_playing && g_toast_t <= 0.0f && g_jam_gate_s <= 0.0f
         && !acid_is_recording() && g_knob_drag_idx < 0
         && acid_output_peak() < 1e-4f;
 }
 
+App() { load_preset(0); load_midi_map(); }
+App(const App&)            = delete;
+App& operator=(const App&) = delete;
+
+};
+
+// ── Program ──────────────────────────────────────────────────────────────────────────────────
+// The Model owns the App. App holds tables that point into itself, so it
+// lives behind a unique_ptr (stable address; the Model stays movable).
+// on(), update() and view() all run on jaal's loop thread; the audio and
+// MIDI threads only talk to the engine through atomics.
+
 struct Acidflow {
     struct Model {
-        std::uint64_t frame = 0;   // bumped every tick so each one redraws
+        std::unique_ptr<App> app = std::make_unique<App>();
         std::chrono::steady_clock::time_point last{};
         bool idle = false;
     };
@@ -4487,10 +4496,10 @@ struct Acidflow {
         // Clamp so a debugger pause or a slow first frame can't jump timers.
         float dt = std::clamp(std::chrono::duration<float>(now - m.last).count(), 0.0f, 0.1f);
         m.last = now;
-        tick(dt);
-        if (g_toast_t <= 0.0f && !g_toast.empty()) g_toast.clear();
-        ++m.frame;
-        m.idle = ui_idle();
+        App& a = *m.app;
+        a.tick(dt);
+        if (a.g_toast_t <= 0.0f && !a.g_toast.empty()) a.g_toast.clear();
+        m.idle = a.ui_idle();
         return {};
     }
     static Cmd update(Model& m, Key k)    { return input(m, Event{k.ev}); }
@@ -4499,7 +4508,7 @@ struct Acidflow {
         return input(m, Event{ResizeEvent{Columns{r.w}, Rows{r.h}}});
     }
 
-    static Element view(const Model&) { return render_frame(); }
+    static Element view(const Model& m) { return m.app->render_frame(); }
 
     static std::optional<Msg> on(const Model&, const KeyEvent& k)   { return Key{k}; }
     static std::optional<Msg> on(const Model&, const MouseEvent& m) { return Mouse{m}; }
@@ -4516,10 +4525,10 @@ struct Acidflow {
 
   private:
     static Cmd input(Model& m, const Event& ev) {
-        handle_event(ev);
+        m.app->handle_event(ev);
         // Input wakes the fast tick right away (a knob turn, play, ...).
         m.idle = false;
-        if (g_quit_requested) return Cmd::quit(0);
+        if (m.app->g_quit_requested) return Cmd::quit(0);
         return {};
     }
 };
@@ -4527,8 +4536,6 @@ struct Acidflow {
 static_assert(maya::Program<Acidflow>);
 
 int main() {
-    load_preset(0);
-    load_midi_map();
     acid_start();
     acid_midi_start();   // No-op on platforms without a MIDI backend.
 
