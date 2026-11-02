@@ -562,7 +562,7 @@ The backend is a zero-overhead path when both toggles are off — no allocations
 
 ## 13. Themes
 
-acidflow's colours come from [maya's theme system](https://github.com/1ay1/maya), so they follow the same themes every maya app uses. Press `T` (Shift+T) to cycle; the change is immediate and applies to every panel, border, glyph and status light. The choice is saved when you quit and comes back next time.
+acidflow's colours come from [maya's theme system](https://github.com/1ay1/maya), so they follow the same themes every maya app uses. Press `T` (Shift+T) to open the **theme picker**: a list of every maya theme, acidflow's favourites (★) first, then all ~600 schemes, each with a swatch of its colours. Type to search ("nord", "light", "gruv"), and moving the cursor or hovering a row previews that theme on the whole app straight away. `Enter` or a click keeps it, `Esc` puts back the theme you had. The choice is saved when you quit.
 
 | Theme | Feel |
 |---|---|
@@ -571,7 +571,7 @@ acidflow's colours come from [maya's theme system](https://github.com/1ay1/maya)
 | **gruvbox dark**, **tokyonight**, **dracula**, **nord**, **catppuccin mocha**, **rose pine**, **github dark** | well-known dark schemes, each with its own background |
 | **catppuccin latte** | a light scheme |
 
-Any of maya's ~600 built-in schemes can be used: put its name in `~/.config/acidflow/prefs.txt` as `theme_name Solarized Dark` (the names are the upstream ones, like `Kanagawa` or `Everforest Dark`).
+The picker writes your choice to `~/.config/acidflow/prefs.txt` as `theme_name <name>`, using maya's scheme names (`Kanagawa`, `Everforest Dark`, …), so you can also set it there by hand.
 
 Colours are given as roles (accent, hot, slide, border, ...) rather than fixed RGB, which is why every theme works without acidflow knowing about it. With `NO_COLOR` set, maya draws no colour at all; accents, slides, rests and the playing step all still have their own symbols.
 
@@ -796,7 +796,7 @@ This is the full canonical list, also accessible inside the app via `?`.
 | `r` | Randomize current section |
 | `R` | Randomize everything (knobs + pattern) |
 | `M` (Shift+M) | Evolve pattern — one small mutation per press |
-| `T` (Shift+T) | Cycle colour theme (acid / terminal / gruvbox / tokyonight / …) |
+| `T` (Shift+T) | Theme picker: search every maya theme, live preview, Enter keeps, Esc reverts |
 | `n` | Toggle **song mode** (chain saved slots on pattern wrap) |
 | `k` | Toggle **jam mode** (two-octave live keyboard into the 303 voice) |
 | `O` (Shift+O) | Toggle **MIDI out** (notes + drums + clock) |

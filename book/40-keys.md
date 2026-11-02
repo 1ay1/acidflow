@@ -16,7 +16,7 @@ These work regardless of focus:
 | `r` | Randomize current section |
 | `R` | Randomize everything (knobs + pattern + drums + FX) |
 | `M` (Shift+M) | Evolve pattern — one small mutation per press |
-| `T` (Shift+T) | Cycle color theme |
+| `T` (Shift+T) | Theme picker: search every maya theme, live preview, Enter keeps, Esc reverts |
 | `n` | Toggle song mode |
 | `k` | Toggle jam mode |
 | `O` (Shift+O) | Toggle MIDI out |

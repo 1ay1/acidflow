@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <maya/maya.hpp>
 #include <maya/style/schemes.hpp>
@@ -75,33 +76,54 @@ inline constexpr ThemeChoice kThemeChoices[] = {
 };
 inline constexpr int kThemeCount = static_cast<int>(sizeof(kThemeChoices) / sizeof(kThemeChoices[0]));
 
-inline int g_theme_idx = 0;
+// Everything the picker offers: the favourites above, then every one of
+// maya's schemes. Index into this with all_themes()[i].
+inline const std::vector<ThemeChoice>& all_themes() {
+    static const std::vector<ThemeChoice> v = [] {
+        std::vector<ThemeChoice> out(std::begin(kThemeChoices), std::end(kThemeChoices));
+        for (const auto& s : theme::schemes) {
+            bool dup = false;   // a favourite that is also a maya scheme
+            for (const auto& f : kThemeChoices) dup = dup || f.theme == s.theme;
+            if (!dup) out.push_back({s.name, s.theme});
+        }
+        return out;
+    }();
+    return v;
+}
+
+// Does this theme draw its own background? (native and acid don't.)
+inline bool theme_is_light(const Theme& t) {
+    const LitColor bg = t.resolve(t.background);
+    if (!bg.has_channels()) return false;
+    return bg.r() * 299 + bg.g() * 587 + bg.b() * 114 > 128 * 1000;
+}
+
+inline int g_theme_idx = 0;                 // into all_themes()
 inline std::string g_theme_name = "acid";   // what's live, for prefs and toasts
 
 inline const ThemeChoice& active_theme() {
-    const int i = (g_theme_idx >= 0 && g_theme_idx < kThemeCount) ? g_theme_idx : 0;
-    return kThemeChoices[i];
+    const auto& all = all_themes();
+    const int i = (g_theme_idx >= 0 && g_theme_idx < static_cast<int>(all.size())) ? g_theme_idx : 0;
+    return all[static_cast<size_t>(i)];
 }
 // Install the theme in maya; every slot colour repaints from it.
 inline void apply_theme() { app_set_theme(*active_theme().theme); }
 inline void set_theme(int i) {
-    g_theme_idx = (i >= 0 && i < kThemeCount) ? i : 0;
-    g_theme_name = kThemeChoices[g_theme_idx].name;
+    const int n = static_cast<int>(all_themes().size());
+    g_theme_idx = (i >= 0 && i < n) ? i : 0;
+    g_theme_name = active_theme().name;
     apply_theme();
 }
-inline void cycle_theme() { set_theme((g_theme_idx + 1) % kThemeCount); }
-// By name, for the saved prefs. Any maya scheme name works too ("Solarized
-// Dark", "Kanagawa"...): it's looked up in maya's full table.
+// T without the picker (and the palette action): the next favourite.
+inline void cycle_theme() {
+    const int next = g_theme_idx >= 0 && g_theme_idx < kThemeCount - 1 ? g_theme_idx + 1 : 0;
+    set_theme(next);
+}
+// By name, for the saved prefs: a favourite or any maya scheme.
 inline bool set_theme_by_name(std::string_view name) {
-    for (int i = 0; i < kThemeCount; ++i)
-        if (name == kThemeChoices[i].name) { set_theme(i); return true; }
-    for (const auto& s : theme::schemes)
-        if (name == s.name) {
-            g_theme_idx = -1;          // T continues from the first choice
-            g_theme_name = s.name;
-            app_set_theme(*s.theme);
-            return true;
-        }
+    const auto& all = all_themes();
+    for (size_t i = 0; i < all.size(); ++i)
+        if (name == all[i].name) { set_theme(static_cast<int>(i)); return true; }
     return false;
 }
 

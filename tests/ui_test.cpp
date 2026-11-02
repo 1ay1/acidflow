@@ -76,6 +76,10 @@ std::string screen(H& h, int w, int rows) {
     return out;
 }
 bool has(const std::string& s, const char* what) { return s.find(what) != std::string::npos; }
+std::string lower_copy(std::string s) {
+    for (auto& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    return s;
+}
 
 struct Clean { Clean(bool fresh = false) { clean_config(fresh); } };
 
@@ -432,22 +436,53 @@ TEST("T switches maya's live theme and it is restored by name") {
         H h;
         REQUIRE(tb303::g_theme_name == "acid");
         const auto acid = theme::live().resolve(tb303::clr_accent());
+        // T opens the picker; moving previews, Enter keeps.
         key(h, U'T');
+        REQUIRE(app(h).g_theme_picker);
+        CHECK(has(screen(h, 120, 40), "THEME"));
+        key(h, SpecialKey::Down);
         CHECK(tb303::g_theme_name == "terminal");
         CHECK(theme::live() == theme::native);
-        key(h, U'T');
+        key(h, SpecialKey::Down);
         CHECK(tb303::g_theme_name == "gruvbox dark");
         CHECK(theme::live() == theme::gruvbox_dark);
         CHECK(!(theme::live().resolve(tb303::clr_accent()) == acid));
+        key(h, SpecialKey::Enter);
+        CHECK(!app(h).g_theme_picker);
         CHECK(has(app(h).g_toast, "gruvbox dark"));
     }   // quit saves prefs
     tb303::set_theme(0);
     H h2;
     CHECK(tb303::g_theme_name == "gruvbox dark");
     CHECK(theme::live() == theme::gruvbox_dark);
-    // Any maya scheme name works in prefs.
-    CHECK(tb303::set_theme_by_name("Solarized Dark") || tb303::set_theme_by_name("Dracula"));
     tb303::set_theme(0);
+}
+
+TEST("theme picker: Esc puts back the old theme; search reaches every maya scheme") {
+    Clean c;
+    H h;
+    REQUIRE(tb303::g_theme_name == "acid");
+    key(h, U'T');
+    key(h, SpecialKey::Down);
+    key(h, SpecialKey::Down);
+    CHECK(tb303::g_theme_name == "gruvbox dark");
+    key(h, SpecialKey::Escape);                 // cancel
+    CHECK(!app(h).g_theme_picker);
+    CHECK(tb303::g_theme_name == "acid");
+    CHECK(theme::live() == tb303::kAcidTheme);
+    // Every maya scheme is in the list.
+    CHECK(tb303::all_themes().size() >= std::size(theme::schemes));
+    // Search previews the first match; first Esc clears the search only.
+    key(h, U'T');
+    for (char32_t ch2 : std::u32string(U"kanagawa")) key(h, ch2);
+    CHECK(has(lower_copy(tb303::g_theme_name), "kanagawa"));
+    CHECK(has(screen(h, 120, 40), "Kanagawa"));
+    key(h, SpecialKey::Escape);
+    CHECK(app(h).g_theme_picker);
+    CHECK(app(h).g_theme_query.empty());
+    key(h, SpecialKey::Escape);
+    CHECK(tb303::g_theme_name == "acid");
+    CHECK(!h.quit());
 }
 
 // The layout at common terminal sizes: every panel is there, labels aren't

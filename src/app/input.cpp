@@ -218,6 +218,7 @@ std::optional<Section> App::hover_section(int col, int row) {
 
 void App::handle_mouse(const MouseEvent& m) {
     if (handle_menu_mouse(m)) return;
+    if (handle_theme_picker_mouse(m)) return;
     int col = m.x.raw();
     int row = m.y.raw();
 
@@ -449,6 +450,7 @@ void App::handle_event(const Event& ev) {
     // ── Global keys ──────────────────────────────────────────────────────────────────────────
     // Overlays own the keyboard while open.
     if (handle_menu_key(ev)) return;
+    if (handle_theme_picker_key(ev)) return;
     if (handle_palette_key(ev)) return;
     if (handle_help_key(ev)) return;
     if (as_key(ev)) g_hover_text.clear();
@@ -550,7 +552,7 @@ void App::handle_event(const Event& ev) {
     if (key(ev, 'A')) { auto_arrange(); return; }
     if (key(ev, 'u')) { do_undo(); return; }
     if (key(ev, 'U')) { do_redo(); return; }
-    if (key(ev, 'T')) { next_theme(); return; }
+    if (key(ev, 'T')) { open_theme_picker(); return; }
     if (key(ev, 'e')) { export_wav(); return; }
     if (key(ev, 'E')) { export_mid(); return; }
     if (key(ev, 'W')) { toggle_live_record(); return; }

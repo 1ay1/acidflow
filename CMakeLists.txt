@@ -89,7 +89,7 @@ if(ACIDFLOW_BUILD_APP)
     add_library(acid_app STATIC
         src/app/state.cpp src/app/presets.cpp src/app/randomize.cpp src/app/persist.cpp
         src/app/song.cpp src/app/export.cpp src/app/audio.cpp src/app/input.cpp
-        src/app/view.cpp src/app/actions.cpp src/app/ui.cpp src/app/menu.cpp)
+        src/app/view.cpp src/app/actions.cpp src/app/ui.cpp src/app/menu.cpp src/app/theme_picker.cpp)
     target_include_directories(acid_app PUBLIC src)
     target_link_libraries(acid_app PUBLIC acid_engine maya::app)
 

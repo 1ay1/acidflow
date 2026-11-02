@@ -2,6 +2,7 @@
 #include "actions.hpp"
 #include "app.hpp"
 #include "tb303/palette.hpp"
+#include "tb303/theme_picker.hpp"
 
 #include <maya/device/floating.hpp>
 
@@ -713,6 +714,14 @@ Element App::render_frame() const {
     }
     if (g_first_run)
         return dsl::zstack({std::move(main), dsl::center()(tb303::build_welcome())});
+    if (g_theme_picker) {
+        // Right side, so most of the workspace stays visible to judge the theme.
+        const int rows = std::max(4, (g_term_h > 0 ? g_term_h : 40) - 10);
+        Element card = tb303::build_theme_picker(g_theme_query, theme_matches(), g_theme_sel,
+                                                 rows, g_theme_before);
+        return dsl::zstack({std::move(main),
+            dsl::hstack().justify(Justify::End).padding(2, 2, 0, 0)(std::move(card))});
+    }
     if (g_menu.open) {
         // Rows: title, items, footer. Width fits the longest label.
         int w = static_cast<int>(g_menu.title.size()) + 4;

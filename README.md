@@ -41,7 +41,7 @@ Type `space` to play. Press `r` to randomize. Drag a knob. Export a WAV. Quit be
 - **Smart randomizer.** Four character archetypes for knobs, four groove archetypes for patterns, plus `M` for one-at-a-time evolving mutations that "walk" a pattern without obliterating it.
 - **9 save slots** (`Shift-1`…`Shift-9` to save, `1`…`9` to load) — each slot stores the full session state (sequence, drums, all knobs, FX) in a plain-text file (`slot_1.txt`…`slot_9.txt`). Drop an AI-generated file here to load it instantly.
 - **Shareable pattern export** (`p` to export, `P` to import) — writes the current session to a single compact base64 file (`pattern.txt`) you can paste into a message or forum post. Same full state as a slot, just a different format for sharing.
-- **Themes from maya** — acidflow's own "acid" look, your terminal's palette, or any of maya's schemes (gruvbox, tokyonight, dracula, nord, catppuccin…), cycled with `T` and remembered.
+- **Themes from maya** — acidflow's own "acid" look, your terminal's palette, or any of maya's schemes (gruvbox, tokyonight, dracula, nord, catppuccin…), picked with `T` from a searchable list with live preview, and remembered.
 - **Cross-platform.** Linux (JACK or ALSA), macOS (CoreAudio), Windows (WASAPI). JACK is used when a server is running (PipeWire's included) and patches straight into a DAW; set `ACIDFLOW_AUDIO=alsa` to force ALSA.
 - **CLAP plugin** — the same engine as an instrument in your DAW: notes in (legato = slide, velocity ≥ 100 = accent), 16 automatable parameters, stereo out.
 - **Stems.** `e` bounces a 24-bit stereo mix plus the dry synth and drum buses, without stopping playback.

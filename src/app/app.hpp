@@ -880,6 +880,16 @@ struct App {
     bool handle_menu_key(const Event& ev);
     bool handle_menu_mouse(const MouseEvent& m);
     void arm_midi_learn(int param);
+    // Theme picker (T): every maya theme, live preview, Enter keeps, Esc reverts.
+    bool        g_theme_picker = false;
+    std::string g_theme_query;
+    int         g_theme_sel    = 0;      // row in theme_matches()
+    int         g_theme_before = 0;      // all_themes() index to go back to
+    std::vector<int> theme_matches() const;
+    void open_theme_picker();
+    void preview_theme_sel();
+    bool handle_theme_picker_key(const Event& ev);
+    bool handle_theme_picker_mouse(const MouseEvent& m);
     Element build_knob_strip() const;
     std::string describe_at(int col, int row) const;
     // Palette / help helpers.
