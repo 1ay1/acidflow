@@ -16,6 +16,9 @@ endif()
 # ── maya framework ──────────────────────────────────────────────────────────
 # Expect a sibling checkout at ../maya. If that ever becomes inconvenient,
 # swap this for FetchContent_Declare(maya ...).
+# We only need the library and maya::app (the jaal runtime), not its demos.
+set(MAYA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(MAYA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../maya ${CMAKE_CURRENT_BINARY_DIR}/maya)
 
 # ── Platform-specific audio backend ─────────────────────────────────────────
@@ -59,7 +62,7 @@ else()
 endif()
 
 add_executable(acidflow ${ACIDFLOW_SOURCES})
-target_link_libraries(acidflow PRIVATE maya ${ACIDFLOW_AUDIO_LIBS})
+target_link_libraries(acidflow PRIVATE maya::app ${ACIDFLOW_AUDIO_LIBS})
 target_include_directories(acidflow PRIVATE src)
 target_compile_options(acidflow PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O3 -march=native -funroll-loops>

@@ -47,7 +47,7 @@ Type `space` to play. Press `r` to randomize. Drag a knob. Export a WAV. Quit be
 
 ## Install
 
-You need a C++26 compiler (recent GCC or Clang), CMake ≥ 3.28, and a sibling checkout of [`maya`](https://github.com/1ay1/maya) — the TUI framework acidflow is built on.
+You need a C++26 compiler (recent GCC or Clang), CMake ≥ 3.28, and a sibling checkout of [`maya`](https://github.com/1ay1/maya) — the TUI framework acidflow is built on. maya pulls in its runtime, [jaal](https://github.com/agentty-org/jaal), as a git submodule, so clone it with `--recursive`.
 
 ```bash
 # Linux: install ALSA dev headers
@@ -56,7 +56,7 @@ sudo dnf install alsa-lib-devel          # Fedora
 sudo pacman -S alsa-lib                  # Arch
 
 # Clone with maya as a sibling
-git clone https://github.com/1ay1/maya.git
+git clone --recursive https://github.com/1ay1/maya.git
 git clone https://github.com/1ay1/acidflow.git
 cd acidflow
 
@@ -78,7 +78,7 @@ cmake --build build --config Release
 .\build\Release\acidflow.exe
 ```
 
-The CMake script falls back to C++23 under MSVC (current MSVC doesn't advertise `cxx_std_26` to CMake) and adds `_USE_MATH_DEFINES` + `/utf-8` for MSVC only. GCC/Clang builds stay on C++26. Run the binary in a terminal that speaks ANSI + UTF-8 (Windows Terminal, WezTerm, Alacritty) — the legacy `cmd.exe` console won't render it correctly.
+MSVC doesn't advertise `cxx_std_26` to CMake, so the script sets C++23 there and maya's `maya::app` target adds `/std:c++latest`, `/utf-8` and the conforming-preprocessor flags; acidflow adds `_USE_MATH_DEFINES`. GCC/Clang builds stay on C++26. Run the binary in a terminal that speaks ANSI + UTF-8 (Windows Terminal, WezTerm, Alacritty) — the legacy `cmd.exe` console won't render it correctly.
 
 ## Quickstart
 
@@ -197,7 +197,8 @@ Then press `1`–`9` in acidflow to load it. Use `Shift-1`…`Shift-9` to overwr
 
 ## Built on
 
-- **[maya](https://github.com/1ay1/maya)** — the C++26 TUI framework that does the rendering, layout, and event loop.
+- **[maya](https://github.com/1ay1/maya)** — the C++26 TUI framework that does the rendering, layout and mouse hit-testing.
+- **[jaal](https://github.com/agentty-org/jaal)** — maya's runtime: the event loop, timers and input routing acidflow runs on.
 
 ## Status
 

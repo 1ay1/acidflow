@@ -9,6 +9,7 @@
 
 #include <maya/maya.hpp>
 
+#include "hit_ids.hpp"
 #include "theme.hpp"
 
 namespace tb303 {
@@ -130,12 +131,12 @@ inline constexpr int kDrumGridVoices = 16;
             }
         }
 
-        rows.push_back(Element{TextElement{
+        rows.push_back((Element{TextElement{
             .content = std::move(txt),
             .style   = {},
             .wrap    = TextWrap::NoWrap,
             .runs    = std::move(runs),
-        }});
+        }} | dsl::hit(hit_id(kHitDrumRow, static_cast<std::uint32_t>(v)))).build());
     }
 
     {

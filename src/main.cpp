@@ -26,11 +26,12 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
 
-#include <maya/maya.hpp>
+#include <maya/host/run.hpp>
 
 using namespace maya;
 using namespace maya::dsl;
@@ -199,25 +200,15 @@ static std::string g_toast;
 static float       g_toast_t    = 0.0f;    // seconds remaining
 static constexpr float kToastDur = 1.5f;
 
-// Mouse support — captured terminal size (updated each frame via the root
-// component wrapper and by ResizeEvent) plus click-drag state for knobs. We
-// don't know widget screen positions from the framework, so hit-testing is
-// done from the known static row heights + centred widget widths below.
+// Terminal size, from ResizeEvent (the help bar marquee needs the width).
+// Knob drag state: the value and row the drag started at.
 static int   g_term_w = 0;
-static int   g_term_h = 0;
 static int   g_knob_drag_idx = -1;   // -1 when not dragging
 static int   g_knob_drag_y0  = 0;
 static float g_knob_drag_v0  = 0.0f;
 
-// Drum panel geometry — captured each render by a ComponentElement wrapping
-// the drum widget so we can hit-test clicks without hard-coding layout math
-// that breaks when the panel is clipped / stretched / split across terminals
-// of different heights. drum_panel_top is the 1-indexed terminal row of the
-// panel's top border; drum_visible_rows counts only the voice rows that
-// actually drew to the screen (the rest were clipped by overflow:Hidden).
-static int g_drum_panel_top    = -1;
-static int g_drum_panel_rows   = 0;
-static int g_drum_visible_voices = 0;
+// Set by the quit keys; the program's update turns it into Cmd::quit.
+static bool  g_quit_requested = false;
 
 // Scroll offsets for areas that may overflow the visible region:
 //   help_bar   — horizontal scroll (units of items), bumped by wheel on row H-1
@@ -2750,18 +2741,6 @@ static void push_params() {
 static void tick(float dt) {
     push_params();
 
-    // Upgrade maya's default mouse tracking (1000 + 1002 = press/release/drag)
-    // to any-event motion (1003) so bare hover deltas are reported. maya's
-    // RunConfig only enables click+drag; we opt into full motion tracking once
-    // the runtime has finished its own terminal init by writing the DECSET
-    // sequence to stdout on the first tick. The teardown ? 1003l runs on exit.
-    static bool motion_on = false;
-    if (!motion_on) {
-        std::fputs("\x1b[?1003h", stdout);
-        std::fflush(stdout);
-        motion_on = true;
-    }
-
     // Toast fade runs whether or not playback is active.
     if (g_toast_t > 0.0f) g_toast_t = std::max(0.0f, g_toast_t - dt);
 
@@ -2998,148 +2977,62 @@ struct HitZone {
     int  idx2 = 0;      // drum voice (0..4)
 };
 
-// Yoga's integer-safe flex split: items get floor(avail * grow/total) each,
-// and the remainder (avail - sum(floors)) is handed to grow-able items in
-// declaration order. For a 2-child split this is simply: last = floor(second);
-// first = avail - last. Using this formula keeps our hit-test grid aligned
-// with what yoga actually renders.
-static inline int flex_first_share(int avail, int grow_first, int grow_total) {
-    int second = (avail * (grow_total - grow_first)) / grow_total;
-    return avail - second;
+// Resolve a mouse position to a target via maya's hit registry. The widgets
+// tag their boxes with `| hit(...)`, so this always matches the painted frame.
+// SGR coordinates are 1-based; the registry is 0-based.
+static HitZone hit_test(int col, int row) {
+    const int x = col - 1;
+    const int y = row - 1;
+    const auto id = maya::hit_test(x, y);
+    if (!id) return {};
+    const int idx = static_cast<int>(maya::hit_index(*id));
+    // x offset inside the tagged box, for rows that pick a step by column.
+    auto rel_x = [&]() -> int {
+        auto r = maya::hit_rect(*id);
+        return r ? x - r->x : -1;
+    };
+    switch (maya::hit_kind(*id)) {
+        case tb303::kHitTitle:       return {HitZone::Title, 0, 0};
+        case tb303::kHitHelpBar:     return {HitZone::HelpBar, 0, 0};
+        case tb303::kHitHelpOverlay: return {HitZone::HelpOverlay, 0, 0};
+        case tb303::kHitKnob:        return {HitZone::Knob, idx, 0};
+        case tb303::kHitFx:          return {HitZone::FxKnob, idx, 0};
+        case tb303::kHitTransport:   return {HitZone::TransportArea, 0, 0};
+        case tb303::kHitScope:       return {HitZone::ScopeArea, 0, 0};
+        case tb303::kHitSeqRow: {
+            int rel = rel_x() - tb303::kSeqCellX0;
+            if (rel < 0) return {};
+            int step = rel / tb303::kSeqCellW;
+            if (step >= 16) return {};
+            return {HitZone::Step, step, 0};
+        }
+        case tb303::kHitDrumRow: {
+            int rel = rel_x();
+            if (rel < 0) return {};
+            // The label ("BD: ") selects the whole voice via step = -1.
+            int step = rel < tb303::kDrumCellX0
+                     ? -1 : (rel - tb303::kDrumCellX0) / tb303::kDrumCellW;
+            if (step >= 16) return {};
+            return {HitZone::DrumCell, step, idx};
+        }
+        default: return {};
+    }
 }
 
-static HitZone hit_test(int col, int row) {
-    // SGR mouse coordinates are 1-indexed per protocol; our geometry here is
-    // 0-indexed (matches maya's internal render positions). Shift once at the
-    // boundary so the math below lines up with what the user actually sees.
-    col -= 1;
-    row -= 1;
-    if (g_term_w <= 0 || g_term_h <= 0) return {};
-    if (row < 0 || row >= g_term_h || col < 0 || col >= g_term_w) return {};
-
-    if (row == 0) return {HitZone::Title, 0, 0};
-    if (row == g_term_h - 1) return {HitZone::HelpBar, 0, 0};
-
-    // Help overlay covers the middle region entirely — report a single zone so
-    // the wheel can scroll the modal, even though individual lines aren't
-    // interactive.
-    if (g_help_open) return {HitZone::HelpOverlay, 0, 0};
-
-    // ── Voice row (rows 1..12): synth 8/14, fx 6/14, gap 1 ────────────────
-    if (row >= 1 && row <= 12) {
-        int avail    = std::max(0, g_term_w - 1);
-        int synth_w  = flex_first_share(avail, 8, 14);
-        int fx_x     = synth_w + 1;
-        int fx_w     = std::max(0, g_term_w - fx_x);
-
-        // Inside-panel tests only apply in the content band (rows 2..11);
-        // rows 1 and 12 are borders. We're lenient about group-header /
-        // caption rows — they fall to the nearest knob column so the user
-        // doesn't have to thread their click between ruler strips.
-        bool in_body = (row >= 2 && row <= 11);
-
-        if (col < synth_w) {
-            if (!in_body) return {};
-            int interior_x = 1 + 2;                 // border + left pad
-            int interior_w = std::max(0, synth_w - 6);
-            constexpr int kStripW = 9 * 8 + 8;      // 80
-            // justify(Center) clamps free_main to 0 when content > container,
-            // so the strip sits at interior_x when the panel is too narrow to
-            // center. Mirror that clamp here.
-            int strip_start = interior_x + std::max(0, (interior_w - kStripW) / 2);
-            int rel = col - strip_start;
-            if (rel < 0) return {};
-            // Each knob lives in a 9-col slot (8 glyph + 1 gap). The trailing
-            // knob has no gap, so the last valid `rel` is kStripW-1. Map gap
-            // columns to the knob on their left so clicks between columns
-            // don't bounce off.
-            int idx = std::min(rel / 9, K_COUNT - 1);
-            if (rel >= kStripW) return {};
-            if (idx < 0 || idx >= K_COUNT) return {};
-            return {HitZone::Knob, idx, 0};
-        }
-        if (col >= fx_x) {
-            if (!in_body) return {};
-            int interior_x = fx_x + 1 + 2;
-            int interior_w = std::max(0, fx_w - 6);
-            constexpr int kFxStripW = FX_COUNT * 8 + (FX_COUNT - 1); // 62
-            int strip_start = interior_x + std::max(0, (interior_w - kFxStripW) / 2);
-            int rel = col - strip_start;
-            if (rel < 0 || rel >= kFxStripW) return {};
-            int idx = std::min(rel / 9, FX_COUNT - 1);
-            if (idx < 0 || idx >= FX_COUNT) return {};
-            return {HitZone::FxKnob, idx, 0};
-        }
-        return {};
+// Which section a hover over this target should focus, if any.
+static std::optional<Section> hover_section(int col, int row) {
+    const auto id = maya::hit_test(col - 1, row - 1);
+    if (!id) return std::nullopt;
+    switch (maya::hit_kind(*id)) {
+        case tb303::kHitKnob:      return Section::Knobs;
+        case tb303::kHitFx:        return Section::FX;
+        case tb303::kHitSeqRow:    return Section::Sequencer;
+        case tb303::kHitDrumRow:   return Section::Drums;
+        case tb303::kHitTransport: return Section::Transport;
+        case tb303::kHitPanel:
+            return static_cast<Section>(maya::hit_index(*id));
+        default: return std::nullopt;
     }
-
-    // ── Step row (bottom): sequencer fills the full width, 10 rows tall. Data
-    // rows (STEP/PITCH/FLAG/PROB/LOCK/NOTE) live at step_top + 2 .. step_top + 7.
-    int step_top = g_term_h - 11;
-    int step_bot = g_term_h - 2;
-    if (row >= step_top && row <= step_bot) {
-        int avail     = std::max(0, g_term_w - 1);
-        int interior_x = 1 + 1;                                  // border + pad
-        int interior_w = std::max(0, avail - 3);
-        constexpr int kSeqW = 7 + 16 * 4 + 1;                     // 72
-        int seq_start = interior_x + std::max(0, (interior_w - kSeqW) / 2);
-        int rel = col - seq_start;
-        if (rel < 8 || rel >= kSeqW) return {};
-        int cell_rel = rel - 8;
-        int step = cell_rel / 4;
-        if (step < 0 || step >= 16) return {};
-        if (row < step_top + 2 || row > step_top + 7) return {};
-        return {HitZone::Step, step, 0};
-    }
-
-    // ── Middle row: left_col (scope + filter) | transport | drums. Split
-    // via 3:2:2 flex shares, matching the dsl hstack that builds this row.
-    // left_col (3) carries the filter chart so it reads at full width;
-    // transport (2) and drums (2) stay equal on the right side.
-    int mid_top = 13;
-    int mid_bot = step_top - 1;
-    if (row >= mid_top && row <= mid_bot) {
-        // 3 panels + 2 gaps fill g_term_w exactly, so the panels share
-        // (g_term_w - 2) columns. NB: the voice_row hit_test uses
-        // `g_term_w - 1` because it has only one gap; we need to subtract
-        // one cell per gap, hence -2 here.
-        int flex = std::max(0, g_term_w - 2);
-        int left_w      = flex_first_share(flex, 3, 7);
-        int tail        = flex - left_w;
-        int transport_w = flex_first_share(tail, 2, 4);
-        int drum_w      = tail - transport_w;
-        int transport_x = left_w + 1;
-        int drum_x      = transport_x + transport_w + 1;
-
-        if (col >= drum_x && col < drum_x + drum_w) {
-            // Drum panel layout: border top + padding(0,1,0,1) + widget (header
-            // + N voice rows + bus) + border bottom. Voice 0 is two rows below
-            // the panel's top border: +1 for the border, +1 for the widget's
-            // header row with step numbers. drum_panel_top is captured during
-            // render so clipping / layout changes can't desync us.
-            int panel_top = (g_drum_panel_top > 0) ? g_drum_panel_top : mid_top;
-            int voice     = row - (panel_top + 2);
-            int max_voice = (g_drum_visible_voices > 0)
-                          ? g_drum_visible_voices : kDrumVoices;
-            if (voice < 0 || voice >= max_voice) return {};
-
-            int interior_x = drum_x + 1 + 1;                     // border + pad
-            int interior_w = std::max(0, drum_w - 4);
-            constexpr int kDrumW = 4 + 16 * 3;                    // 52
-            int drum_start = interior_x + std::max(0, (interior_w - kDrumW) / 2);
-            int rel = col - drum_start;
-            if (rel < 0 || rel >= kDrumW) return {};
-            // Label area (rel < 4, e.g. "BD: ") — signal voice-only select
-            // via step = -1. Toggling cells still needs rel ≥ 4.
-            int step = (rel < 4) ? -1 : (rel - 4) / 3;
-            if (step >= 16) return {};
-            return {HitZone::DrumCell, step, voice};
-        }
-        if (col >= transport_x) return {HitZone::TransportArea, 0, 0};
-        return {HitZone::ScopeArea, 0, 0};
-    }
-
-    return {};
 }
 
 static void handle_mouse(const MouseEvent& m) {
@@ -3173,44 +3066,7 @@ static void handle_mouse(const MouseEvent& m) {
     // user's intent on hover is "this panel", not "this exact knob".
     if (m.kind == MouseEventKind::Move) {
         if (g_help_open) return;
-        if (g_term_w <= 0 || g_term_h <= 0) return;
-        int hc = col - 1;       // SGR → 0-indexed
-        int hr = row - 1;
-        if (hr <= 0 || hr >= g_term_h - 1) return;   // title / help bar rows
-
-        // Voice row: synth panel (8/14) vs FX panel (6/14).
-        if (hr >= 1 && hr <= 12) {
-            int avail   = std::max(0, g_term_w - 1);
-            int synth_w = flex_first_share(avail, 8, 14);
-            g_focus = (hc < synth_w) ? Section::Knobs : Section::FX;
-            return;
-        }
-        // Step row: sequencer spans full width at the bottom.
-        int step_top = g_term_h - 11;
-        int step_bot = g_term_h - 2;
-        if (hr >= step_top && hr <= step_bot) {
-            g_focus = Section::Sequencer;
-            return;
-        }
-        // Middle band: left_col | transport | drums, 3:2:2 flex split matching
-        // the dsl::hstack that builds this row (gap 1 between cells).
-        // Uses g_term_w - 2 (one cell per gap) — same correction as hit_test.
-        int mid_top = 13;
-        int mid_bot = step_top - 1;
-        if (hr >= mid_top && hr <= mid_bot) {
-            int flex        = std::max(0, g_term_w - 2);
-            int left_w      = flex_first_share(flex, 3, 7);
-            int tail        = flex - left_w;
-            int transport_w = flex_first_share(tail, 2, 4);
-            int transport_x = left_w + 1;
-            int drum_x      = transport_x + transport_w + 1;
-            // Left third has no interactive widgets — leave focus where it
-            // was rather than hijacking it to the sequencer (which lives in
-            // a totally different row).
-            if (hc >= drum_x)            g_focus = Section::Drums;
-            else if (hc >= transport_x)  g_focus = Section::Transport;
-            return;
-        }
+        if (auto s = hover_section(col, row)) g_focus = *s;
         return;
     }
 
@@ -3388,8 +3244,8 @@ static void handle_mouse(const MouseEvent& m) {
 
 static void handle_event(const Event& ev) {
     // Resize — keep terminal size in sync for mouse hit-tests.
-    int rw = 0, rh = 0;
-    if (resized(ev, &rw, &rh)) { g_term_w = rw; g_term_h = rh; return; }
+    int rw = 0;
+    if (resized(ev, &rw, nullptr)) { g_term_w = rw; return; }
     if (const MouseEvent* m = as_mouse(ev)) { handle_mouse(*m); return; }
 
     // ── Take picker modal ────────────────────────────────────────────────────
@@ -3438,7 +3294,7 @@ static void handle_event(const Event& ev) {
             set_toast("jam off");
             return;
         }
-        maya::quit();
+        g_quit_requested = true;
         return;
     }
     if (key(ev, '?')) { g_help_open = !g_help_open; g_help_ov_scroll = 0; return; }
@@ -3932,13 +3788,14 @@ static Element build_knob_row() {
     auto build_one = [&](int i) -> Element {
         bool focused = (g_focus == Section::Knobs) && (g_knob_sel == i);
         maya::Color gc = group_color_for(i);
+        const auto id = hit(hit_id(tb303::kHitKnob, static_cast<std::uint32_t>(i)));
         if (i == K_WAVE) {
             tb303::WaveformToggle w;
             w.index       = g_wave;
             w.focused     = focused;
             w.group_col   = gc;
             w.tech_symbol = g_knob_table[i].tech;
-            return w.build();
+            return (w.build() | id).build();
         }
         tb303::Knob k;
         k.label         = g_knob_table[i].label;
@@ -3951,7 +3808,7 @@ static Element build_knob_row() {
         k.tech_symbol   = g_knob_table[i].tech;
         k.focused       = focused;
         k.group_col     = gc;
-        return k.build();
+        return (k.build() | id).build();
     };
 
     // Build the 8-column strip in signal-flow order: OSC (tune, wave) →
@@ -4089,7 +3946,7 @@ static Element build_knob_row() {
         ? " \xe2\x97\x87 SYNTH VOICE \xc2\xb7 MUTED (m) \xe2\x97\x87 "
         : " \xe2\x97\x87 SYNTH VOICE \xc2\xb7 VCO\xe2\x86\x92VCF\xe2\x86\x92VCA"
           " \xc2\xb7 24 dB/oct LADDER \xe2\x97\x87 ";
-    return dsl::vstack()
+    return (dsl::vstack()
         .border(BorderStyle::Round)
         .border_color(g_synth_mute ? tb303::clr_dim()
                       : g_focus == Section::Knobs ? tb303::clr_accent() : tb303::clr_panel_hi())
@@ -4102,7 +3959,7 @@ static Element build_knob_row() {
             std::move(group_header),
             std::move(strip),
             build_caption()
-        );
+        ) | hit(hit_id(tb303::kHitPanel, static_cast<std::uint32_t>(Section::Knobs)))).build();
 }
 
 // Compact FX rack panel — one bordered row below the SYNTH VOICE panel.
@@ -4144,7 +4001,7 @@ static Element build_fx_row() {
             k.default_value = g_fx_table[i].default_v;
             k.modified      = std::abs(*g_fx_table[i].value - g_fx_table[i].default_v) > 0.005f;
         }
-        return k.build();
+        return (k.build() | hit(hit_id(tb303::kHitFx, static_cast<std::uint32_t>(i)))).build();
     };
 
     std::vector<Element> cols;
@@ -4243,7 +4100,7 @@ static Element build_fx_row() {
     const char* fx_title = g_synth_mute
         ? " \xe2\x97\x87 FX RACK \xc2\xb7 MUTED (m) \xe2\x97\x87 "
         : " \xe2\x97\x87 FX RACK \xc2\xb7 OD\xe2\x86\x92" "DELAY\xe2\x86\x92" "REVERB \xe2\x97\x87 ";
-    return dsl::vstack()
+    return (dsl::vstack()
         .border(BorderStyle::Round)
         .border_color(g_synth_mute ? tb303::clr_dim()
                       : g_focus == Section::FX ? tb303::clr_accent() : tb303::clr_panel_hi())
@@ -4252,7 +4109,8 @@ static Element build_fx_row() {
         .basis(Dimension::fixed(0))
         .min_width(Dimension::fixed(0))
         .overflow(Overflow::Hidden)
-        .padding(0, 2, 0, 2)(std::move(group_header), std::move(strip), build_caption());
+        .padding(0, 2, 0, 2)(std::move(group_header), std::move(strip), build_caption())
+        | hit(hit_id(tb303::kHitPanel, static_cast<std::uint32_t>(Section::FX)))).build();
 }
 
 static Element render_frame() {
@@ -4309,28 +4167,9 @@ static Element render_frame() {
             std::move(scope_box)  | dsl::grow(2)
         );
 
-    // Wrap the drum widget in a ComponentElement so we learn its allocated
-    // pixel height at paint time. The hit-test uses this to map a click row
-    // to a voice index without guessing at layout math — click mapping then
-    // works whether the panel got its full 20 rows or is clipped on a short
-    // terminal.
-    auto drums_component = dsl::fill([=](int, int h) -> Element {
-        // h = interior height of the drum panel (inside its border + padding).
-        // The widget lays out as: 1 header row, N voice rows, 1 bus row.
-        // When clipped, the bottom is cut first (header + early voices stay
-        // visible). Record how many voice rows we actually displayed and
-        // stash the panel's rendered height so hit_test can invert the map.
-        int visible = std::max(0, h - 1 - 1);     // minus header + bus row
-        if (visible > kDrumVoices) visible = kDrumVoices;
-        g_drum_visible_voices = visible;
-        g_drum_panel_rows     = h + 2;            // +2 for top/bottom borders
-        // drum_panel_top = 1-indexed terminal row of the panel's top border.
-        // Anchor to the bottom of middle_row (which in the current layout
-        // ends one row above step_row's top border at g_term_h - 12) minus
-        // the panel's outer height, plus 1 to convert bottom-inclusive to
-        // top-inclusive.
-        //   bottom = g_term_h - 12   outer = h + 2   top = bottom - outer + 1
-        g_drum_panel_top = (g_term_h - 12) - (h + 2) + 1;
+    // Drums sit in a fill() so the panel can shrink on short terminals and
+    // clip the bottom voices instead of pushing the layout taller.
+    auto drums_component = dsl::fill([=](int, int) -> Element {
         return tb303::build_drums(g_drums, g_drum_voice_mute,
                                   g_drum_voice_sel, g_drum_step_sel,
                                   g_playing ? g_current_step : -1,
@@ -4346,15 +4185,16 @@ static Element render_frame() {
         .basis(Dimension::fixed(0))
         .min_width(Dimension::fixed(0))
         .overflow(Overflow::Hidden)
-        .padding(0, 1, 0, 1)(std::move(drums_component));
+        .padding(0, 1, 0, 1)(std::move(drums_component))
+        | hit(hit_id(tb303::kHitPanel, static_cast<std::uint32_t>(Section::Drums)));
 
     // Middle row hosts three stacked panels side by side: scope/filter (left),
     // transport (centre), drums (right). voice_row (below) is given shrink(1)
     // so on short terminals the knob row compresses first and middle_row keeps
     // enough height to render the 16-voice drum grid unclipped.
     auto middle_row = (dsl::h(
-        std::move(left_col)   | dsl::grow(3),
-        std::move(transport)  | dsl::grow(2),
+        std::move(left_col)   | dsl::grow(3) | hit(hit_id(tb303::kHitScope)),
+        std::move(transport)  | dsl::grow(2) | hit(hit_id(tb303::kHitTransport)),
         std::move(drum_panel) | dsl::grow(2)
     ) | dsl::gap(1) | dsl::grow(1)).build();
 
@@ -4368,11 +4208,13 @@ static Element render_frame() {
         .basis(Dimension::fixed(0))
         .min_width(Dimension::fixed(0))
         .overflow(Overflow::Hidden)
-        .padding(0, 1, 0, 1)(std::move(seq));
+        .padding(0, 1, 0, 1)(std::move(seq))
+        | hit(hit_id(tb303::kHitPanel, static_cast<std::uint32_t>(Section::Sequencer)));
 
     int help_auto = static_cast<int>(g_help_bar_auto_t / kHelpBarChipDur);
     auto help_bar = tb303::build_help_bar(g_focus, g_help_open,
-                                          g_help_bar_scroll, g_term_w, help_auto);
+                                          g_help_bar_scroll, g_term_w, help_auto)
+                  | hit(hit_id(tb303::kHitHelpBar));
 
     // Title bar: a compact brand strip with a pulse-colored dot that flips
     // from muted → red while playing, so the play state is legible from a
@@ -4416,7 +4258,6 @@ static Element render_frame() {
             .wrap    = TextWrap::NoWrap,
         }};
     } else {
-        if (!g_toast.empty()) g_toast.clear();
         // When the user is tracking to live.wav, replace the play glyph with
         // a bright blinking REC + elapsed seconds so the indicator is
         // unmissable during a take. Blink rate is ~1 Hz off the same timer
@@ -4458,14 +4299,16 @@ static Element render_frame() {
         .padding(0, 1, 0, 1)
         .justify(Justify::SpaceBetween)
         .align_items(Align::Center)
-        (std::move(brand_group), std::move(status_el));
+        (std::move(brand_group), std::move(status_el))
+        | hit(hit_id(tb303::kHitTitle));
 
     // Help replaces the main workspace (keeps title + status bar visible) so
     // the user always has context and knows how to close it.
     if (g_help_open) {
         return (dsl::v(
             std::move(title_bar),
-            tb303::build_help_overlay(g_help_ov_scroll) | dsl::grow(1),
+            tb303::build_help_overlay(g_help_ov_scroll) | dsl::grow(1)
+                | hit(hit_id(tb303::kHitHelpOverlay)),
             std::move(help_bar)
         ) | dsl::gap(0)).build();
     }
@@ -4518,53 +4361,95 @@ static Element render_frame() {
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── Program ────────────────────────────────────────────────────────────────────────
+// The app state lives in the file-level globals above. on(), update() and
+// view() all run on jaal's loop thread, so that stays single-threaded; the
+// audio and MIDI threads only talk to the engine through atomics.
+
+// True when nothing on screen is moving, so the tick can slow right down.
+static bool ui_idle() {
+    return !g_playing && g_toast_t <= 0.0f && g_jam_gate_s <= 0.0f
+        && !acid_is_recording() && g_knob_drag_idx < 0
+        && acid_output_peak() < 1e-4f;
+}
+
+struct Acidflow {
+    struct Model {
+        std::uint64_t frame = 0;   // bumped every tick so each one redraws
+        std::chrono::steady_clock::time_point last{};
+        bool idle = false;
+    };
+
+    struct Tick {};
+    struct Key    { KeyEvent ev; };
+    struct Mouse  { MouseEvent ev; };
+    struct Resize { int w, h; };
+    using Msg = std::variant<Tick, Key, Mouse, Resize>;
+    using Cmd = jaal::Cmd<Msg>;
+    using Sub = jaal::Sub<Msg>;
+
+    static Cmd init(Model& m) {
+        m.last = std::chrono::steady_clock::now();
+        return {};
+    }
+
+    static Cmd update(Model& m, Tick) {
+        auto now = std::chrono::steady_clock::now();
+        // Clamp so a debugger pause or a slow first frame can't jump timers.
+        float dt = std::clamp(std::chrono::duration<float>(now - m.last).count(), 0.0f, 0.1f);
+        m.last = now;
+        tick(dt);
+        if (g_toast_t <= 0.0f && !g_toast.empty()) g_toast.clear();
+        ++m.frame;
+        m.idle = ui_idle();
+        return {};
+    }
+    static Cmd update(Model& m, Key k)    { return input(m, Event{k.ev}); }
+    static Cmd update(Model& m, Mouse mo) { return input(m, Event{mo.ev}); }
+    static Cmd update(Model& m, Resize r) {
+        return input(m, Event{ResizeEvent{Columns{r.w}, Rows{r.h}}});
+    }
+
+    static Element view(const Model&) { return render_frame(); }
+
+    static std::optional<Msg> on(const Model&, const KeyEvent& k)   { return Key{k}; }
+    static std::optional<Msg> on(const Model&, const MouseEvent& m) { return Mouse{m}; }
+    static std::optional<Msg> on(const Model&, const ResizeEvent& r) {
+        return Resize{r.width.value, r.height.value};
+    }
+
+    // 30 fps while anything moves; a slow tick when idle so the help bar
+    // marquee still turns but the process doesn't spin.
+    static Sub subscribe(const Model& m) {
+        return Sub::every(std::chrono::milliseconds{m.idle ? 250 : 33}, Tick{});
+    }
+    static bool subs_key(const Model& m) { return m.idle; }
+
+  private:
+    static Cmd input(Model& m, const Event& ev) {
+        handle_event(ev);
+        // Input wakes the fast tick right away (a knob turn, play, ...).
+        m.idle = false;
+        if (g_quit_requested) return Cmd::quit(0);
+        return {};
+    }
+};
+
+static_assert(maya::Program<Acidflow>);
+
 int main() {
     load_preset(0);
     acid_start();
     acid_midi_start();   // No-op on platforms without a MIDI backend.
 
-    using clock = std::chrono::steady_clock;
-    auto last = clock::now();
-
-    maya::run(
-        RunConfig{
-            .title = "tb-303",
-            .fps   = 30,
-            .mouse = true,
-            .mode  = Mode::Fullscreen,
-        },
-        [](const Event& ev) { handle_event(ev); },
-        [&] {
-            auto now = clock::now();
-            float dt = std::chrono::duration<float>(now - last).count();
-            last = now;
-            // clamp — protects against debugger pauses or initial frame
-            dt = std::clamp(dt, 0.0f, 0.1f);
-            tick(dt);
-            // Wrap the whole tree in a root ComponentElement so every render
-            // pass captures the current terminal (w, h) into globals. We need
-            // these for mouse hit-testing — maya doesn't otherwise expose
-            // widget positions to user code.
-            // Use dsl::fill (not component().grow(1)): fill installs a
-            // measure so grow actually expands it to the whole terminal and
-            // hands the REAL allocated (w, h) to the callback. A bare
-            // component().grow(1) is content-measured by maya's layout and
-            // collapses to ~0x0 at the root, so g_term_w/h came back zero and
-            // render_frame() produced an empty frame every tick (frozen UI).
-            return Element{dsl::fill([](int w, int h) -> Element {
-                g_term_w = w;
-                g_term_h = h;
-                return render_frame();
-            })};
-        }
-    );
-
-    // Pair with the 1003h DECSET in tick() — without this the host shell can
-    // inherit all-motion mouse tracking and spray SGR escapes at the prompt.
-    std::fputs("\x1b[?1003l", stdout);
-    std::fflush(stdout);
+    int rc = maya::run<Acidflow>({
+        .title        = "tb-303",
+        .mouse        = true,
+        .hover_motion = true,   // bare motion drives hover focus
+        .mode         = Mode::Fullscreen,
+    });
 
     acid_midi_stop();
     acid_stop();
-    return 0;
+    return rc;
 }

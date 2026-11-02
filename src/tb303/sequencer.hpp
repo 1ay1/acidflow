@@ -29,6 +29,7 @@
 
 #include <maya/maya.hpp>
 
+#include "hit_ids.hpp"
 #include "step_data.hpp"
 #include "theme.hpp"
 
@@ -304,6 +305,13 @@ using namespace maya;
         "\xe2\x94\x98",   // ┘
         "\xe2\x94\x80");  // ─
 
+    // Data rows are hit targets; the click's x offset inside the row picks
+    // the step (see kSeqCellX0 / kSeqCellW).
+    auto tag = [](Element e, int row) {
+        return (std::move(e) | dsl::hit(hit_id(kHitSeqRow,
+                                               static_cast<std::uint32_t>(row)))).build();
+    };
+
     // align_items(Center) on the vstack itself centers each row on the
     // cross-axis (horizontal), so the whole block floats to the middle of
     // the SEQUENCER panel on wide terminals and stays intrinsic-width on
@@ -312,12 +320,12 @@ using namespace maya;
         .gap(0)
         .align_items(Align::Center)(
             std::move(top),
-            std::move(nums),
-            std::move(sparkline),
-            std::move(leds),
-            std::move(probs),
-            std::move(locks),
-            std::move(notes),
+            tag(std::move(nums), 0),
+            tag(std::move(sparkline), 1),
+            tag(std::move(leds), 2),
+            tag(std::move(probs), 3),
+            tag(std::move(locks), 4),
+            tag(std::move(notes), 5),
             std::move(bottom)
         );
 }
